@@ -97,6 +97,9 @@ impl<S: IoStream> Write for DeadlineStream<S> {
         self.inner.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        // A no-op on today's sockets, but a buffering stream flushes by
+        // writing — which must not outlive the deadline either.
+        self.arm()?;
         self.inner.flush()
     }
 }
@@ -185,8 +188,13 @@ mod tests {
         let mut buf = [0u8; 4];
         assert_eq!(s.read(&mut buf).unwrap_err().kind(), ErrorKind::TimedOut);
         assert_eq!(s.write(b"x").unwrap_err().kind(), ErrorKind::TimedOut);
+        assert_eq!(s.flush().unwrap_err().kind(), ErrorKind::TimedOut);
         let seen = seen.lock().unwrap();
-        assert_eq!((seen.reads, seen.writes), (0, 0), "inner stream was used");
+        assert_eq!(
+            (seen.reads, seen.writes, seen.flushes),
+            (0, 0, 0),
+            "inner stream was used"
+        );
         assert!(seen.timeouts.is_empty(), "inner timeout was touched");
     }
 
