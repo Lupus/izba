@@ -347,7 +347,10 @@ fn read_manifest<R: Read>(entries: &mut tar::Entries<'_, R>) -> anyhow::Result<M
 }
 
 /// One staging dir per bundled workspace tree, beside its target (so the
-/// final placement is a rename).
+/// final placement is a rename). Created owner-only: under a shared parent
+/// (e.g. `/tmp`) the extracted files — possibly secrets — must not be
+/// readable by other users before the tree is placed; the placed root gets
+/// its ordinary mode back in `commit_workspaces`.
 fn create_workspace_stages(
     sels: &mut [Sel],
     run_id: &str,
@@ -374,7 +377,7 @@ fn create_workspace_stages(
             .unwrap_or_default()
             .to_string_lossy();
         let ws_stage = parent.join(format!(".izba-load-{run_id}-{base}"));
-        fs::create_dir(&ws_stage)
+        create_private_dir(&ws_stage)
             .with_context(|| format!("creating {}", ws_stage.display()))
             .context(PLACE_HINT)?;
         scratch.push(ws_stage.clone());
@@ -382,6 +385,34 @@ fn create_workspace_stages(
         s.ws_stage = Some(ws_stage);
     }
     Ok(())
+}
+
+/// `create_dir` with mode 0700 from the start on Unix (no chmod window).
+fn create_private_dir(p: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(p)
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(p)
+}
+
+/// The mode a plain `create_dir` gives a new directory here (`0777 & !umask`,
+/// the umask read from `/proc/self/status` — reading it via `umask(2)` would
+/// briefly change it for every thread). A placed workspace root gets this, so
+/// its private staging mode never outlives the load. Falls back to umask 022.
+#[cfg(unix)]
+fn default_dir_mode() -> u32 {
+    let umask = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Umask:"))
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+        })
+        .unwrap_or(0o022);
+    0o777 & !umask
 }
 
 fn verify_staged(staged: &Staged) -> anyhow::Result<()> {
@@ -630,6 +661,13 @@ fn commit_workspaces(sels: &[Sel], undo: &mut Vec<Undo>) -> anyhow::Result<()> {
             .with_context(|| format!("placing workspace {}", t.display()))
             .context(PLACE_HINT)?;
         undo.push(Undo::Remove(t.clone()));
+        // The stage was private; the placed root gets what a fresh dir would.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(t, fs::Permissions::from_mode(default_dir_mode()))
+                .with_context(|| format!("setting the mode of {}", t.display()))?;
+        }
         crate::procmgr::ensure_confinable(t)?;
     }
     Ok(())
@@ -961,17 +999,6 @@ fn select(
                     target.display()
                 );
             }
-            // Sharers of one tree restore it once, together; two DIFFERENT
-            // source workspaces can never land on one dir.
-            if sels
-                .iter()
-                .any(|s| s.ws_tree.is_some() && s.ws_target == target && s.ws_tree != ws_tree)
-            {
-                bail!(
-                    "two sandboxes would restore their workspace to {}; pass --workspace-root",
-                    target.display()
-                );
-            }
         } else {
             if !target.is_dir() {
                 bail!(
@@ -982,6 +1009,7 @@ fn select(
             }
             crate::procmgr::ensure_confinable(&target)?;
         }
+        check_target_collision(&sels, e, &name, &target, ws_tree.as_deref())?;
         sels.push(Sel {
             src: e.name.clone(),
             name,
@@ -994,11 +1022,56 @@ fn select(
     Ok(sels)
 }
 
+/// A bundled tree may only land on a dir no other selected sandbox resolves
+/// to — bundled or not — unless both describe the SAME source workspace
+/// (sharers restore one tree, once, together; an unbundled sharer then uses
+/// it). Otherwise the load would bind a sandbox to another one's files.
+fn check_target_collision(
+    sels: &[Sel],
+    e: &SandboxEntry,
+    name: &str,
+    target: &Path,
+    ws_tree: Option<&str>,
+) -> anyhow::Result<()> {
+    let clash = sels.iter().find(|s| {
+        s.ws_target == target
+            && (ws_tree.is_some() || s.ws_tree.is_some())
+            && match (ws_tree, s.ws_tree.as_deref()) {
+                (Some(a), Some(b)) => a != b,
+                _ => s.entry.source_workspace != e.source_workspace,
+            }
+    });
+    if let Some(other) = clash {
+        bail!(
+            "two sandboxes would use workspace {} ('{}' and '{name}' were saved from different \
+             workspaces); load them one at a time with --workspace <dir>",
+            target.display(),
+            other.name
+        );
+    }
+    Ok(())
+}
+
 /// The single-writer invariant (`sandbox::ensure_volume_not_shared`): a
-/// named volume may be bound to at most one sandbox config on this host. A
-/// loaded sandbox may reuse an identical volume only while NO existing
+/// named volume may be bound to at most one sandbox config on this host —
+/// so also to at most one sandbox of the selection. A loaded sandbox may reuse an identical volume only while NO existing
 /// sandbox here references it — otherwise the load would bind it twice.
 fn check_volume_writers(paths: &Paths, sels: &[Sel]) -> anyhow::Result<()> {
+    // Two sandboxes of this very load binding one volume break it just the
+    // same: once one runs, the other can never start.
+    let mut first: HashMap<&str, &str> = HashMap::new();
+    for s in sels {
+        for v in &s.entry.named_volumes {
+            if let Some(other) = first.insert(v, &s.name) {
+                bail!(
+                    "named volume '{v}' is used by both '{other}' and '{}' in this archive (a \
+                     named volume has a single writer); load them one at a time by naming \
+                     one of them",
+                    s.name
+                );
+            }
+        }
+    }
     let (_, volumes) = selection_needs(sels);
     for v in &volumes {
         if let Some(other) = crate::sandbox::volume_referrers(paths, v)?.first() {
@@ -2507,7 +2580,7 @@ mod tests {
         let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
             .unwrap_err()
             .to_string();
-        assert!(e.contains("two sandboxes would restore"), "{e}");
+        assert!(e.contains("two sandboxes would use workspace"), "{e}");
     }
 
     #[test]
@@ -2523,6 +2596,131 @@ mod tests {
         let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
         let want = tgt.dir("projects/a").canonicalize().unwrap();
         assert!(rep.sandboxes.iter().all(|s| s.workspace == want), "{rep:?}");
+    }
+
+    /// Archive of "a" + "b" (b's config from `b_workspace`) saved WITH
+    /// workspaces, then rewritten so `unbundled` is not bundled (its tree, if
+    /// any, dropped): a mixed selection only a crafted manifest can express.
+    fn mixed_archive(b_workspace: impl FnOnce(&Src) -> PathBuf, unbundled: &str) -> (Src, PathBuf) {
+        let src = src_with_b(b_workspace);
+        let ar = src.save(&["a", "b"], true);
+        let tree = format!("workspaces/{unbundled}/");
+        rewrite_archive(&ar, |n, b| (!n.starts_with(&tree)).then_some(b));
+        edit_manifest(&ar, |m| {
+            let e = m
+                .sandboxes
+                .iter_mut()
+                .find(|s| s.name == unbundled)
+                .unwrap();
+            e.workspace_bundled = false;
+            e.workspace_from = None;
+            e.workspace_bytes = 0;
+        });
+        (src, ar)
+    }
+
+    #[test]
+    fn a_bundled_workspace_may_not_land_where_an_unbundled_sandbox_resolves() {
+        // b's own workspace is `<src>/other/a`: same basename as a's, so with
+        // --workspace-root both resolve to `projects/a` — an EMPTY existing
+        // dir, which is both a free bundled target and an existing unbundled one.
+        for unbundled in ["b", "a"] {
+            let (_src, ar) = mixed_archive(|s| s.t.path().join("other/a"), unbundled);
+            let tgt = Tgt::new();
+            std::fs::create_dir_all(tgt.dir("projects/a")).unwrap();
+            let o = LoadOpts {
+                workspace_root: Some(tgt.dir("projects")),
+                ..opts(ar, None)
+            };
+            let before = tgt.snapshot();
+            let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("two sandboxes would") && e.contains("'a'") && e.contains("'b'"),
+                "{unbundled}: {e}"
+            );
+            assert_eq!(tgt.snapshot(), before, "{unbundled}");
+        }
+    }
+
+    #[test]
+    fn an_unbundled_sharer_of_a_bundled_workspace_is_still_allowed() {
+        let (_src, ar) = mixed_archive(shared, "b");
+        let tgt = Tgt::new();
+        std::fs::create_dir_all(tgt.dir("projects/a")).unwrap();
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar, None)
+        };
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        let want = tgt.dir("projects/a").canonicalize().unwrap();
+        assert_eq!(std::fs::read(want.join("README")).unwrap(), b"hello");
+        assert!(rep.sandboxes.iter().all(|s| s.workspace == want), "{rep:?}");
+    }
+
+    #[test]
+    fn a_named_volume_shared_by_two_selected_sandboxes_is_refused() {
+        let src = Src::new();
+        add_sandbox(&src.paths, "b", "sha256:aa", &[("data", "/data")]);
+        let ar = src.save(&["a", "b"], false);
+        let tgt = Tgt::new();
+        for n in ["a", "b"] {
+            std::fs::create_dir_all(tgt.dir(&format!("projects/{n}"))).unwrap();
+        }
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar.clone(), None)
+        };
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("named volume 'data'") && e.contains("'a'") && e.contains("'b'"),
+            "{e}"
+        );
+        assert_eq!(tgt.snapshot(), before);
+        // One of them alone is fine.
+        let o = LoadOpts {
+            select: vec!["b".into()],
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar, None)
+        };
+        load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        assert!(tgt.paths.volume_image("data").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundled_workspace_is_staged_privately_and_placed_with_the_default_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tgt = Tgt::new();
+        let o = opts_bundled(&tgt);
+        let mut stage_modes = Vec::new();
+        load_with(
+            &tgt.paths,
+            &o,
+            &mut |_| {
+                let Ok(rd) = std::fs::read_dir(tgt.dir("ws")) else {
+                    return;
+                };
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(".izba-load-") {
+                        stage_modes.push(mode(&e.path()));
+                    }
+                }
+            },
+            &tgt.hooks(),
+        )
+        .unwrap();
+        assert!(!stage_modes.is_empty());
+        assert!(stage_modes.iter().all(|m| *m == 0o700), "{stage_modes:?}");
+        // The placed root ends with what a plain new directory gets here.
+        let probe = tgt.dir("probe");
+        std::fs::create_dir(&probe).unwrap();
+        assert_eq!(mode(&tgt.dir("ws/a")), mode(&probe));
     }
 
     #[test]
