@@ -252,6 +252,118 @@ fn build_vm_disks(
     disks
 }
 
+/// The four base virtiofs shares every launch carries (per-mode extras such as
+/// `izba-buildout` / `izba-vnc` are appended by the caller). One function so
+/// `start_with_timeouts` and the F-09 write-surface guard test build the exact
+/// same list.
+fn base_vm_shares(
+    workspace: &Path,
+    trust_dir: &Path,
+    oci_dir: &Path,
+    ssh_share: &Path,
+) -> Vec<FsShare> {
+    vec![
+        FsShare {
+            tag: "workspace".to_string(),
+            host_path: workspace.to_path_buf(),
+        },
+        FsShare {
+            tag: "izba-trust".to_string(),
+            host_path: trust_dir.to_path_buf(),
+        },
+        FsShare {
+            tag: OCI_TAG.to_string(),
+            host_path: oci_dir.to_path_buf(),
+        },
+        FsShare {
+            tag: "izba-ssh".to_string(),
+            host_path: ssh_share.to_path_buf(),
+        },
+    ]
+}
+
+/// Host dir of the builder VM's writable `izba-buildout` share.
+fn buildout_share_dir(paths: &Paths, name: &str) -> PathBuf {
+    paths.sandbox_dir(name).join("buildout")
+}
+
+/// Does this launch Low-label the workspace tree? Only the Windows drivers
+/// label (`spawn_default_confined_vmm` for a confined launch,
+/// `spawn_locked_vmm` for a lock-down launch — a locked launch is never
+/// `allow_unconfined`, so it is covered); `--allow-unconfined` launches
+/// unlabelled, and Linux never labels at all.
+fn workspace_label_guard_applies(windows: bool, allow_unconfined: bool) -> bool {
+    windows && !allow_unconfined
+}
+
+/// `cfg!(windows)`, with a test-only override so the call-site test can drive
+/// the Windows branch of `start_with_timeouts` on a Linux host.
+fn host_is_windows() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = tests::FORCE_WINDOWS.with(|c| c.get()) {
+        return forced;
+    }
+    cfg!(windows)
+}
+
+/// Refuse a workspace that equals or contains `paths.daemon_dir()` (F-09,
+/// #281). `<data>/daemon` holds `izbad.sock`, which deliberately keeps the
+/// implicit Medium label: Windows AF_UNIX `connect()` needs write access
+/// (spike #248), so a Low-IL VMM cannot dial it. A confined start Low-labels
+/// the entire workspace subtree (inheritably), so a workspace covering the
+/// daemon dir would silently flip the socket to Low and let the sandbox's
+/// VMM drive every sandbox. Fail closed with an actionable error. A workspace
+/// merely INSIDE the data root that does not contain the daemon dir is not
+/// refused by this rule.
+fn check_workspace_spares_control_socket(paths: &Paths, workspace: &Path) -> anyhow::Result<()> {
+    let daemon = resolve_for_compare(&paths.daemon_dir());
+    let ws = resolve_for_compare(workspace);
+    if path_is_ancestor_or_equal(&ws, &daemon, cfg!(windows)) {
+        bail!(
+            "workspace {} contains izba's data dir {}; a confined Windows start Low-labels the \
+             whole workspace tree, which would include the izbad control socket and let the \
+             sandbox's VMM drive every sandbox (F-09). Choose a narrower workspace directory \
+             (a project dir that does not contain {}).",
+            workspace.display(),
+            paths.root().display(),
+            paths.root().display(),
+        );
+    }
+    Ok(())
+}
+
+/// Canonicalize `p`; when it (or a tail of it) does not exist, canonicalize
+/// the deepest existing ancestor and re-append the rest, falling back to the
+/// lexical path. Keeps both sides of the comparison in one spelling.
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(leaf)) if !parent.as_os_str().is_empty() => {
+            resolve_for_compare(parent).join(leaf)
+        }
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Component-wise "`ancestor` equals `path` or is a proper ancestor of it"
+/// (`/data/izba` is NOT an ancestor of `/data/izbaX`). `case_insensitive` is
+/// the NTFS comparison.
+fn path_is_ancestor_or_equal(ancestor: &Path, path: &Path, case_insensitive: bool) -> bool {
+    let norm = |c: std::path::Component<'_>| {
+        let s = c.as_os_str().to_string_lossy().into_owned();
+        if case_insensitive {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    let a: Vec<String> = ancestor.components().map(norm).collect();
+    let p: Vec<String> = path.components().map(norm).collect();
+    p.len() >= a.len() && p[..a.len()] == a[..]
+}
+
 /// Kernel cmdline for a launch. `izba.volumes` carries the ordered guest
 /// mountpoints (vdc, vdd, …) only when volumes are present. `izba.buildout=1`
 /// is appended for builder VMs so the guest mounts the `izba-buildout` share.
@@ -962,6 +1074,14 @@ pub fn start_with_timeouts(
     let config: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?
         .with_context(|| format!("no such sandbox '{name}'"))?;
 
+    // F-09 / #281: refuse BEFORE anything is launched or labelled. A confined
+    // (or locked-down) Windows launch Low-labels the whole workspace tree, so
+    // a workspace that contains `<data>/daemon` would hand the VMM the izbad
+    // control socket. Gated to exactly the launches that Low-label.
+    if workspace_label_guard_applies(host_is_windows(), allow_unconfined) {
+        check_workspace_spares_control_socket(paths, &config.workspace)?;
+    }
+
     // The kernel was chosen by the caller from ONE read of config.json, and the
     // line above is a SECOND read: a grant (or revoke) landing between the two
     // would boot a kernel whose USB support disagrees with the cmdline and the
@@ -1087,7 +1207,7 @@ pub fn start_with_timeouts(
     // For builder VMs: create the buildout host dir and add the rw share.
     let mut extra_shares: Vec<FsShare> = Vec::new();
     if config.builder {
-        let buildout_dir = paths.sandbox_dir(name).join("buildout");
+        let buildout_dir = buildout_share_dir(paths, name);
         std::fs::create_dir_all(&buildout_dir)
             .with_context(|| format!("creating buildout dir {}", buildout_dir.display()))?;
         extra_shares.push(FsShare {
@@ -1144,24 +1264,7 @@ pub fn start_with_timeouts(
             &config.volumes,
             art.kasmvnc_erofs.as_deref(),
         ),
-        shares: vec![
-            FsShare {
-                tag: "workspace".to_string(),
-                host_path: config.workspace.clone(),
-            },
-            FsShare {
-                tag: "izba-trust".to_string(),
-                host_path: trust_dir.clone(),
-            },
-            FsShare {
-                tag: OCI_TAG.to_string(),
-                host_path: oci_dir.clone(),
-            },
-            FsShare {
-                tag: "izba-ssh".to_string(),
-                host_path: ssh_share.clone(),
-            },
-        ],
+        shares: base_vm_shares(&config.workspace, &trust_dir, &oci_dir, &ssh_share),
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
         allow_unconfined,
@@ -5084,5 +5187,200 @@ mod tests {
         let (_dir, paths) = test_paths();
         std::fs::create_dir_all(paths.sandboxes_dir()).unwrap();
         assert!(edit_sandbox_config(&paths, "ghost", |_| Ok(())).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // F-09 / #281: the izbad control socket must stay Medium-only
+    // -----------------------------------------------------------------------
+
+    thread_local! {
+        /// Test seam behind `host_is_windows()`.
+        pub(super) static FORCE_WINDOWS: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Restores the override from Drop so a failing assert cannot leak
+    /// `windows=true` into the next test on this thread.
+    struct ForceWindows;
+    impl ForceWindows {
+        fn on() -> Self {
+            FORCE_WINDOWS.with(|c| c.set(Some(true)));
+            ForceWindows
+        }
+    }
+    impl Drop for ForceWindows {
+        fn drop(&mut self) {
+            FORCE_WINDOWS.with(|c| c.set(None));
+        }
+    }
+
+    /// PINNING guard (an already-true invariant, not a fix): every host path
+    /// the confined VMM gets write access to — hence Low-labelled — must stay
+    /// clear of `<data>/daemon`, which holds `izbad.sock`. Windows AF_UNIX
+    /// connect() needs write access (spike #248), so a Low-IL VMM reaching the
+    /// socket could drive every sandbox (F-09, #281). Built from a real
+    /// `Paths` layout through the production share/disk builders, covering
+    /// every share and disk kind.
+    #[test]
+    fn confined_write_surfaces_never_touch_the_control_socket_dir() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("project"); // user-chosen, OUTSIDE the data root
+        let name = "web";
+        let mut shares = base_vm_shares(
+            &ws,
+            &paths.sandbox_dir(name).join("trust"),
+            &paths.sandbox_dir(name).join("oci"),
+            &paths.ssh_share_dir(name),
+        );
+        shares.push(FsShare {
+            tag: "izba-vnc".into(),
+            host_path: paths.vnc_share_dir(name),
+        });
+        shares.push(FsShare {
+            tag: "izba-buildout".into(),
+            host_path: buildout_share_dir(&paths, name),
+        });
+        let volumes = vec![
+            crate::volume::VolumeSpec {
+                name: None,
+                guest_path: "/eph".into(),
+                size_bytes: 1 << 30,
+                eph_id: Some(0),
+            },
+            crate::volume::parse_volume_flag("cache:/data:1g").unwrap(),
+        ];
+        let spec = VmSpec {
+            kernel: PathBuf::from("/art/vmlinux"),
+            initramfs: PathBuf::from("/art/initramfs.img"),
+            cmdline: String::new(),
+            cpus: 1,
+            mem_mb: 512,
+            disks: build_vm_disks(
+                &paths,
+                name,
+                "sha256:abc",
+                &volumes,
+                Some(Path::new("/art/kasmvnc.erofs")),
+            ),
+            shares,
+            console_log: paths.logs_dir(name).join("console.log"),
+            run_dir: paths.run_dir(name),
+            allow_unconfined: false,
+            lockdown: None,
+        };
+        let surfaces = spec.confined_write_surfaces();
+        // Non-vacuous: the list really contains the surfaces we care about.
+        assert!(surfaces.contains(&ws));
+        assert!(surfaces.contains(&paths.run_dir(name)));
+        assert!(surfaces.contains(&paths.logs_dir(name)));
+        assert!(surfaces.contains(&paths.sandbox_dir(name).join("rw.img")));
+        assert!(surfaces.contains(&paths.volume_image("cache")));
+        assert!(surfaces.contains(&buildout_share_dir(&paths, name)));
+        let daemon = paths.daemon_dir();
+        for s in &surfaces {
+            assert!(
+                !path_is_ancestor_or_equal(s, &daemon, false)
+                    && !path_is_ancestor_or_equal(&daemon, s, false),
+                "confined write surface {} overlaps the izbad control socket dir {} (F-09/#281)",
+                s.display(),
+                daemon.display()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_guard_refuses_daemon_dir_root_and_ancestors() {
+        let paths = Paths::with_root(PathBuf::from("/data/izba"));
+        for ws in ["/data/izba/daemon", "/data/izba", "/data", "/"] {
+            let err = check_workspace_spares_control_socket(&paths, Path::new(ws))
+                .expect_err(ws)
+                .to_string();
+            assert!(err.contains("F-09") && err.contains("/data/izba"), "{err}");
+        }
+    }
+
+    #[test]
+    fn workspace_guard_accepts_unrelated_and_non_ancestor_paths() {
+        let paths = Paths::with_root(PathBuf::from("/data/izba"));
+        for ws in [
+            "/data/project",
+            "/data/izbaX",
+            "/data/izba-other",
+            "/data/izba/sandboxes/web/trust",
+            "/data/izba/daemon/sub",
+            "/home/me/proj",
+        ] {
+            check_workspace_spares_control_socket(&paths, Path::new(ws)).expect(ws);
+        }
+    }
+
+    #[test]
+    fn path_ancestor_compare_is_component_wise_and_case_aware() {
+        let a = Path::new("/Data/Izba");
+        let p = Path::new("/data/izba/daemon");
+        assert!(!path_is_ancestor_or_equal(a, p, false));
+        assert!(path_is_ancestor_or_equal(a, p, true));
+        assert!(path_is_ancestor_or_equal(p, p, false));
+        assert!(!path_is_ancestor_or_equal(
+            Path::new("/data/izba"),
+            Path::new("/data/izbaX"),
+            true
+        ));
+        assert!(!path_is_ancestor_or_equal(
+            p,
+            Path::new("/data/izba"),
+            false
+        ));
+    }
+
+    #[test]
+    fn workspace_label_guard_applies_only_to_confined_windows() {
+        assert!(workspace_label_guard_applies(true, false));
+        assert!(!workspace_label_guard_applies(true, true));
+        assert!(!workspace_label_guard_applies(false, false));
+        assert!(!workspace_label_guard_applies(false, true));
+    }
+
+    fn start_with_workspace_containing_root(
+        allow_unconfined: bool,
+    ) -> (MockDriver, anyhow::Result<()>) {
+        let (dir, paths) = test_paths();
+        // The tempdir parent of the data root: an ANCESTOR of <data>/daemon.
+        create(&paths, "web", &opts(dir.path())).unwrap();
+        let driver = MockDriver::new();
+        let r = start(&paths, "web", &driver, &arts(), allow_unconfined);
+        (driver, r)
+    }
+
+    /// The call-site test: the rule is wired into `start_with_timeouts`, runs
+    /// before the driver is ever invoked, and is gated exactly to confined
+    /// Windows launches.
+    #[test]
+    fn start_refuses_ancestor_workspace_on_confined_windows_before_launch() {
+        let _w = ForceWindows::on();
+        let (driver, r) = start_with_workspace_containing_root(false);
+        let err = r.expect_err("must refuse").to_string();
+        assert!(
+            err.contains("F-09") && err.contains("control socket"),
+            "{err}"
+        );
+        assert!(
+            driver.captured.lock().unwrap().is_none(),
+            "driver.launch must never be reached"
+        );
+    }
+
+    #[test]
+    fn start_allows_ancestor_workspace_when_unconfined_or_not_windows() {
+        {
+            let _w = ForceWindows::on();
+            let (driver, r) = start_with_workspace_containing_root(true);
+            r.expect("allow_unconfined never labels");
+            assert!(driver.captured.lock().unwrap().is_some());
+        }
+        // Linux (no override): never labels, `izba run` from $HOME keeps working.
+        let (driver, r) = start_with_workspace_containing_root(false);
+        r.expect("non-windows never labels");
+        assert!(driver.captured.lock().unwrap().is_some());
     }
 }
