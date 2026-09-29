@@ -718,6 +718,41 @@ mod tests {
         assert!(matches!(l, DaemonRequest::Load { select, rename: None, .. } if select.is_empty()));
     }
 
+    #[test]
+    fn saved_and_loaded_responses_round_trip() {
+        use crate::bundle::load::{LoadReport, LoadedSandbox};
+        use crate::bundle::save::SaveReport;
+        let saved = SaveReport {
+            path: "/x.izba".into(),
+            sandboxes: vec!["a".into(), "b".into()],
+            logical_bytes: 1 << 30,
+            archive_bytes: 12345,
+            warnings: vec!["skipped special file fifo".into()],
+        };
+        let loaded = LoadReport {
+            sandboxes: vec![LoadedSandbox {
+                name: "b".into(),
+                image_ref: "ubuntu:24.04".into(),
+                workspace: "/home/v/proj".into(),
+            }],
+            warnings: vec!["reusing identical volume 'data'".into()],
+            redo: vec!["re-plug USB device 0403:6001 for 'b'".into()],
+        };
+        for resp in [
+            DaemonResponse::Saved(saved.clone()),
+            DaemonResponse::Loaded(loaded.clone()),
+        ] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &resp).unwrap();
+            let back: DaemonResponse = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+            match (resp, back) {
+                (DaemonResponse::Saved(_), DaemonResponse::Saved(b)) => assert_eq!(b, saved),
+                (DaemonResponse::Loaded(_), DaemonResponse::Loaded(b)) => assert_eq!(b, loaded),
+                (a, b) => panic!("{a:?} came back as {b:?}"),
+            }
+        }
+    }
+
     /// A `create` frame from a pre-`builder` client (the field absent) must
     /// deserialize to `builder: false` — additive, no proto bump.
     #[test]
