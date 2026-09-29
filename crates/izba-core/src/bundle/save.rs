@@ -23,7 +23,7 @@ use super::fsutil::ExactLen;
 use super::manifest::{
     BlobInfo, Checksums, Manifest, SandboxEntry, SourceOs, CHECKSUMS_PATH, MANIFEST_PATH,
 };
-use super::sparse::{chunk_entry_name, for_each_chunk, DigestBuilder};
+use super::sparse::{chunk_entry_name, data_extents, for_each_chunk, DigestBuilder};
 use super::workspace::{append_workspace, git_exec_bits, workspace_bytes};
 use super::{Progress, FORMAT_VERSION};
 use crate::liveness::Liveness;
@@ -186,12 +186,24 @@ pub fn save(
     }
 }
 
-fn blob_info(path: String, src: &Path) -> anyhow::Result<BlobInfo> {
-    let meta = std::fs::metadata(src).with_context(|| format!("stat {}", src.display()))?;
+/// A disk's manifest entry. `allocated` is the sum of its data extents on
+/// every host OS — never the file length (a Windows file's metadata carries
+/// no block count, so a sparse disk would over-ask the load's space check).
+fn disk_blob_info(path: String, src: &Path) -> anyhow::Result<BlobInfo> {
+    let f = File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let logical_len = f
+        .metadata()
+        .with_context(|| format!("stat {}", src.display()))?
+        .len();
+    let allocated = data_extents(&f, logical_len)
+        .with_context(|| format!("mapping extents of {}", src.display()))?
+        .iter()
+        .map(|(_, l)| l)
+        .sum();
     Ok(BlobInfo {
         path,
-        logical_len: meta.len(),
-        allocated: crate::sandbox::allocated_bytes(&meta),
+        logical_len,
+        allocated,
     })
 }
 
@@ -212,7 +224,7 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
     let named_volumes = plan
         .named_volumes
         .iter()
-        .map(|v| blob_info(format!("volumes/{v}.img"), &paths.volume_image(v)))
+        .map(|v| disk_blob_info(format!("volumes/{v}.img"), &paths.volume_image(v)))
         .collect::<anyhow::Result<_>>()?;
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let source_home = std::env::var_os(home_var).map(|h| h.to_string_lossy().into_owned());
@@ -241,7 +253,7 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
             source_home: source_home.clone(),
             disks: sandbox_disks(paths, name, cfg)
                 .into_iter()
-                .map(|(p, src)| blob_info(p, &src))
+                .map(|(p, src)| disk_blob_info(p, &src))
                 .collect::<anyhow::Result<_>>()?,
             workspace_bytes: ws_bytes,
             locked: paths
@@ -960,6 +972,24 @@ mod tests {
         let names = entry_names(&out);
         assert!(!names.iter().any(|n| n.ends_with("manifest.review")));
         assert!(!names.iter().any(|n| n.ends_with("/passwd")));
+    }
+
+    #[test]
+    fn a_disk_allocation_is_its_data_extent_sum_on_every_os() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("d.img");
+        crate::bundle::testutil::write_sparse_disk(&p, 0x5A);
+        let b = disk_blob_info("volumes/d.img".into(), &p).unwrap();
+        let f = File::open(&p).unwrap();
+        let sum: u64 = crate::bundle::sparse::data_extents(&f, DISK_LEN)
+            .unwrap()
+            .iter()
+            .map(|(_, l)| l)
+            .sum();
+        assert_eq!(b.logical_len, DISK_LEN);
+        assert_eq!(b.allocated, sum);
+        assert!(b.allocated <= b.logical_len);
+        assert_eq!(b.path, "volumes/d.img");
     }
 
     #[test]
