@@ -245,37 +245,108 @@ fn create_partial(
 /// the CLI's "output exists" check is not atomic (and the daemon may be
 /// asked directly), so a file appearing at `out` meanwhile is never lost. A
 /// hard link fails on an existing target on every OS; a filesystem without
-/// hard links (FAT/exFAT) falls back to claiming `out` exclusively and
-/// renaming over that claim.
+/// hard links (FAT/exFAT) falls back to [`rename_no_replace`], an atomic
+/// rename that itself refuses an existing target. There is deliberately NO
+/// claim-`out`-then-rename fallback: between the claim and the rename a
+/// concurrent writer's data at `out` would be lost.
 fn publish(partial: &Path, out: &Path) -> anyhow::Result<()> {
-    let appeared = || {
-        anyhow::anyhow!(
-            "output file {} appeared during the save; nothing was written",
-            out.display()
-        )
-    };
     match std::fs::hard_link(partial, out) {
         Ok(()) => {
             let _ = std::fs::remove_file(partial);
-            return Ok(());
+            Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(appeared()),
-        Err(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(appeared(out)),
+        Err(_) => rename_no_replace(partial, out),
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out)
-    {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(appeared()),
-        Err(e) => return Err(e).with_context(|| format!("creating {}", out.display())),
+}
+
+fn appeared(out: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "output file {} appeared during the save; nothing was written",
+        out.display()
+    )
+}
+
+/// The "neither hard links nor no-replace renames" failure; removes the partial.
+#[cfg(unix)]
+fn unsupported(partial: &Path, out: &Path) -> anyhow::Error {
+    let _ = std::fs::remove_file(partial);
+    let dir = out.parent().unwrap_or(out);
+    anyhow::anyhow!(
+        "the filesystem of {} supports neither hard links nor no-replace renames, \
+         so the archive cannot be published without risking an existing file; \
+         save to a different directory",
+        dir.display()
+    )
+}
+
+/// Atomic rename that never replaces an existing `out`
+/// (`renameat2(RENAME_NOREPLACE)`). On an existing target the partial is
+/// removed and the "appeared" error returned.
+#[cfg(target_os = "linux")]
+fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .with_context(|| format!("path {} contains a NUL byte", p.display()))
+    };
+    let (src, dst) = (cstr(partial)?, cstr(out)?);
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
     }
-    if let Err(e) = std::fs::rename(partial, out) {
-        let _ = std::fs::remove_file(out);
-        return Err(e).with_context(|| format!("renaming to {}", out.display()));
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EEXIST) => {
+            let _ = std::fs::remove_file(partial);
+            Err(appeared(out))
+        }
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Err(unsupported(partial, out)),
+        _ => {
+            let _ = std::fs::remove_file(partial);
+            Err(e).with_context(|| format!("renaming to {}", out.display()))
+        }
     }
-    Ok(())
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` refuses an existing target.
+#[cfg(windows)]
+fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let wide = |p: &Path| {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let (src, dst) = (wide(partial), wide(out));
+    // SAFETY: both buffers are NUL-terminated UTF-16 valid for the call.
+    if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    let _ = std::fs::remove_file(partial);
+    match e.raw_os_error().map(|c| c as u32) {
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Err(appeared(out)),
+        _ => Err(e).with_context(|| format!("renaming to {}", out.display())),
+    }
+}
+
+/// Other unix targets have no portable no-replace rename here.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
+    Err(unsupported(partial, out))
 }
 
 /// A disk's manifest entry. `allocated` is the sum of its data extents on
@@ -991,6 +1062,24 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"precious");
         std::fs::remove_file(&out).unwrap();
         publish(&partial, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"archive");
+        assert!(!partial.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_no_replace_publishes_fresh_and_never_replaces() {
+        let t = tempfile::tempdir().unwrap();
+        let (partial, out) = (t.path().join("p.partial"), t.path().join("x.izba"));
+        std::fs::write(&partial, b"archive").unwrap();
+        std::fs::write(&out, b"precious").unwrap();
+        let e = rename_no_replace(&partial, &out).unwrap_err().to_string();
+        assert!(e.contains("appeared during the save"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        assert!(!partial.exists(), "partial removed on refusal");
+        std::fs::remove_file(&out).unwrap();
+        std::fs::write(&partial, b"archive").unwrap();
+        rename_no_replace(&partial, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"archive");
         assert!(!partial.exists());
     }
