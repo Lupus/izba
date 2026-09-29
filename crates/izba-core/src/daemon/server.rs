@@ -370,6 +370,59 @@ fn peer_auth_mode_line() -> Option<String> {
     }
 }
 
+/// The Windows default tier's lateral exposure between sandboxes (#280,
+/// F-33), as an izbad startup line; `None` off Windows. `is_windows` is
+/// injected (callers pass `cfg!(windows)`) so both outcomes are testable on
+/// any shard.
+///
+/// It is a SEPARATE line from `peer_auth_mode_line` on purpose: that line is
+/// an inventory of izbad's OWN listeners, whereas this exposure is the VMM's
+/// listener and files, which izbad cannot gate. Facts it summarizes:
+///
+/// 1. Every default confined Windows start Low-labels
+///    `VmSpec::confined_write_surfaces` — the run dir (holding the VMM's own
+///    `vsock.sock`), console log, workspace and every writable disk.
+/// 2. The default VMM token is the invoking user's at Low integrity, so the
+///    user's DACL admits it and the Low label passes MIC.
+/// 3. Windows AF_UNIX `connect()` needs write access on the socket file
+///    (spike #248), so the Low label admits any same-user Low-IL process; a
+///    peer of a sibling's `vsock.sock` reaches its guest's control RPC and
+///    stream ports (exec, `cp`, port relays).
+/// 4. Lockdown is one-directional: it ADDS an ACE for `izba-sb-<name>` and
+///    keeps the user's, so a locked sandbox's escapee is kept out of its
+///    siblings, but an unlocked sibling's escapee can still reach a locked
+///    sandbox. Do not shorten "separated only when every sandbox is locked
+///    down" into an unconditional "lockdown separates sandboxes".
+///
+/// The #276 accept-time gate covers only izbad's `vsock.sock_1027`/`_1028`,
+/// never the VMM's own `vsock.sock`, so #276 landing must not drop this
+/// line; the wording says it does not change this.
+fn windows_sibling_exposure_line(is_windows: bool) -> Option<String> {
+    is_windows.then(|| {
+        "izbad: Windows default tier — every confined VMM runs as you at Low \
+         integrity, and every sandbox's run dir, writable disks, console log \
+         and workspace carry a Low label so its VMM can write them; a VMM that \
+         escapes its guest therefore reaches every SIBLING sandbox's surfaces \
+         too, including that sandbox's own VMM socket (vsock.sock → exec, cp \
+         and port relays in its guest). Gating izbad's egress/USB listeners \
+         (#276) does not change this. `izba lockdown <name>` runs a sandbox's \
+         VMM as its own account, which keeps that VMM's escapee out of its \
+         siblings — but an unlocked sibling can still reach a locked sandbox, \
+         so sandboxes are separated from each other only when every one of \
+         them is locked down (F-33)"
+            .to_string()
+    })
+}
+
+/// Every startup posture line, in print order: the peer-auth inventory, then
+/// the Windows sibling exposure. `None`s are dropped.
+fn startup_posture_lines(is_windows: bool) -> Vec<String> {
+    peer_auth_mode_line()
+        .into_iter()
+        .chain(windows_sibling_exposure_line(is_windows))
+        .collect()
+}
+
 /// One accept-loop iteration: accept a connection, authenticate its peer,
 /// and hand it to a fresh handler thread — or log/sleep on a transient
 /// accept error. Split out of `run_daemon_with` purely for readability;
@@ -2151,7 +2204,7 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         });
     }
 
-    if let Some(line) = peer_auth_mode_line() {
+    for line in startup_posture_lines(cfg!(windows)) {
         eprintln!("{line}");
     }
 
@@ -6470,6 +6523,64 @@ mod tests {
             line.contains("not"),
             "naming the USB broker is only honest if the line says it is NOT \
              covered; got: {line}"
+        );
+    }
+
+    #[test]
+    fn windows_sibling_exposure_line_is_absent_off_windows() {
+        assert!(super::windows_sibling_exposure_line(false).is_none());
+    }
+
+    #[test]
+    fn windows_sibling_exposure_line_names_the_sibling_surfaces() {
+        let line = super::windows_sibling_exposure_line(true).expect("Windows gets the line");
+        for needle in [
+            "SIBLING",
+            "vsock.sock",
+            "exec",
+            "writable disks",
+            "console log",
+            "workspace",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?}; got: {line}");
+        }
+    }
+
+    #[test]
+    fn windows_sibling_exposure_line_does_not_let_276_read_as_the_fix() {
+        let line = super::windows_sibling_exposure_line(true).expect("Windows gets the line");
+        assert!(line.contains("#276"), "got: {line}");
+        assert!(line.contains("does not change this"), "got: {line}");
+    }
+
+    #[test]
+    fn windows_sibling_exposure_line_names_lockdown_with_its_limit() {
+        let line = super::windows_sibling_exposure_line(true).expect("Windows gets the line");
+        for needle in [
+            "izba lockdown",
+            "an unlocked sibling can still reach a locked sandbox",
+            "only when every one of them is locked down",
+            "F-33",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?}; got: {line}");
+        }
+    }
+
+    #[test]
+    fn windows_sibling_exposure_line_is_a_single_line() {
+        let line = super::windows_sibling_exposure_line(true).expect("Windows gets the line");
+        assert!(!line.contains('\n'), "got: {line}");
+    }
+
+    #[test]
+    fn startup_posture_lines_carry_the_sibling_line_only_on_windows() {
+        let win = super::startup_posture_lines(true);
+        let sibling = super::windows_sibling_exposure_line(true).unwrap();
+        assert!(win.contains(&sibling), "got: {win:?}");
+        assert_eq!(win.first(), Some(&super::peer_auth_mode_line().unwrap()));
+        assert_eq!(
+            super::startup_posture_lines(false),
+            super::peer_auth_mode_line().into_iter().collect::<Vec<_>>()
         );
     }
 
