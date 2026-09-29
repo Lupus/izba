@@ -6,9 +6,10 @@
 //! references a saved named volume — is held for the whole write, and
 //! liveness is re-checked under the lock, so a concurrent `start` or config
 //! edit can never interleave with the copy. The archive is written to a
-//! per-run `<out>.<pid>.<seq>.partial` and renamed into place only once it is
-//! complete; any failure removes the partial, so `<out>` is either absent or
-//! a whole archive.
+//! per-run `<out>.<pid>.<seq>.partial` (created exclusively, owner-only) and
+//! published without replacing anything only once it is complete; any
+//! failure removes the partial, so `<out>` is either absent or a whole
+//! archive.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -120,16 +121,40 @@ pub fn save(
     opts: &SaveOpts,
     progress: Progress,
 ) -> anyhow::Result<SaveReport> {
-    let plan = plan(paths, &opts.names)?;
+    save_with(paths, connector, opts, progress, &plan)
+}
+
+/// Signature of [`plan`]; a test seam proving it runs under the locks.
+type PlanFn<'a> = &'a dyn Fn(&Paths, &[String]) -> anyhow::Result<Plan>;
+
+fn save_with(
+    paths: &Paths,
+    connector: Connector,
+    opts: &SaveOpts,
+    progress: Progress,
+    plan_fn: PlanFn,
+) -> anyhow::Result<SaveReport> {
+    if opts.names.is_empty() {
+        bail!("no sandboxes to save");
+    }
     // Held until this function returns: blocks `start` and config edits for
-    // the whole copy. Liveness is re-checked under the lock.
+    // the whole copy. Taken BEFORE any config is read, so the planned
+    // inventory and the copied `config.json` are one and the same state (an
+    // edit can no longer land between the plan and the lock). Liveness is
+    // re-checked under the lock.
     let mut _locks = Vec::new();
-    for (name, _) in &plan.configs {
+    let mut seen = HashSet::new();
+    for name in &opts.names {
+        crate::sandbox::validate_name(name)?;
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
         _locks.push(crate::sandbox::lock_sandbox(paths, name)?);
         if crate::sandbox::liveness_of(paths, name, connector)? != Liveness::Stopped {
             bail!("sandbox '{name}' is running; stop it first (or pass --stop)");
         }
     }
+    let plan = plan_fn(paths, &opts.names)?;
     // Also lock every OTHER sandbox that references a saved named volume, so
     // none can `start` and write the volume mid-copy (a torn image whose
     // checksums would still validate). Held for the whole write, like the
@@ -156,25 +181,16 @@ pub fn save(
             bail!("named volume '{v}' is in use by running sandbox '{h}'; stop it first");
         }
     }
-    let file_name = opts
-        .out
-        .file_name()
-        .context("output path has no file name")?;
     // Unique per run (pid + in-process counter): two concurrent saves to the
     // same --out — possibly two daemon threads — never share a partial.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let partial = opts.out.with_file_name(format!(
-        "{}.{}.{seq}.partial",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    match write_archive(paths, &plan, opts, &partial, progress) {
+    let (partial, file) = create_partial(&opts.out, &mut || {
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })?;
+    let res = write_archive(paths, &plan, opts, file, progress)
+        .and_then(|report| publish(&partial, &opts.out).map(|()| report));
+    match res {
         Ok(mut report) => {
-            if let Err(e) = std::fs::rename(&partial, &opts.out) {
-                let _ = std::fs::remove_file(&partial);
-                return Err(e).with_context(|| format!("renaming to {}", opts.out.display()));
-            }
             report.path = opts.out.clone();
             report.archive_bytes = std::fs::metadata(&opts.out)?.len();
             Ok(report)
@@ -184,6 +200,82 @@ pub fn save(
             Err(e)
         }
     }
+}
+
+/// How many partial names `create_partial` tries before giving up.
+const PARTIAL_ATTEMPTS: u32 = 16;
+
+/// Creates `<out>.<pid>.<seq>.partial` exclusively (`O_EXCL`; on Unix also
+/// `O_NOFOLLOW`, mode 0600): the name is predictable, so in a shared
+/// directory another user may already have planted a file or a symlink
+/// there — an existing name is skipped for the next `seq`, never followed
+/// nor truncated.
+fn create_partial(
+    out: &Path,
+    next_seq: &mut dyn FnMut() -> u64,
+) -> anyhow::Result<(PathBuf, File)> {
+    let file_name = out.file_name().context("output path has no file name")?;
+    for _ in 0..PARTIAL_ATTEMPTS {
+        let partial = out.with_file_name(format!(
+            "{}.{}.{}.partial",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            next_seq()
+        ));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match o.open(&partial) {
+            Ok(f) => return Ok((partial, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", partial.display())),
+        }
+    }
+    bail!(
+        "could not create a partial file beside {} ({PARTIAL_ATTEMPTS} names already taken)",
+        out.display()
+    )
+}
+
+/// Moves the finished `partial` to `out` WITHOUT replacing anything there:
+/// the CLI's "output exists" check is not atomic (and the daemon may be
+/// asked directly), so a file appearing at `out` meanwhile is never lost. A
+/// hard link fails on an existing target on every OS; a filesystem without
+/// hard links (FAT/exFAT) falls back to claiming `out` exclusively and
+/// renaming over that claim.
+fn publish(partial: &Path, out: &Path) -> anyhow::Result<()> {
+    let appeared = || {
+        anyhow::anyhow!(
+            "output file {} appeared during the save; nothing was written",
+            out.display()
+        )
+    };
+    match std::fs::hard_link(partial, out) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(partial);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(appeared()),
+        Err(_) => {}
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(appeared()),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", out.display())),
+    }
+    if let Err(e) = std::fs::rename(partial, out) {
+        let _ = std::fs::remove_file(out);
+        return Err(e).with_context(|| format!("renaming to {}", out.display()));
+    }
+    Ok(())
 }
 
 /// A disk's manifest entry. `allocated` is the sum of its data extents on
@@ -305,11 +397,10 @@ fn write_archive(
     paths: &Paths,
     plan: &Plan,
     opts: &SaveOpts,
-    partial: &Path,
+    file: File,
     progress: Progress,
 ) -> anyhow::Result<SaveReport> {
     let manifest = build_manifest(paths, plan, opts.with_workspace)?;
-    let file = File::create(partial).with_context(|| format!("creating {}", partial.display()))?;
     let mut enc = zstd::Encoder::new(BufWriter::new(file), 3)?;
     enc.include_checksum(true)?;
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get() as u32);
@@ -434,7 +525,7 @@ fn write_archive(
         .context("flushing archive")?;
     file.sync_all().context("syncing archive")?;
     Ok(SaveReport {
-        path: partial.to_path_buf(),
+        path: PathBuf::new(),
         sandboxes: plan.configs.iter().map(|(n, _)| n.clone()).collect(),
         logical_bytes: logical,
         archive_bytes: 0,
@@ -834,22 +925,151 @@ mod tests {
 
     #[test]
     fn concurrent_runs_use_distinct_partials() {
-        // Two saves of different sandboxes to the same --out, both succeed
-        // (last rename wins) and leave no partial behind.
+        // Two saves of different sandboxes to the same --out: exactly one
+        // publishes, the other refuses to replace it, and no partial is left.
         let (t, paths) = fixture();
         add_sandbox(&paths, "a", "sha256:aa", &[]);
         add_sandbox(&paths, "b", "sha256:aa", &[]);
         let out = t.path().join("x.izba");
-        std::thread::scope(|s| {
-            for n in ["a", "b"] {
-                let (paths, out) = (&paths, out.clone());
-                s.spawn(move || {
-                    save(paths, &no_conn, &opts(&[n], out, false), &mut |_| {}).unwrap();
-                });
-            }
+        let results: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = ["a", "b"]
+                .map(|n| {
+                    let (paths, out) = (&paths, out.clone());
+                    s.spawn(move || {
+                        save(paths, &no_conn, &opts(&[n], out, false), &mut |_| {})
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .into_iter()
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let e = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(e.contains("appeared during the save"), "{e}");
         assert!(out.exists());
         assert_no_partials(t.path());
+    }
+
+    #[test]
+    fn save_never_replaces_an_output_that_appears_during_the_write() {
+        let (t, paths) = fixture();
+        add_sandbox(&paths, "a", "sha256:aa", &[]);
+        let out = t.path().join("x.izba");
+        let e = save(
+            &paths,
+            &no_conn,
+            &opts(&["a"], out.clone(), false),
+            &mut |_| {
+                if !out.exists() {
+                    std::fs::write(&out, b"precious").unwrap();
+                }
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("appeared during the save") && e.contains("nothing was written"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        assert_no_partials(t.path());
+    }
+
+    #[test]
+    fn publish_refuses_an_existing_target_and_moves_the_partial_otherwise() {
+        let t = tempfile::tempdir().unwrap();
+        let (partial, out) = (t.path().join("p.partial"), t.path().join("x.izba"));
+        std::fs::write(&partial, b"archive").unwrap();
+        std::fs::write(&out, b"precious").unwrap();
+        let e = publish(&partial, &out).unwrap_err().to_string();
+        assert!(e.contains("appeared during the save"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        std::fs::remove_file(&out).unwrap();
+        publish(&partial, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"archive");
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn a_partial_name_already_taken_is_skipped_never_truncated() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("x.izba");
+        let name = |seq: u64| {
+            t.path()
+                .join(format!("x.izba.{}.{seq}.partial", std::process::id()))
+        };
+        std::fs::write(name(0), b"planted").unwrap();
+        #[cfg(unix)]
+        {
+            // A symlink planted at the next name must not be followed.
+            let victim = t.path().join("victim");
+            std::fs::write(&victim, b"keep").unwrap();
+            std::os::unix::fs::symlink(&victim, name(1)).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(name(1), b"planted").unwrap();
+        let mut seq = 0;
+        let (p, _f) = create_partial(&out, &mut || {
+            seq += 1;
+            seq - 1
+        })
+        .unwrap();
+        assert_eq!(p, name(2));
+        assert_eq!(std::fs::read(name(0)).unwrap(), b"planted");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::read(t.path().join("victim")).unwrap(), b"keep");
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Every name taken: a bounded, loud refusal.
+        let e = create_partial(&out, &mut || 0).unwrap_err().to_string();
+        assert!(e.contains("names already taken"), "{e}");
+    }
+
+    #[test]
+    fn save_plans_from_configs_read_under_the_sandbox_locks() {
+        let (t, paths) = fixture();
+        add_sandbox(&paths, "a", "sha256:aa", &[]);
+        add_sandbox(&paths, "b", "sha256:aa", &[]);
+        let busy_while_planning = std::cell::RefCell::new(Vec::new());
+        let plan_fn = |p: &Paths, names: &[String]| {
+            for n in ["a", "b"] {
+                let e = crate::sandbox::lock_sandbox(p, n)
+                    .err()
+                    .map(|e| e.to_string());
+                busy_while_planning
+                    .borrow_mut()
+                    .push(e.is_some_and(|e| e.contains("busy")));
+            }
+            plan(p, names)
+        };
+        // A config edited before the save starts is what gets planned AND copied.
+        let cp = paths.sandbox_dir("b").join(CONFIG_FILE);
+        let mut c: SandboxConfig = load_json(&cp).unwrap().unwrap();
+        c.cpus = 7;
+        save_json(&cp, &c).unwrap();
+        let out = t.path().join("x.izba");
+        let r = save_with(
+            &paths,
+            &no_conn,
+            &opts(&["a", "b"], out.clone(), false),
+            &mut |_| {},
+            &plan_fn,
+        )
+        .unwrap();
+        assert_eq!(busy_while_planning.into_inner(), vec![true, true]);
+        assert_eq!(r.sandboxes, vec!["a".to_string(), "b".to_string()]);
+        let entries = read_entries(&out);
+        let got: SandboxConfig =
+            serde_json::from_slice(body(&entries, "sandboxes/b/config.json")).unwrap();
+        assert_eq!(got.cpus, 7);
     }
 
     #[test]
@@ -1142,6 +1362,9 @@ mod tests {
         assert!(r.warnings[0].contains("'a'") && r.warnings[0].contains("fifo"));
     }
 
+    /// Unix only: NTFS cannot even create these names (`std::fs::write`
+    /// fails), so on Windows no such file can reach a save.
+    #[cfg(unix)]
     #[test]
     fn save_with_workspace_refuses_a_name_load_could_not_restore() {
         for bad in ["a:b", "CON.txt", "trail.", "back\\slash"] {
