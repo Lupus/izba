@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SandboxDetail, SandboxView } from "../../lib/types";
 import { api } from "../../lib/ipc";
 import { useStats } from "../../lib/useStats";
@@ -15,9 +15,18 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
   const { stats, error } = useStats(sandbox.name);
   const [detail, setDetail] = useState<SandboxDetail | null>(null);
 
+  // `rev` bumps on a lock-down/unlock; `state.kind` because the restart-required
+  // fact flips on start/stop. Only a NAME change blanks the card ("…").
+  const [rev, setRev] = useState(0);
+  const lastName = useRef(sandbox.name);
+  const stateKind = sandbox.state.kind;
+
   useEffect(() => {
     let alive = true;
-    setDetail(null);
+    if (lastName.current !== sandbox.name) {
+      lastName.current = sandbox.name;
+      setDetail(null);
+    }
     api.inspect(sandbox.name).then(
       (d) => {
         if (alive) setDetail(d);
@@ -29,7 +38,7 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
     return () => {
       alive = false;
     };
-  }, [sandbox.name]);
+  }, [sandbox.name, stateKind, rev]);
 
   return (
     // `overflow-auto`: the tab body is a fixed-height flex child, and four
@@ -54,6 +63,7 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
         detail={detail}
         stats={stats}
         stale={error !== null}
+        onChanged={() => setRev((r) => r + 1)}
       />
       <ResourcesCard stats={stats} />
       <div className="md:col-span-2">

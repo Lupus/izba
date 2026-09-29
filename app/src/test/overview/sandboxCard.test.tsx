@@ -167,3 +167,18 @@ describe("SandboxCard", () => {
     expect(screen.queryByText("container")).not.toBeInTheDocument();
   });
 });
+
+describe("SandboxCard lock-down row", () => {
+  const props = { name: "web", state: { kind: "running" } as const, stats: null };
+
+  it("hides the lock-down row when the host has no lock-down", () => {
+    render(<SandboxCard {...props} detail={detailFixture()} />);
+    expect(screen.queryByText("lock-down")).toBeNull();
+  });
+
+  it("shows the lock-down row when the host supports it", () => {
+    const lockdown = { locked: false, account: null, net_blocked: false, restart_required: false, booted_as_account: false };
+    render(<SandboxCard {...props} detail={detailFixture({ lockdown })} />);
+    expect(screen.getByText("lock-down")).toBeInTheDocument();
+  });
+});
