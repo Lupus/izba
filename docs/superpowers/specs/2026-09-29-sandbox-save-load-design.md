@@ -1,6 +1,6 @@
 # Sandbox save/load (move sandboxes between hosts) — design
 
-Status: approved in brainstorming 2026-09-29; awaiting written-spec review.
+Status: approved 2026-09-29. Implementation amendments (from planning) are in §10.
 
 ## 1. Goal
 
@@ -280,3 +280,22 @@ TDD throughout.
 - Windows: `validate-izba-windows.ps1` gains save/load on Windows plus a
   sparseness check. The cross-OS move (WSL → Windows via `/mnt/c`) is
   exercised manually through interop before the PR is reported.
+
+## 10. Amendments from implementation planning
+
+- **Cmdline keys:** `izba.diskuidmap=` + `izba.diskgidmap=` (two keys, same
+  `disk-presented-size` grammar as `izba.uidmap=`), instead of one
+  `izba.diskidmap=<uid>;<gid>`, so init reuses its existing parser.
+- **Disk encoding:** a tar header needs the entry size up front, so a disk is
+  stored as a `<path>.len` entry (8-byte LE logical length) plus
+  `<path>.d/<offset-hex16>` entries of ≤ 4 MiB of non-zero 64 KiB blocks,
+  instead of one `.xsp` body.
+- **Checksums:** a `checksums.json` trailer (last entry), because digests are
+  computed while streaming. `manifest.json` (first) carries sizes for
+  preflight. A disk's digest is canonical (sha256 over logical length + each
+  non-zero 64 KiB block with its offset), so it is identical for a sparse
+  file and its fully-allocated twin; equal digest + equal length ⇔ logically
+  byte-identical. Workspace transport integrity is the zstd frame checksum.
+- **Client disconnect:** the daemon's progress channel cannot observe the
+  client going away, so an interrupted CLI does not abort a running save; the
+  archive still lands at `<out>` (atomically, via `.partial`).
