@@ -3,6 +3,7 @@
 //! fake guest connectors, and pid-identity fixtures. Never compiled into
 //! release builds (`#[cfg(test)]` at the module declaration).
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -437,6 +438,43 @@ pub(crate) fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box
             let _ = read_frame::<_, Request>(&mut s);
             // Keep the socket open so the client cannot see EOF.
             std::thread::sleep(Duration::from_secs(10));
+        });
+        Ok(Box::new(client) as Box<dyn IoStream>)
+    }
+}
+
+/// Guest side of a hostile trickle (#205): after the host's request has been
+/// read, announce a large-but-legal frame (a valid u32-LE length prefix) and
+/// then dribble its payload one byte every `TRICKLE_GAP` for `TRICKLE_FOR` —
+/// each gap well inside any per-syscall read timeout, so only an OVERALL
+/// deadline can cut the exchange short. Stops quietly once the host hangs up
+/// (a write fails), then closes.
+pub(crate) fn trickle_frame(mut s: UdsStream) {
+    const ANNOUNCED_LEN: u32 = 4096;
+    const TRICKLE_GAP: Duration = Duration::from_millis(50);
+    const TRICKLE_FOR: Duration = Duration::from_secs(3);
+    if s.write_all(&ANNOUNCED_LEN.to_le_bytes()).is_err() {
+        return;
+    }
+    let until = std::time::Instant::now() + TRICKLE_FOR;
+    while std::time::Instant::now() < until {
+        std::thread::sleep(TRICKLE_GAP);
+        if s.write_all(b"x").is_err() {
+            return;
+        }
+    }
+}
+
+/// Control-port connector to a guest that reads the request and then
+/// trickles its reply (see [`trickle_frame`]).
+pub(crate) fn trickling_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
+    |_paths: &Paths, _name: &str| {
+        let (client, server) = UdsStream::pair()?;
+        std::thread::spawn(move || {
+            let mut s = server;
+            if read_frame::<_, Request>(&mut s).is_ok() {
+                trickle_frame(s);
+            }
         });
         Ok(Box::new(client) as Box<dyn IoStream>)
     }
