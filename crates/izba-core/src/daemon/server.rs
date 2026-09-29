@@ -392,7 +392,9 @@ fn peer_auth_mode_line() -> Option<String> {
 ///    keeps the user's, so a locked sandbox's escapee is kept out of its
 ///    siblings, but an unlocked sibling's escapee can still reach a locked
 ///    sandbox. Do not shorten "separated only when every sandbox is locked
-///    down" into an unconditional "lockdown separates sandboxes".
+///    down" into an unconditional "lockdown separates sandboxes". Even then,
+///    a workspace whose DACL grants `Users`/`Authenticated Users` stays
+///    reachable by every lockdown account, so the line says so.
 ///
 /// The #276 accept-time gate covers only izbad's `vsock.sock_1027`/`_1028`,
 /// never the VMM's own `vsock.sock`, so #276 landing must not drop this
@@ -409,7 +411,8 @@ fn windows_sibling_exposure_line(is_windows: bool) -> Option<String> {
          VMM as its own account, which keeps that VMM's escapee out of its \
          siblings — but an unlocked sibling can still reach a locked sandbox, \
          so sandboxes are separated from each other only when every one of \
-         them is locked down (F-33)"
+         them is locked down, and even then not through a workspace whose \
+         permissions grant Users or Authenticated Users (F-33)"
             .to_string()
     })
 }
@@ -6561,6 +6564,7 @@ mod tests {
             "izba lockdown",
             "an unlocked sibling can still reach a locked sandbox",
             "only when every one of them is locked down",
+            "Authenticated Users",
             "F-33",
         ] {
             assert!(line.contains(needle), "missing {needle:?}; got: {line}");
