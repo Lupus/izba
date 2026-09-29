@@ -51,6 +51,22 @@ describe("LockdownRow", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
+  it("disables the open Unlock confirmation while unknown and re-enables it when known", () => {
+    const { rerender } = render(<LockdownRow name="web" lockdown={locked} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+    rerender(<LockdownRow name="web" lockdown={locked} onChanged={() => {}} unknown />);
+    const confirm = screen.getByRole("button", { name: "Unlock sandbox" });
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "The lock-down state is unknown right now — wait for it to refresh before unlocking.",
+    );
+    fireEvent.click(confirm);
+    expect(unlock).not.toHaveBeenCalled();
+    rerender(<LockdownRow name="web" lockdown={locked} onChanged={() => {}} />);
+    expect(screen.getByRole("button", { name: "Unlock sandbox" })).toBeEnabled();
+    expect(screen.getByRole("dialog")).not.toHaveTextContent(/state is unknown/);
+  });
+
   it("offers Lock down when unlocked", () => {
     render(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} />);
     expect(screen.getByText("unlocked")).toBeInTheDocument();

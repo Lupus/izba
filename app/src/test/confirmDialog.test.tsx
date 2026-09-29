@@ -21,6 +21,14 @@ describe("ConfirmDialog", () => {
     expect(onConfirm).toHaveBeenCalledOnce();
   });
 
+  it("confirmDisabled disables the confirm button", () => {
+    const onConfirm = vi.fn();
+    render(<ConfirmDialog title="t" message="m" confirmLabel="Go" confirmDisabled onConfirm={onConfirm} onCancel={() => {}} />);
+    expect(screen.getByRole("button", { name: "Go" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
   it("fires onCancel from the Cancel button", () => {
     const onCancel = vi.fn();
     render(
