@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 /// Path of the local tag store for the given `paths`.
-fn tags_path(paths: &Paths) -> std::path::PathBuf {
+pub(crate) fn tags_path(paths: &Paths) -> std::path::PathBuf {
     paths.images_dir().join("tags.json")
 }
 

@@ -227,12 +227,21 @@ pub fn chunk_entry_name(prefix: &str, offset: u64) -> String {
     format!("{prefix}.d/{offset:016x}")
 }
 
+/// Inverse of `chunk_entry_name`, accepting ONLY the canonical spelling save
+/// writes: exactly 16 lowercase hex digits naming a `ZERO_BLOCK`-aligned
+/// offset. Anything else (`+`, uppercase, unaligned) is `None`, so two
+/// different entry names can never alias one chunk in a hostile archive.
 pub fn parse_chunk_entry(name: &str) -> Option<(&str, u64)> {
     let (prefix, hexoff) = name.rsplit_once(".d/")?;
-    if hexoff.len() != 16 {
+    if hexoff.len() != 16
+        || !hexoff
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return None;
     }
-    Some((prefix, u64::from_str_radix(hexoff, 16).ok()?))
+    let off = u64::from_str_radix(hexoff, 16).ok()?;
+    (off % ZERO_BLOCK == 0).then_some((prefix, off))
 }
 
 #[cfg(test)]
@@ -398,6 +407,27 @@ mod tests {
         );
         assert_eq!(parse_chunk_entry("sandboxes/a/rw.img.d/xyz"), None);
         assert_eq!(parse_chunk_entry("sandboxes/a/config.json"), None);
+    }
+
+    #[test]
+    fn non_canonical_chunk_names_are_rejected() {
+        for bad in [
+            // not exactly 16 lowercase hex digits
+            "v.img.d/+000000000010000",
+            "v.img.d/00000000000A0000",
+            "v.img.d/000000000010000",
+            "v.img.d/00000000000100000",
+            "v.img.d/ 000000000010000",
+            // offset not a multiple of ZERO_BLOCK
+            "v.img.d/0000000000000001",
+            "v.img.d/0000000000018000",
+        ] {
+            assert_eq!(parse_chunk_entry(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_chunk_entry("v.img.d/00000000000a0000"),
+            Some(("v.img", 0xa_0000))
+        );
     }
 
     #[cfg(target_os = "linux")]
