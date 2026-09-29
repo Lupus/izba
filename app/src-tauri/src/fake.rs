@@ -335,6 +335,8 @@ impl DaemonApi for FakeDaemon {
             vnc_running: self.vnc_running,
             vnc_url: self.vnc_url.clone(),
             vnc_restart_required: self.vnc_restart_required,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         })
     }
 

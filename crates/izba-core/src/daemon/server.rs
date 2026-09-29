@@ -976,6 +976,16 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     // the two answers can never disagree about the same sandbox.
     let running = d.registry.liveness(&name).unwrap_or(Liveness::Stopped) != Liveness::Stopped;
     let booted_vnc = run_state.as_ref().map(|s| s.vnc).unwrap_or(false);
+    let lockdown_account = if running {
+        run_state.as_ref().and_then(|s| s.lockdown_account.clone())
+    } else {
+        None
+    };
+    let lockdown_restart_required = crate::jail_account::lockdown_restart_required(
+        &crate::jail_account::lockdown_state(&d.paths, &name),
+        lockdown_account.as_deref(),
+        running,
+    );
     // Honesty: the VM (liveness) being up does not mean the workload container
     // inside it is. Probe the guest's container state best-effort; any failure
     // (unreachable/wedged guest, or a guest that doesn't report it) maps to
@@ -1030,6 +1040,8 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         vnc_running,
         vnc_url,
         vnc_restart_required: needs_vnc_restart(config.vnc, running, booted_vnc),
+        lockdown_account,
+        lockdown_restart_required,
     }))
 }
 
@@ -2915,6 +2927,7 @@ mod tests {
                 user_fallback: None,
                 usb_kernel: true,
                 vnc: false,
+                lockdown_account: None,
             },
         )
         .unwrap();
@@ -3217,6 +3230,7 @@ mod tests {
                 user_fallback: Some(UserFallback::new("node")),
                 usb_kernel: false,
                 vnc: false,
+                lockdown_account: None,
             },
         )
         .unwrap();
@@ -3515,6 +3529,7 @@ mod tests {
                 user_fallback: None,
                 usb_kernel: false,
                 vnc: false,
+                lockdown_account: None,
             },
         )
         .unwrap();
@@ -3558,6 +3573,71 @@ mod tests {
             DaemonResponse::Inspect(det) => assert!(!det.vnc_restart_required),
             other => panic!("expected Inspect, got {other:?}"),
         }
+    }
+
+    /// `Inspect` derives lock-down restart-required from the configured
+    /// `lockdown.json` against the account the live VMM booted as (the run
+    /// record), against the real handler.
+    #[test]
+    fn inspect_reports_lockdown_restart_required() {
+        use crate::jail_account::{LockdownFile, LockedInfo, LOCKDOWN_FILE};
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        save_json(
+            &d.paths.sandbox_dir("web").join(LOCKDOWN_FILE),
+            &LockdownFile {
+                state: Some(LockedInfo {
+                    account: "izba-sb-web".into(),
+                    sid: "S-1".into(),
+                    net_blocked: true,
+                }),
+            },
+        )
+        .unwrap();
+        let write_run = |account: Option<&str>| {
+            save_json(
+                &d.paths.sandbox_dir("web").join(STATE_FILE),
+                &RunState {
+                    vmm_pid: live_identity(),
+                    sidecar_pids: vec![],
+                    started_unix_ms: 0,
+                    confinement: None,
+                    run_dir: None,
+                    user_fallback: None,
+                    usb_kernel: false,
+                    vnc: false,
+                    lockdown_account: account.map(str::to_string),
+                },
+            )
+            .unwrap();
+        };
+        let inspect = |c: &mut _| match rpc(c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => det,
+            other => panic!("expected Inspect, got {other:?}"),
+        };
+
+        // Stopped: nothing to restart, no booted account reported.
+        write_run(Some("izba-sb-web"));
+        let det = inspect(&mut c);
+        assert!(!det.lockdown_restart_required);
+        assert_eq!(det.lockdown_account, None);
+
+        // Running, booted unconfined while configured locked.
+        d.registry.set_liveness("web", Liveness::Running);
+        write_run(None);
+        let det = inspect(&mut c);
+        assert!(det.lockdown_restart_required);
+        assert_eq!(det.lockdown_account, None);
+
+        // Running as the configured account: applied.
+        write_run(Some("izba-sb-web"));
+        let det = inspect(&mut c);
+        assert!(!det.lockdown_restart_required);
+        assert_eq!(det.lockdown_account.as_deref(), Some("izba-sb-web"));
     }
 
     /// The guard Task 4's reviewer flagged: enabling VNC on a sandbox already
@@ -4484,6 +4564,7 @@ mod tests {
                 user_fallback: None,
                 usb_kernel: false,
                 vnc: true,
+                lockdown_account: None,
             },
         )
         .unwrap();

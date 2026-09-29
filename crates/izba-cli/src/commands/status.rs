@@ -45,7 +45,10 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 /// `unknown`.
 fn render(paths: &Paths, det: &SandboxDetail, stats: Option<&SandboxStats>) -> String {
     let confinement = det.confinement.as_deref().unwrap_or("unknown");
-    let lockdown = lockdown_state(paths, &det.name).summary();
+    let mut lockdown = lockdown_state(paths, &det.name).summary();
+    if det.lockdown_restart_required {
+        lockdown.push_str(" (restart required)");
+    }
     let mut out = format!(
         "name:        {}\n\
          image:       {}\n\
@@ -222,6 +225,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         }
     }
 
@@ -596,6 +601,19 @@ mod tests {
         assert_eq!(
             engine_line(Some(&stats_with(None))),
             "engine:      unknown (guest reported no engine state)"
+        );
+    }
+
+    #[test]
+    fn renders_lockdown_restart_required_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.lockdown_restart_required = true;
+        let out = render(&paths, &det, None);
+        assert!(
+            out.contains("lock-down:   unlocked (restart required)"),
+            "{out}"
         );
     }
 

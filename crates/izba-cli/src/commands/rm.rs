@@ -102,6 +102,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         }
     }
 

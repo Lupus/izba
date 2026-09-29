@@ -171,6 +171,14 @@ pub struct RunState {
     /// direction (never claims a desktop it doesn't have).
     #[serde(default)]
     pub vnc: bool,
+    /// The Windows lock-down account (MVP-D) this run's VMM was launched as,
+    /// or `None` when it ran as the invoking user. Recorded at launch — like
+    /// `usb_kernel`/`vnc`, this is the only answer to "is the RUNNING VMM
+    /// confined to the account", which `lockdown.json` (the configured
+    /// posture, applied at the NEXT start) cannot give. `serde(default)`: a
+    /// pre-field `state.json` reads as `None`.
+    #[serde(default)]
+    pub lockdown_account: Option<String>,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -314,7 +322,26 @@ mod tests {
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         }
+    }
+
+    #[test]
+    fn a_state_json_written_before_lockdown_account_reads_as_none() {
+        // Same safe direction as usb_kernel: an old record never claims the
+        // VMM was launched as the lock-down account.
+        let mut v = serde_json::to_value(sample_run_state()).unwrap();
+        v.as_object_mut().unwrap().remove("lockdown_account");
+        let s: RunState = serde_json::from_value(v).unwrap();
+        assert!(s.lockdown_account.is_none());
+    }
+
+    #[test]
+    fn run_state_roundtrips_lockdown_account() {
+        let mut s = sample_run_state();
+        s.lockdown_account = Some("izba-sb-web".into());
+        let back: RunState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.lockdown_account.as_deref(), Some("izba-sb-web"));
     }
 
     #[test]

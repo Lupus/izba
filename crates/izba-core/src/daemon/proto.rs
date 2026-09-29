@@ -312,6 +312,16 @@ pub struct SandboxDetail {
     /// DAEMON_PROTO_VERSION bump.
     #[serde(default)]
     pub vnc_restart_required: bool,
+    /// The lock-down account the live VMM was launched as (from
+    /// `RunState.lockdown_account`); `None` when stopped or unconfined.
+    /// Additive + serde(default) → no DAEMON_PROTO_VERSION bump.
+    #[serde(default)]
+    pub lockdown_account: Option<String>,
+    /// Running with a lock-down posture other than the configured one
+    /// (`jail_account::lockdown_restart_required`). Additive + serde(default)
+    /// → no DAEMON_PROTO_VERSION bump; an older daemon reads as `false`.
+    #[serde(default)]
+    pub lockdown_restart_required: bool,
 }
 
 /// Hand-written so `vnc_url` — which carries the sandbox's plaintext VNC
@@ -341,6 +351,8 @@ impl std::fmt::Debug for SandboxDetail {
             .field("vnc_running", &self.vnc_running)
             .field("vnc_url", &self.vnc_url.as_ref().map(|_| "<redacted>"))
             .field("vnc_restart_required", &self.vnc_restart_required)
+            .field("lockdown_account", &self.lockdown_account)
+            .field("lockdown_restart_required", &self.lockdown_restart_required)
             .finish()
     }
 }
@@ -732,6 +744,8 @@ mod tests {
                 vnc_running: false,
                 vnc_url: None,
                 vnc_restart_required: false,
+                lockdown_account: None,
+                lockdown_restart_required: false,
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Pruned {
@@ -874,6 +888,8 @@ mod tests {
             vnc_running: true,
             vnc_url: Some("http://izba:sup3rs3cr3tpassw0rd@127.0.0.1:41234/".into()),
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         };
         let rendered = format!("{det:?}");
         assert!(
@@ -918,6 +934,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         });
         let json = serde_json::to_string(&resp).unwrap();
         let back: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -955,6 +973,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         });
         // DaemonResponse is internally tagged (`#[serde(tag = "type")]`), so a
         // newtype variant flattens its struct's fields alongside `type` at the
