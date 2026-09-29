@@ -1174,7 +1174,7 @@ pub fn start_with_timeouts(
     // Recorded in state.json only once boot succeeded (record_run_state), so
     // it states a launch that actually happened; a locked launch that fails
     // fails the whole start — there is no silent fallback to mis-record.
-    let lockdown_account = spec.lockdown.as_ref().map(|l| l.account().to_string());
+    let lockdown_account = booted_lockdown_account(&spec);
 
     let mut handle = driver.launch(&spec)?;
 
@@ -1256,6 +1256,12 @@ fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool 
         ))
     })()
     .unwrap_or(false)
+}
+
+/// The account a launch runs the VMM as, recorded in `state.json` so the
+/// "restart required" answer reflects what is actually running.
+fn booted_lockdown_account(spec: &VmSpec) -> Option<String> {
+    spec.lockdown.as_ref().map(|l| l.account().to_string())
 }
 
 /// Persist the post-boot `state.json`: the VMM pid (split out of the driver's
@@ -2904,6 +2910,23 @@ mod tests {
         grant_a_device(&paths, "withusb");
         start(&paths, "withusb", &MockDriver::new(), &arts_usb(), false).unwrap();
         assert!(started_run_state(&paths, "withusb").usb_kernel);
+    }
+
+    /// The call site in `start`: the recorded account is exactly the one the
+    /// spec handed to the VMM launch (None for an unlocked launch).
+    #[test]
+    fn booted_lockdown_account_follows_the_spec() {
+        use crate::vmm::spec::LockdownLaunch;
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "bl", &opts(&ws)).unwrap();
+        let driver = MockDriver::new();
+        start(&paths, "bl", &driver, &arts(), false).unwrap();
+        let mut spec = driver.captured.lock().unwrap().clone().unwrap();
+        assert_eq!(booted_lockdown_account(&spec), None);
+        spec.lockdown = Some(LockdownLaunch::new("izba-sb-x".into(), "pw".into()));
+        assert_eq!(booted_lockdown_account(&spec).as_deref(), Some("izba-sb-x"));
     }
 
     /// `record_run_state` persists the lock-down account the VMM launched as.
