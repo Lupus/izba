@@ -579,6 +579,20 @@ fn run(
             }
             fs::rename(from, &to).with_context(|| format!("installing {}", to.display()))?;
         }
+        // The workspace's izba.yml still names the sandbox it was saved as
+        // (metadata.name, or the dir basename by default): diff/promote there
+        // would resolve to that name, not the one this load created.
+        if s.name != s.src && cfg.workspace.join("izba.yml").is_file() {
+            report.warnings.push(format!(
+                "sandbox '{}' was loaded as '{}': izba diff/promote in {} will resolve to \
+                 '{}' — update metadata.name in izba.yml or pass --name {}",
+                s.src,
+                s.name,
+                cfg.workspace.display(),
+                s.src,
+                s.name
+            ));
+        }
         report.sandboxes.push(LoadedSandbox {
             name: s.name.clone(),
             image_ref: cfg.image_ref.clone(),
@@ -1545,6 +1559,43 @@ mod tests {
         }
         assert!(tgt.paths.run_dir("b").join("owner").is_file());
         assert!(no_stage_left(&tgt));
+    }
+
+    #[test]
+    fn a_renamed_load_warns_about_a_workspace_izba_yml() {
+        let src = Src::new();
+        let ws = crate::bundle::testutil::workspace_of(&src.paths, "a");
+        std::fs::write(ws.join("izba.yml"), b"metadata:\n  name: a\n").unwrap();
+        let tgt = Tgt::new();
+        let ar = tgt.dir("in.izba");
+        src.save_to(&["a"], true, &ar);
+        let renamed = LoadOpts {
+            rename: Some("b".into()),
+            ..opts(ar.clone(), Some(tgt.dir("ws/b")))
+        };
+        let rep = load_with(&tgt.paths, &renamed, &mut |_| {}, &tgt.hooks()).unwrap();
+        let w: Vec<_> = rep
+            .warnings
+            .iter()
+            .filter(|w| w.contains("izba.yml"))
+            .collect();
+        assert_eq!(w.len(), 1, "{:?}", rep.warnings);
+        assert!(
+            w[0].contains("resolve to 'a'")
+                && w[0].contains("metadata.name")
+                && w[0].contains("--name"),
+            "{}",
+            w[0]
+        );
+        // Not renamed: nothing to warn about.
+        std::fs::remove_dir_all(tgt.paths.sandbox_dir("b")).unwrap();
+        let plain = opts(ar, Some(tgt.dir("ws/a")));
+        let rep = load_with(&tgt.paths, &plain, &mut |_| {}, &tgt.hooks()).unwrap();
+        assert!(
+            !rep.warnings.iter().any(|w| w.contains("izba.yml")),
+            "{:?}",
+            rep.warnings
+        );
     }
 
     #[test]
