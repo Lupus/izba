@@ -6,11 +6,12 @@ interface Props {
   message: string;
   confirmLabel: string;
   danger?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
 
-export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm, onCancel }: Props) {
+export function ConfirmDialog({ title, message, confirmLabel, danger, confirmDisabled = false, onConfirm, onCancel }: Props) {
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onCancel(); }}>
       <DialogContent aria-label={title}>
@@ -22,7 +23,7 @@ export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm,
           <DialogClose asChild>
             <Button variant="ghost">Cancel</Button>
           </DialogClose>
-          <Button variant={danger ? "destructive" : "default"} onClick={onConfirm}>
+          <Button variant={danger ? "destructive" : "default"} disabled={confirmDisabled} onClick={onConfirm}>
             {confirmLabel}
           </Button>
         </DialogFooter>

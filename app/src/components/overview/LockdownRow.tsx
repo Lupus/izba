@@ -99,7 +99,10 @@ export function LockdownRow({
       {confirming && (
         <ConfirmDialog
           title="Unlock sandbox?"
-          message="The network block and the locked-down account are removed immediately. A running sandbox's VMM keeps running as the old account until its next restart, then runs as your own user with network access. Requires administrator approval (UAC)."
+          message={`The network block and the locked-down account are removed immediately. A running sandbox's VMM keeps running as the old account until its next restart, then runs as your own user with network access. Requires administrator approval (UAC).${
+            unknown ? " The lock-down state is unknown right now — wait for it to refresh before unlocking." : ""
+          }`}
+          confirmDisabled={unknown}
           confirmLabel="Unlock sandbox"
           danger
           onCancel={() => setConfirming(false)}

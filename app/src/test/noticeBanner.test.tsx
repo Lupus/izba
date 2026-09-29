@@ -1,18 +1,36 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
-import { NoticeBanner } from "../components/NoticeBanner";
+import { NoticeBanner, appendNotice } from "../components/NoticeBanner";
 
 describe("NoticeBanner", () => {
-  it("renders nothing without a notice", () => {
-    render(<NoticeBanner notice={null} onDismiss={() => {}} />);
+  it("renders nothing without notices", () => {
+    render(<NoticeBanner notices={[]} onDismiss={() => {}} />);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("shows the notice and Dismiss clears it", () => {
+  it("shows the notice and Dismiss reports its index", () => {
     const onDismiss = vi.fn();
-    render(<NoticeBanner notice="run 'izba windows-cleanup'" onDismiss={onDismiss} />);
+    render(<NoticeBanner notices={["run 'izba windows-cleanup'"]} onDismiss={onDismiss} />);
     expect(screen.getByRole("alert")).toHaveTextContent("izba windows-cleanup");
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(onDismiss).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(onDismiss).toHaveBeenCalledWith(0);
+  });
+
+  it("renders every notice with its own Dismiss", () => {
+    const onDismiss = vi.fn();
+    render(<NoticeBanner notices={["first", "second"]} onDismiss={onDismiss} />);
+    expect(screen.getAllByRole("alert")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notice 2" }));
+    expect(onDismiss).toHaveBeenCalledWith(1);
+  });
+});
+
+describe("appendNotice", () => {
+  it("appends, keeping earlier guidance", () => {
+    expect(appendNotice(["a"], "b")).toEqual(["a", "b"]);
+  });
+  it("skips an identical notice", () => {
+    const list = ["a"];
+    expect(appendNotice(list, "a")).toBe(list);
   });
 });
