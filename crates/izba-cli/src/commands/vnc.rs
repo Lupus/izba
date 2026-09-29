@@ -254,6 +254,8 @@ mod tests {
             vnc_running,
             vnc_url: vnc_url.map(String::from),
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         }
     }
 

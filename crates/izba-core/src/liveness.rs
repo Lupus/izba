@@ -118,6 +118,7 @@ mod tests {
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         }
     }
 

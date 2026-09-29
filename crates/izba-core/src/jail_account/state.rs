@@ -55,6 +55,29 @@ impl LockdownState {
     }
 }
 
+/// Whether a sandbox is RUNNING with a lock-down posture other than the one
+/// configured on disk — lock-down only takes effect at the next start. The
+/// single source of truth for "restart to apply": the daemon's Inspect reply
+/// carries its answer, and neither the CLI nor the app re-derives it.
+///
+/// `booted_account` is the account the live VMM was launched as
+/// (`RunState.lockdown_account`); `None` also covers a `state.json` written
+/// before that field existed — a configured-locked sandbox then reports
+/// restart-required, because we cannot prove it runs as the account.
+pub fn lockdown_restart_required(
+    configured: &LockdownState,
+    booted_account: Option<&str>,
+    running: bool,
+) -> bool {
+    if !running {
+        return false;
+    }
+    match configured {
+        LockdownState::Locked(info) => booted_account != Some(info.account.as_str()),
+        LockdownState::Unlocked | LockdownState::Degraded { .. } => booted_account.is_some(),
+    }
+}
+
 /// On-disk representation of the lock-down state, persisted as `lockdown.json`
 /// in the sandbox directory.
 ///
@@ -80,6 +103,71 @@ mod tests {
             sid: "S-1-5-21-1234567890-1234567890-1234567890-1001".to_string(),
             net_blocked: true,
         }
+    }
+
+    // --- lockdown_restart_required truth table ---
+
+    #[test]
+    fn restart_never_required_when_not_running() {
+        let locked = LockdownState::Locked(locked_info());
+        assert!(!lockdown_restart_required(&locked, None, false));
+        assert!(!lockdown_restart_required(
+            &LockdownState::Unlocked,
+            Some("izba-sb-foo"),
+            false
+        ));
+    }
+
+    #[test]
+    fn locked_and_booted_as_that_account_is_applied() {
+        let locked = LockdownState::Locked(locked_info());
+        assert!(!lockdown_restart_required(
+            &locked,
+            Some("izba-sb-foo"),
+            true
+        ));
+    }
+
+    #[test]
+    fn locked_but_booted_unconfined_requires_restart() {
+        // Also the pre-upgrade case: a state.json without the field reads as
+        // None, and we cannot prove the VMM runs as the account.
+        let locked = LockdownState::Locked(locked_info());
+        assert!(lockdown_restart_required(&locked, None, true));
+    }
+
+    #[test]
+    fn locked_but_booted_as_a_different_account_requires_restart() {
+        let locked = LockdownState::Locked(locked_info());
+        assert!(lockdown_restart_required(
+            &locked,
+            Some("izba-sb-other"),
+            true
+        ));
+    }
+
+    #[test]
+    fn unlocked_but_still_running_as_account_requires_restart() {
+        assert!(lockdown_restart_required(
+            &LockdownState::Unlocked,
+            Some("izba-sb-foo"),
+            true
+        ));
+        let degraded = LockdownState::Degraded { reason: "x".into() };
+        assert!(lockdown_restart_required(
+            &degraded,
+            Some("izba-sb-foo"),
+            true
+        ));
+    }
+
+    #[test]
+    fn unlocked_and_booted_unconfined_is_applied() {
+        assert!(!lockdown_restart_required(
+            &LockdownState::Unlocked,
+            None,
+            true
+        ));
     }
 
     // --- serde round-trip ---

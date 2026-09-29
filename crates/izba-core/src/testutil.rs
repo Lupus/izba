@@ -239,6 +239,7 @@ pub(crate) fn write_state_with_run_dir(
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         },
     )
     .unwrap();
@@ -261,6 +262,7 @@ pub(crate) fn write_state_with_sidecars(
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         },
     )
     .unwrap();

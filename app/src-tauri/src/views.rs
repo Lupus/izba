@@ -1042,6 +1042,8 @@ mod tests {
             vnc_running: true,
             vnc_url: Some("vnc://127.0.0.1:5901".into()),
             vnc_restart_required: true,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.name, "web");
@@ -1081,6 +1083,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.workspace, r"C:\Users\u\proj");
@@ -1110,6 +1114,8 @@ mod tests {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         };
         let v = SandboxDetailView::from(detail);
         assert!(v.docker);

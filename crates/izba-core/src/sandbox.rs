@@ -1171,6 +1171,10 @@ pub fn start_with_timeouts(
     // after constructing the base spec so the base vec literal stays readable.
     let mut spec = spec;
     spec.shares.extend(extra_shares);
+    // Recorded in state.json only once boot succeeded (record_run_state), so
+    // it states a launch that actually happened; a locked launch that fails
+    // fails the whole start — there is no silent fallback to mis-record.
+    let lockdown_account = spec.lockdown.as_ref().map(|l| l.account().to_string());
 
     let mut handle = driver.launch(&spec)?;
 
@@ -1185,6 +1189,7 @@ pub fn start_with_timeouts(
             user_fallback,
             has_usb_kernel,
             has_vnc,
+            lockdown_account,
         )
     })();
 
@@ -1259,7 +1264,8 @@ fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool 
 /// honestly — and loudly when unconfined), which kernel variant booted (so
 /// a grant added later can be told apart from one the running kernel supports),
 /// and whether this run booted with the VNC desktop disk+cmdline (so a VNC
-/// toggle on a running sandbox can be told apart the same way).
+/// toggle on a running sandbox can be told apart the same way), and which
+/// lock-down account, if any, the VMM was launched as.
 fn record_run_state(
     paths: &Paths,
     name: &str,
@@ -1267,6 +1273,7 @@ fn record_run_state(
     user_fallback: Option<crate::state::UserFallback>,
     usb_kernel: bool,
     vnc: bool,
+    lockdown_account: Option<String>,
 ) -> anyhow::Result<()> {
     let mut pids = handle.pids();
     let vmm_idx = pids
@@ -1286,6 +1293,7 @@ fn record_run_state(
         user_fallback,
         usb_kernel,
         vnc,
+        lockdown_account,
     };
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
@@ -2077,6 +2085,7 @@ mod tests {
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         };
         save_json(&paths.sandbox_dir("web").join(STATE_FILE), &legacy).unwrap();
         assert_eq!(live_run_dir(&paths, "web"), paths.legacy_run_dir("web"));
@@ -2895,6 +2904,36 @@ mod tests {
         grant_a_device(&paths, "withusb");
         start(&paths, "withusb", &MockDriver::new(), &arts_usb(), false).unwrap();
         assert!(started_run_state(&paths, "withusb").usb_kernel);
+    }
+
+    /// `record_run_state` persists the lock-down account the VMM launched as.
+    #[test]
+    fn record_run_state_persists_the_lockdown_account() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "lk", &opts(&ws)).unwrap();
+        let driver = MockDriver::new();
+        start(&paths, "lk", &driver, &arts(), false).unwrap();
+        // An ordinary (unlocked) start records no account.
+        assert_eq!(started_run_state(&paths, "lk").lockdown_account, None);
+
+        let spec = driver.captured.lock().unwrap().clone().unwrap();
+        let handle = driver.launch(&spec).unwrap();
+        record_run_state(
+            &paths,
+            "lk",
+            handle.as_ref(),
+            None,
+            false,
+            false,
+            Some("izba-sb-x".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            started_run_state(&paths, "lk").lockdown_account.as_deref(),
+            Some("izba-sb-x")
+        );
     }
 
     /// The kernel is picked from one read of config.json and `start` re-reads
@@ -3995,6 +4034,7 @@ mod tests {
                 user_fallback: None,
                 usb_kernel: false,
                 vnc: false,
+                lockdown_account: None,
             },
         )
         .unwrap();
@@ -4026,6 +4066,7 @@ mod tests {
             user_fallback: None,
             usb_kernel: false,
             vnc: false,
+            lockdown_account: None,
         };
         save_json(&sdir.join(STATE_FILE), &confined).unwrap();
         restore_confined_workspace(&paths, "box"); // Ok(None) arm
