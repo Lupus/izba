@@ -41,7 +41,9 @@ upstream selection.
 git-aware vendor-neutral egress policy (`access: read|read-write`, `izba policy
 git allow/block` — MVP-A, PR #54), fail-closed Linux VMM confinement
 (seccomp + Landlock + virtiofsd namespace/chroot — MVP-C, PR #52), the Windows
-per-sandbox account + `izba lockdown`/`unlock` (MVP-D, PR #53); the desktop app's Lock down / Unlock control + restart-to-apply badge followed in 2026-09, and the app's
+per-sandbox account + `izba lockdown`/`unlock` (MVP-D, PR #53); the desktop
+app's Lock down / Unlock control + restart-to-apply badge followed in 2026-09,
+and the app's
 Ports/Volumes/Policy/Netlog wiring (MVP-B; the owner-verified-on-a-real-build
 checkbox is the remaining sliver). **Shipped beyond the plan**, unrecorded here
 until now:
@@ -249,8 +251,9 @@ fix; see risk #3).
 > surface; the **owner-verified-on-a-real-build** checkbox is the remaining
 > sliver before the tag), MVP-C ✅ (PR #52, fail-closed seccomp + Landlock +
 > virtiofsd namespace/chroot), MVP-D ✅ (PR #53, per-sandbox Windows account +
-> `izba lockdown`); the desktop app's Lock down / Unlock control + restart-to-apply badge followed in 2026-09. The paragraphs below are the original scope brief, kept for
-> rationale.
+> `izba lockdown`); the desktop app's Lock down / Unlock control + restart-to-apply
+> badge followed in 2026-09. The paragraphs below are the original scope brief,
+> kept for rationale.
 
 Decided 2026-06-18 (owner). Before the first release tag and before M4, ship the
 cut that makes **one** sandbox genuinely defensible and genuinely usable — a real
