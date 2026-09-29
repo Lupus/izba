@@ -202,6 +202,12 @@ fn run_pid1() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Save/load (spec 2026-09-29 §5.3): a sandbox moved between hosts with a
+    // different workspace owner presents its upper + volumes through P so
+    // every file keeps its in-container owner. /lower is NOT mapped: image
+    // ids are read under this host's own userns map, like a fresh create.
+    let disk_maps =
+        idmap::disk_maps_from_cmdline(&params, docker).map_err(|e| anyhow::anyhow!("{e}"))?;
     // The fs ids init's own /rootfs writes must adopt in docker mode so they
     // land as disk-0 (container-root-owned) through the idmapped layers; see
     // idmap.rs module docs. None outside docker mode (plain writes).
@@ -230,6 +236,11 @@ fn run_pid1() -> anyhow::Result<()> {
             gid_map,
         )
         .context("idmapping overlay layers (docker mode)")?;
+    }
+    if let Some((uid_map, gid_map)) = &disk_maps {
+        idmap::apply_layer_idmaps(&[Path::new("/upper")], uid_map, gid_map).context(
+            "idmapping the rw disk (moved sandbox; kernel must support idmapped ext4 + overlay)",
+        )?;
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
@@ -265,7 +276,7 @@ fn run_pid1() -> anyhow::Result<()> {
         .get("izba.volumes")
         .map(|s| s.split(',').filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    setup_user_volumes(&vols, layer_maps.as_ref())?;
+    setup_user_volumes(&vols, layer_maps.as_ref().or(disk_maps.as_ref()))?;
 
     // Builder output share: when the host attached the `izba-buildout` virtiofs
     // share (signalled by `izba.buildout=1` on the cmdline), mount it at
@@ -533,13 +544,13 @@ fn setup_user_volumes(
     }
     let plan = mounts::volume_mount_plan(vols);
     mounts::apply(&plan).context("volume mounts")?;
-    // Docker mode: volumes present through the same idmap as the overlay
+    // Docker mode or a moved sandbox's disk idmap: volumes present through the same idmap as the overlay
     // layers, so e.g. the fresh /var/lib/docker ext4 root (disk-uid 0)
     // appears container-root-owned — dockerd owns it with no chown pass.
     if let Some((uid_map, gid_map)) = layer_maps {
         let targets: Vec<&Path> = plan.iter().map(|op| op.target.as_path()).collect();
         idmap::apply_layer_idmaps(&targets, uid_map, gid_map)
-            .context("idmapping user volumes (docker mode)")?;
+            .context("idmapping user volumes (docker mode or moved sandbox)")?;
     }
     Ok(())
 }

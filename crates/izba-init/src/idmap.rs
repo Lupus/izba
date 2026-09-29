@@ -22,6 +22,14 @@
 //! exactly like a normal system. **Invariant: any future init write under
 //! `/rootfs` must do the same in docker mode.**
 //!
+//! Save/load disk idmap (spec 2026-09-29 §5.3): a sandbox moved to a host
+//! with a different workspace owner carries `izba.diskuidmap=`/
+//! `izba.diskgidmap=` (non-docker only) — a full bijection over the id space
+//! with no fsuid-0 anchor, applied to `/upper` and the user volumes via the
+//! same [`apply_layer_idmaps`] machinery. `/lower` is deliberately not
+//! mapped, and since the map is a bijection init needs no
+//! [`presented_of_disk_zero`]/[`with_fs_ids`] handling for it.
+//!
 //! Pure logic (parsing, map-line rendering, reverse lookup) is host-tested;
 //! the syscall glue (userns helper child + open_tree/mount_setattr/
 //! move_mount) only runs in the guest and is exercised by the docker-mode
@@ -274,9 +282,92 @@ pub fn apply_layer_idmaps(
     Ok(())
 }
 
+/// The (uid, gid) extent lists of the save/load disk idmap.
+pub type DiskMaps = (Vec<IdExtent>, Vec<IdExtent>);
+
+/// Parse the save/load disk idmap (`izba.diskuidmap=`/`izba.diskgidmap=`,
+/// izba-core `disk_idmap_cmdline_value`). Both keys or neither; never
+/// together with docker mode (its layers carry their own map). Any error
+/// must fail the boot — booting with the raw disk ids would present every
+/// moved file with the wrong owner.
+pub fn disk_maps_from_cmdline(
+    params: &std::collections::BTreeMap<String, String>,
+    docker: bool,
+) -> Result<Option<DiskMaps>, String> {
+    let u = params.get("izba.diskuidmap");
+    let g = params.get("izba.diskgidmap");
+    match (u, g) {
+        (None, None) => Ok(None),
+        (Some(u), Some(g)) => {
+            if docker {
+                return Err("izba.diskuidmap with izba.docker=1 (host bug)".into());
+            }
+            Ok(Some((
+                parse_cmdline_map(u).map_err(|e| format!("izba.diskuidmap: {e}"))?,
+                parse_cmdline_map(g).map_err(|e| format!("izba.diskgidmap: {e}"))?,
+            )))
+        }
+        _ => Err("izba.diskuidmap and izba.diskgidmap must be given together".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn disk_maps_absent_is_none() {
+        assert_eq!(disk_maps_from_cmdline(&params(&[]), false).unwrap(), None);
+    }
+
+    #[test]
+    fn disk_maps_parse_both_legs() {
+        let p = params(&[
+            (
+                "izba.diskuidmap",
+                "0-0-1000,1000-1001-1,1001-1000-1,1002-1002-5",
+            ),
+            ("izba.diskgidmap", "0-0-9"),
+        ]);
+        let (u, g) = disk_maps_from_cmdline(&p, false).unwrap().unwrap();
+        assert_eq!(u.len(), 4);
+        assert_eq!(
+            g,
+            vec![IdExtent {
+                disk: 0,
+                presented: 0,
+                size: 9
+            }]
+        );
+    }
+
+    #[test]
+    fn disk_maps_require_both_keys() {
+        assert!(disk_maps_from_cmdline(&params(&[("izba.diskuidmap", "0-0-9")]), false).is_err());
+        assert!(disk_maps_from_cmdline(&params(&[("izba.diskgidmap", "0-0-9")]), false).is_err());
+    }
+
+    #[test]
+    fn disk_maps_refused_in_docker_mode() {
+        let p = params(&[("izba.diskuidmap", "0-0-9"), ("izba.diskgidmap", "0-0-9")]);
+        assert!(
+            disk_maps_from_cmdline(&p, true).is_err(),
+            "host never emits both; refuse loudly"
+        );
+    }
+
+    #[test]
+    fn disk_maps_reject_garbage() {
+        let p = params(&[("izba.diskuidmap", "nope"), ("izba.diskgidmap", "0-0-9")]);
+        assert!(disk_maps_from_cmdline(&p, false).is_err());
+    }
 
     #[test]
     fn parse_cmdline_map_accepts_the_layer_shape() {
