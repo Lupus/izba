@@ -524,6 +524,82 @@ pub fn transpose_identity_map(
     maps
 }
 
+/// Apply the Option A container→guest map ([`transpose_identity_map`]) to one
+/// id. A transposition is its own inverse, so this is also guest→container.
+/// Kept in lock-step with `transpose_identity_map` by a guard test.
+pub fn transpose_apply(workload: u32, owner: u32, x: u32) -> u32 {
+    if workload == owner || owner == 0 {
+        x
+    } else if x == workload {
+        owner
+    } else if x == owner {
+        workload
+    } else {
+        x
+    }
+}
+
+/// Mount idmap for a non-docker sandbox whose disks were written under
+/// workspace owner `src_owner` but now boot under `tgt_owner` (save/load
+/// spec §5.2): `P = M_tgt ∘ M_src⁻¹` (= `M_tgt ∘ M_src`, transpositions are
+/// self-inverse). Disk id `d` presents as `P(d)`, so every file keeps the
+/// container owner it had on the source. `None` iff P is the identity.
+///
+/// Orientation matches [`layer_idmap_cmdline_value`]: each extent's
+/// `container_id` is the DISK id and `host_id` the PRESENTED id. P moves at
+/// most four ids ({0, W, src, tgt}); everything else is identity, emitted as
+/// the gaps between them so the map covers `0..USERNS_RANGE_END` exactly.
+pub fn disk_idmap_extents(
+    workload: u32,
+    src_owner: u32,
+    tgt_owner: u32,
+) -> Option<Vec<oci_spec::runtime::LinuxIdMapping>> {
+    use oci_spec::runtime::LinuxIdMappingBuilder;
+    let p = |d: u32| transpose_apply(workload, tgt_owner, transpose_apply(workload, src_owner, d));
+    let mut moved: Vec<u32> = [0, workload, src_owner, tgt_owner]
+        .into_iter()
+        .filter(|&d| d < USERNS_RANGE_END && p(d) != d)
+        .collect();
+    moved.sort_unstable();
+    moved.dedup();
+    if moved.is_empty() {
+        return None;
+    }
+    let extent = |disk: u32, presented: u32, size: u32| {
+        LinuxIdMappingBuilder::default()
+            .container_id(disk)
+            .host_id(presented)
+            .size(size)
+            .build()
+            .expect("LinuxIdMapping build is infallible for u32 fields")
+    };
+    let mut out = Vec::with_capacity(2 * moved.len() + 1);
+    let mut next = 0u32;
+    for d in moved {
+        if d > next {
+            out.push(extent(next, next, d - next));
+        }
+        out.push(extent(d, p(d), 1));
+        next = d + 1;
+    }
+    if next < USERNS_RANGE_END {
+        out.push(extent(next, next, USERNS_RANGE_END - next));
+    }
+    Some(out)
+}
+
+/// `izba.diskuidmap=`/`izba.diskgidmap=` value: `disk-presented-size`
+/// triples, same grammar izba-init's `idmap::parse_cmdline_map` reads. No
+/// fsuid-0 anchor: P is a bijection over the whole range, so guest-root
+/// writers (overlay copy-up, whiteouts) always have a reverse mapping.
+pub fn disk_idmap_cmdline_value(extents: &[oci_spec::runtime::LinuxIdMapping]) -> String {
+    extents
+        .iter()
+        .map(|m| format!("{}-{}-{}", m.container_id(), m.host_id(), m.size()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Compute the container user-namespace `(uidMappings, gidMappings)` for
 /// Option A from the workspace-owner ids and the workload (image `USER`) ids.
 /// Thin wrapper over [`transpose_identity_map`] applied to uid and gid.
@@ -1974,6 +2050,127 @@ mod tests {
                 b + 1001,
                 r - 1001
             )
+        );
+    }
+
+    // ---- disk-owner permutation P = M_tgt ∘ M_src (spec §5.2) ----
+
+    /// transpose_apply must agree with transpose_identity_map's extents
+    /// (container -> guest) — the single source of truth for Option A.
+    #[test]
+    fn transpose_apply_agrees_with_identity_map_extents() {
+        let cases = [
+            (0, 1000),
+            (1000, 1000),
+            (1001, 1000),
+            (1000, 0),
+            (0, 0),
+            (5, 70000),
+        ];
+        for (w, o) in cases {
+            let maps = transpose_identity_map(w, o);
+            for x in [
+                0u32,
+                1,
+                5,
+                999,
+                1000,
+                1001,
+                70000,
+                123456,
+                USERNS_RANGE_END - 1,
+            ] {
+                let via_extents = maps
+                    .iter()
+                    .find(|m| x >= m.container_id() && x - m.container_id() < m.size())
+                    .map(|m| m.host_id() + (x - m.container_id()))
+                    .expect("full-range map covers x");
+                assert_eq!(transpose_apply(w, o, x), via_extents, "w={w} o={o} x={x}");
+            }
+        }
+    }
+
+    fn apply_extents(ext: &[oci_spec::runtime::LinuxIdMapping], d: u32) -> u32 {
+        ext.iter()
+            .find(|m| d >= m.container_id() && d - m.container_id() < m.size())
+            .map(|m| m.host_id() + (d - m.container_id()))
+            .expect("P covers every id")
+    }
+
+    #[test]
+    fn disk_idmap_is_none_when_owner_unchanged() {
+        assert!(disk_idmap_extents(1001, 1000, 1000).is_none());
+        assert!(disk_idmap_extents(0, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn disk_idmap_is_none_when_both_maps_are_identity() {
+        // W == O on the source and owner 0 on the target: both identity.
+        assert!(disk_idmap_extents(1000, 1000, 0).is_none());
+    }
+
+    /// The invariant: for every disk id d, the container id it presents as on
+    /// the target equals the container id it had on the source.
+    #[test]
+    fn disk_idmap_preserves_container_view() {
+        let cases = [
+            (1001, 1000, 1002), // uid change, non-root USER
+            (0, 1000, 0),       // root USER, Linux -> Windows anchor
+            (1001, 1000, 0),    // non-root USER, Linux -> Windows
+            (1001, 0, 1000),    // Windows -> Linux
+            (0, 0, 1000),       // root USER, Windows -> Linux
+            (1000, 1001, 1000), // target owner == USER
+        ];
+        for (w, src, tgt) in cases {
+            let ext = disk_idmap_extents(w, src, tgt).expect("non-identity case");
+            for d in [0u32, 1, 999, 1000, 1001, 1002, 4242, USERNS_RANGE_END - 1] {
+                let presented = apply_extents(&ext, d);
+                let container_src = transpose_apply(w, src, d); // M_src self-inverse
+                let container_tgt = transpose_apply(w, tgt, presented);
+                assert_eq!(
+                    container_src, container_tgt,
+                    "w={w} src={src} tgt={tgt} d={d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disk_idmap_is_a_sorted_full_range_bijection() {
+        let ext = disk_idmap_extents(1001, 1000, 0).unwrap();
+        let mut next = 0u32;
+        for m in &ext {
+            assert_eq!(m.container_id(), next, "contiguous disk ranges");
+            assert!(m.size() > 0);
+            next = m.container_id() + m.size();
+        }
+        assert_eq!(next, USERNS_RANGE_END);
+        let mut presented: Vec<u32> = ext
+            .iter()
+            .filter(|m| m.size() == 1)
+            .map(|m| m.host_id())
+            .collect();
+        presented.sort();
+        presented.dedup();
+        assert_eq!(
+            presented.len(),
+            ext.iter().filter(|m| m.size() == 1).count(),
+            "no two disk ids share a presented id"
+        );
+    }
+
+    #[test]
+    fn disk_idmap_cmdline_value_renders_triples_without_anchor() {
+        let ext = disk_idmap_extents(1001, 1000, 1002).unwrap();
+        let v = disk_idmap_cmdline_value(&ext);
+        assert!(v.starts_with("0-0-1000,"), "{v}");
+        assert!(
+            v.contains("1000-1002-1"),
+            "disk 1000 (container 1001) -> guest 1002: {v}"
+        );
+        assert!(
+            !v.contains(&format!("{DOCKER_IDMAP_FSUID0_DISK_ID}-0-1")),
+            "{v}"
         );
     }
 
