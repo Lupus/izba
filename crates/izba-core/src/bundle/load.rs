@@ -32,6 +32,9 @@ use super::{Progress, MAX_CHUNK};
 use crate::paths::Paths;
 use crate::state::{load_json, save_json, PortRule, SandboxConfig, CONFIG_FILE};
 
+/// Image files an existing-but-incomplete target cache entry may gain.
+const IMAGE_META: [&str; 3] = ["config.json", "passwd", "group"];
+
 /// Upper bound on the manifest / trailer JSON read into memory.
 const MAX_JSON: u64 = 16 << 20;
 
@@ -152,62 +155,81 @@ pub(crate) fn load_with(
     let mut undo = Vec::new();
     let mut scratch = Vec::new();
     let res = run(paths, opts, progress, hooks, &mut undo, &mut scratch);
-    // Stage dirs go in every case; a staged workspace can hold read-only dirs.
+    // Stage dirs go in every case; a staged workspace can hold read-only
+    // dirs. Best-effort: a leftover `.load-*` is swept by a later load.
     for p in scratch.iter().rev() {
-        force_remove(p);
+        let _ = force_remove(p);
     }
-    if res.is_err() {
-        rollback(undo);
-    }
-    res
+    res.map_err(|e| {
+        let failed = rollback(undo);
+        if failed.is_empty() {
+            e
+        } else {
+            e.context(format!(
+                "load failed and its rollback is incomplete: {}",
+                failed.join("; ")
+            ))
+        }
+    })
 }
 
-fn rollback(undo: Vec<Undo>) {
+/// Apply `undo` in reverse; returns one line per step that could not be undone.
+fn rollback(undo: Vec<Undo>) -> Vec<String> {
+    let mut failed = Vec::new();
     for u in undo.into_iter().rev() {
-        match u {
-            Undo::Remove(p) => force_remove(&p),
-            Undo::Recreate(p) => {
-                let _ = fs::create_dir(&p);
-            }
-            Undo::Restore(p, Some(bytes)) => {
-                let _ = fs::write(&p, bytes);
-            }
-            Undo::Restore(p, None) => {
-                let _ = fs::remove_file(&p);
-            }
+        let (what, res, p) = match u {
+            Undo::Remove(p) => ("remove", force_remove(&p), p),
+            Undo::Recreate(p) => ("re-create", fs::create_dir(&p), p),
+            Undo::Restore(p, Some(bytes)) => ("restore", fs::write(&p, bytes), p),
+            Undo::Restore(p, None) => ("remove", remove_file_if_present(&p), p),
+        };
+        if let Err(e) = res {
+            failed.push(format!("could not {what} {}: {e}", p.display()));
         }
     }
+    failed
 }
 
-/// Best-effort removal of a file or tree, making read-only directories
+fn remove_file_if_present(p: &Path) -> std::io::Result<()> {
+    match fs::remove_file(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
+}
+
+/// Remove a file or tree (absent = done), making read-only directories
 /// writable first if a plain removal fails.
-fn force_remove(p: &Path) {
+fn force_remove(p: &Path) -> std::io::Result<()> {
     let Ok(m) = fs::symlink_metadata(p) else {
-        return;
+        return Ok(());
     };
     if !m.is_dir() {
-        let _ = fs::remove_file(p);
-        return;
+        return remove_file_if_present(p);
     }
-    // Unix only: a staged 0555 dir blocks removal of its children.
-    #[cfg(unix)]
-    if fs::remove_dir_all(p).is_err() {
-        fn chmod_tree(d: &Path) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o700));
-            if let Ok(rd) = fs::read_dir(d) {
-                for e in rd.flatten() {
-                    if e.file_type().is_ok_and(|t| t.is_dir()) {
-                        chmod_tree(&e.path());
-                    }
-                }
+    match fs::remove_dir_all(p) {
+        Ok(()) => Ok(()),
+        // Unix only: a staged 0555 dir blocks removal of its children.
+        #[cfg(unix)]
+        Err(_) => {
+            chmod_tree(p);
+            fs::remove_dir_all(p)
+        }
+        #[cfg(not(unix))]
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn chmod_tree(d: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o700));
+    if let Ok(rd) = fs::read_dir(d) {
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                chmod_tree(&e.path());
             }
         }
-        chmod_tree(p);
-        let _ = fs::remove_dir_all(p);
     }
-    #[cfg(not(unix))]
-    let _ = fs::remove_dir_all(p);
 }
 
 /// `create_dir_all(dir)` (0700 inside `root` when given), recording the
@@ -327,16 +349,30 @@ fn run(
     let mut need_images = BTreeSet::new();
     let mut need_volumes = BTreeSet::new();
     let mut reused = BTreeSet::new();
-    let mut used_images = BTreeSet::new();
+    let mut refs = Vec::new();
     for s in &sels {
         let cfg = prepare_config(s, &manifest, &staged, hooks, &mut report)?;
         let d = &cfg.image_digest;
-        used_images.insert(d.clone());
-        let staged_complete = ["rootfs.erofs", "config.json"]
-            .iter()
-            .all(|f| staged.files.contains_key(&image_entry(d, f)));
+        let named: BTreeSet<&String> = cfg.volumes.iter().filter_map(|v| v.name.as_ref()).collect();
+        if *d != s.entry.image_digest || named != s.entry.named_volumes.iter().collect() {
+            bail!(
+                "archive is corrupt: config.json of '{}' disagrees with the manifest",
+                s.src
+            );
+        }
+        refs.push((cfg.image_ref.clone(), d.clone()));
         if !store.is_complete(d) {
-            if !staged_complete {
+            let dir = paths.image_dir(d);
+            let has =
+                |f: &str| dir.join(f).is_file() || staged.files.contains_key(&image_entry(d, f));
+            if !has("rootfs.erofs") || !has("config.json") {
+                if dir.exists() {
+                    bail!(
+                        "image {d} is incomplete here and the archive cannot complete it; \
+                         remove {} and retry",
+                        dir.display()
+                    );
+                }
                 bail!("archive is missing image {d}");
             }
             need_images.insert(d.clone());
@@ -385,26 +421,56 @@ fn run(
     fail(CommitStep::Images)?;
     for d in &need_images {
         let dst = paths.image_dir(d);
-        if dst.exists() {
-            continue; // a concurrent pull/load won; the target's copy is kept
+        let from = stage
+            .join("images")
+            .join(dst.file_name().unwrap_or_default());
+        if !dst.exists() {
+            mkdirs(undo, &paths.images_dir(), Some(paths.root()))?;
+            fs::rename(&from, &dst).with_context(|| format!("installing image {d}"))?;
+            undo.push(Undo::Remove(dst));
+            continue;
         }
-        mkdirs(undo, &paths.images_dir(), Some(paths.root()))?;
-        let dir_name = dst.file_name().unwrap_or_default();
-        fs::rename(stage.join("images").join(dir_name), &dst)
-            .with_context(|| format!("installing image {d}"))?;
-        undo.push(Undo::Remove(dst));
+        // Existing but incomplete: its rootfs is kept; add only the verified
+        // metadata it lacks (and undo only those files).
+        if !store.config_path(d).exists() && from.join("config.json").is_file() {
+            store.persist_config(d, &fs::read(from.join("config.json"))?)?;
+            undo.push(Undo::Remove(store.config_path(d)));
+        }
+        for (f, path) in [
+            ("passwd", store.passwd_path(d)),
+            ("group", store.group_path(d)),
+        ] {
+            if path.exists() || !from.join(f).is_file() {
+                continue;
+            }
+            let bytes = fs::read(from.join(f))?;
+            let (pw, gr) = if f == "passwd" {
+                (Some(&bytes[..]), None)
+            } else {
+                (None, Some(&bytes[..]))
+            };
+            store.persist_user_dbs(d, pw, gr)?;
+            undo.push(Undo::Remove(path));
+        }
     }
 
     fail(CommitStep::Volumes)?;
     for v in &need_volumes {
         let dst = paths.volume_image(v);
-        if dst.exists() {
-            bail!("named volume '{v}' appeared on this host during the load; retry");
-        }
         mkdirs(undo, &paths.volumes_dir(), Some(paths.root()))?;
-        fs::rename(stage.join(format!("volumes/{v}.img")), &dst)
-            .with_context(|| format!("installing volume '{v}'"))?;
-        undo.push(Undo::Remove(dst));
+        // No-replace install: a hard link fails if `dst` exists, so a volume
+        // created concurrently is never overwritten (a rename would be).
+        let from = stage.join(format!("volumes/{v}.img"));
+        match fs::hard_link(&from, &dst) {
+            Ok(()) => undo.push(Undo::Remove(dst)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("named volume '{v}' appeared on this host during the load; retry")
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("installing volume '{v}'"));
+            }
+        }
+        let _ = fs::remove_file(&from);
     }
 
     fail(CommitStep::Workspaces)?;
@@ -452,9 +518,15 @@ fn run(
             .take_while(|p| !p.exists())
             .last()
             .map(Path::to_path_buf);
+        let marker = run.join(crate::sandbox::RUN_DIR_OWNER);
+        let marker_existed = marker.exists();
         crate::sandbox::claim_run_dir(paths, &s.name)?;
-        if let Some(t) = run_top {
-            undo.push(Undo::Remove(t));
+        match run_top {
+            Some(t) => undo.push(Undo::Remove(t)),
+            // A pre-existing run dir (e.g. left behind by an `rm`): undo only
+            // the owner marker this claim wrote.
+            None if !marker_existed => undo.push(Undo::Remove(marker)),
+            None => {}
         }
         cfg.workspace = s
             .ws_target
@@ -487,11 +559,17 @@ fn run(
         });
     }
 
-    // Tags last: only for images a loaded sandbox uses, never overriding a
-    // tag this host already resolves.
+    // Tags last. Only a loaded sandbox's own `image_ref`, mapped by the
+    // archive to that sandbox's digest, and only when it does not resolve
+    // here: an archive can never plant a tag that shadows an unrelated
+    // (e.g. bare registry) name. Every tag created is reported.
     let mut tags_saved = false;
-    for (tag, digest) in &manifest.tags {
-        if !used_images.contains(digest) || crate::image::tags::resolve_tag(paths, tag)?.is_some() {
+    let mut seen = BTreeSet::new();
+    for (tag, digest) in &refs {
+        if manifest.tags.get(tag) != Some(digest)
+            || !seen.insert(tag)
+            || crate::image::tags::resolve_tag(paths, tag)?.is_some()
+        {
             continue;
         }
         if !tags_saved {
@@ -500,6 +578,9 @@ fn run(
             tags_saved = true;
         }
         crate::image::tags::set_tag(paths, tag, digest)?;
+        report.warnings.push(format!(
+            "created local image tag '{tag}' → {digest} (from the archive)"
+        ));
     }
     Ok(report)
 }
@@ -532,6 +613,25 @@ fn validate_manifest(m: &Manifest) -> anyhow::Result<()> {
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
             if rel != "rw.img" && !anon_ok {
                 bail!("unexpected disk {:?} for sandbox '{}'", d.path, s.name);
+            }
+        }
+        if !m.images.contains(&s.image_digest) {
+            bail!(
+                "sandbox '{}': image {:?} is not in the archive",
+                s.name,
+                s.image_digest
+            );
+        }
+        for v in &s.named_volumes {
+            if !m
+                .named_volumes
+                .iter()
+                .any(|b| b.path == format!("volumes/{v}.img"))
+            {
+                bail!(
+                    "sandbox '{}': named volume {v:?} is not in the archive",
+                    s.name
+                );
             }
         }
     }
@@ -698,9 +798,21 @@ fn source_basename(s: &str) -> Option<&str> {
     (b != "." && b != ".." && !b.contains([':', '\0'])).then_some(b)
 }
 
+/// Image digests and named volumes the selected sandboxes use (per the
+/// manifest; each staged config is later checked to agree with it).
+fn selection_needs(sels: &[Sel]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let images = sels.iter().map(|s| s.entry.image_digest.clone()).collect();
+    let volumes = sels
+        .iter()
+        .flat_map(|s| s.entry.named_volumes.iter().cloned())
+        .collect();
+    (images, volumes)
+}
+
 /// Allocated bytes needed per target filesystem (keyed by the nearest
-/// existing ancestor), with 5% headroom. Images carry no size in the
-/// manifest and are not counted; `workspace_bytes` is only an estimate.
+/// existing ancestor), with 5% headroom: the selected sandboxes' disks, the
+/// named volumes and images they use that this host lacks, and bundled
+/// workspaces (`workspace_bytes` is only an estimate).
 fn check_space(paths: &Paths, m: &Manifest, sels: &[Sel], hooks: &LoadHooks) -> anyhow::Result<()> {
     let mut need: BTreeMap<PathBuf, u64> = BTreeMap::new();
     let mut data: u64 = sels
@@ -708,14 +820,19 @@ fn check_space(paths: &Paths, m: &Manifest, sels: &[Sel], hooks: &LoadHooks) -> 
         .flat_map(|s| &s.entry.disks)
         .map(|d| d.allocated)
         .fold(0, u64::saturating_add);
+    let (images, volumes) = selection_needs(sels);
     for v in &m.named_volumes {
         let name = v
             .path
             .trim_start_matches("volumes/")
             .trim_end_matches(".img");
-        if !paths.volume_image(name).exists() {
+        if volumes.contains(name) && !paths.volume_image(name).exists() {
             data = data.saturating_add(v.allocated);
         }
+    }
+    let store = crate::image::ImageStore::new(paths);
+    for d in images.iter().filter(|d| !store.is_complete(d)) {
+        data = data.saturating_add(m.image_sizes.get(d).copied().unwrap_or(0));
     }
     *need.entry(nearest_existing(paths.root())?).or_default() += data;
     for s in sels.iter().filter(|s| s.entry.workspace_bundled) {
@@ -758,7 +875,7 @@ fn sweep_stale_stages(root: &Path) {
                 continue;
             };
             if !Path::new(&format!("/proc/{pid}")).exists() {
-                force_remove(&e.path());
+                let _ = force_remove(&e.path());
             }
         }
     }
@@ -784,6 +901,9 @@ struct Stager<'a> {
     known_disks: HashMap<String, (DiskKind, u64)>,
     /// image dir name -> digest.
     image_dirs: HashMap<String, String>,
+    /// What the selection uses; everything else is drained unstaged.
+    need_images: BTreeSet<String>,
+    need_volumes: BTreeSet<String>,
     disks: HashMap<String, DiskState>,
     dir_modes: HashMap<String, DirModes>,
     out: Staged,
@@ -810,10 +930,13 @@ impl<'a> Stager<'a> {
                 );
             }
         }
+        let (need_images, need_volumes) = selection_needs(sels);
         Self {
             paths,
             m,
             stage,
+            need_images,
+            need_volumes,
             selected: sels
                 .iter()
                 .map(|s| (s.src.clone(), s.ws_stage.clone()))
@@ -866,7 +989,7 @@ impl<'a> Stager<'a> {
             return self.chunk(e, &p);
         }
         if let Some(rest) = p.strip_prefix("images/") {
-            return self.image_file(e, &p, rest);
+            return self.image_file(e, &p, rest, progress);
         }
         if let Some(rest) = p.strip_prefix("sandboxes/") {
             let (src, file) = rest.split_once('/').unwrap_or((rest, ""));
@@ -897,6 +1020,7 @@ impl<'a> Stager<'a> {
         e: &mut tar::Entry<R>,
         p: &str,
         rest: &str,
+        progress: Progress,
     ) -> anyhow::Result<()> {
         let (dir, file) = rest.split_once('/').unwrap_or((rest, ""));
         let Some(digest) = self.image_dirs.get(dir) else {
@@ -905,9 +1029,18 @@ impl<'a> Stager<'a> {
         if !IMAGE_FILES.contains(&file) {
             bail!("unexpected archive entry {p}");
         }
-        if crate::image::ImageStore::new(self.paths).is_complete(digest) {
-            return drain(e); // the target's copy is kept
+        if !self.need_images.contains(digest)
+            || crate::image::ImageStore::new(self.paths).is_complete(digest)
+        {
+            return drain(e); // unused here, or the target's copy is kept
         }
+        let target = self.paths.image_dir(digest);
+        // An incomplete target entry (#222: rootfs without config.json) keeps
+        // its rootfs; only the metadata it lacks is taken from the archive.
+        if target.exists() && (!IMAGE_META.contains(&file) || target.join(file).exists()) {
+            return drain(e);
+        }
+        progress(format!("staging image {digest} ({file})"));
         let dst = self.stage.join(p);
         let sha = stage_file(e, &dst)?;
         self.add_file(p, dst, sha)
@@ -936,7 +1069,9 @@ impl<'a> Stager<'a> {
             bail!("archive entry {p} appears twice (corrupt archive)");
         }
         let wanted = match &kind {
-            DiskKind::Named(v) => !self.paths.volume_image(v).exists(),
+            DiskKind::Named(v) => {
+                self.need_volumes.contains(v) && !self.paths.volume_image(v).exists()
+            }
             DiskKind::Sandbox(src) => self.selected.contains_key(src),
         };
         let state = if wanted {
@@ -1408,6 +1543,218 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o555);
         set(&tgt.dir("ws/a/ro"), 0o755);
+    }
+
+    /// Edit the source sandbox's config.json in place.
+    fn edit_src_config(src: &Src, name: &str, f: impl FnOnce(&mut SandboxConfig)) {
+        let cp = src.paths.sandbox_dir(name).join(CONFIG_FILE);
+        let mut c: SandboxConfig = load_json(&cp).unwrap().unwrap();
+        f(&mut c);
+        crate::state::save_json(&cp, &c).unwrap();
+    }
+
+    /// Edit the archive's manifest.json (not covered by the trailer).
+    fn edit_manifest(archive: &Path, f: impl FnOnce(&mut Manifest)) {
+        let mut f = Some(f);
+        rewrite_archive(archive, |name, body| {
+            if name != MANIFEST_PATH {
+                return Some(body);
+            }
+            let mut m: Manifest = serde_json::from_slice(&body).unwrap();
+            (f.take().unwrap())(&mut m);
+            Some(serde_json::to_vec(&m).unwrap())
+        });
+    }
+
+    #[test]
+    fn a_selective_load_leaves_the_other_sandboxes_image_and_volume_behind() {
+        let src = Src::new();
+        add_sandbox(&src.paths, "b", "sha256:bb", &[]);
+        let ar = src.save(&["a", "b"], false);
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let o = LoadOpts {
+            select: vec!["b".into()],
+            ..opts(ar, Some(ws))
+        };
+        let mut msgs = Vec::new();
+        load_with(&tgt.paths, &o, &mut |m| msgs.push(m), &tgt.hooks()).unwrap();
+        let store = crate::image::ImageStore::new(&tgt.paths);
+        assert!(store.is_complete("sha256:bb"));
+        assert!(!tgt.paths.image_dir("sha256:aa").exists());
+        assert!(!tgt.paths.volume_image("data").exists());
+        // Never even staged.
+        assert!(msgs.iter().any(|m| m.contains("sha256:bb")), "{msgs:?}");
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.contains("sha256:aa") || m.contains("data.img")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn space_check_counts_an_absent_image() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        edit_manifest(&ar, |m| {
+            assert!(m.image_sizes["sha256:aa"] > 0);
+            m.image_sizes.insert("sha256:aa".into(), 1 << 50);
+        });
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let some = |_: &Path| -> anyhow::Result<u64> { Ok(1 << 40) };
+        let mut hooks = tgt.hooks();
+        hooks.free_bytes = &some;
+        let o = opts(ar, Some(ws));
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &hooks)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not enough free space"), "{e}");
+        // Once the image is already here, it no longer counts.
+        crate::bundle::testutil::add_image(&tgt.paths, "sha256:aa");
+        load_with(&tgt.paths, &o, &mut |_| {}, &hooks).unwrap();
+    }
+
+    #[test]
+    fn only_a_loaded_image_ref_becomes_a_local_tag() {
+        let src = Src::new();
+        edit_src_config(&src, "a", |c| c.image_ref = "mine".into());
+        crate::image::tags::set_tag(&src.paths, "mine", "sha256:aa").unwrap();
+        let ar = src.save(&["a"], false);
+        edit_manifest(&ar, |m| {
+            assert_eq!(m.tags.get("mine").map(String::as_str), Some("sha256:aa"));
+            m.tags.insert("ubuntu".into(), "sha256:aa".into());
+        });
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let rep = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks()).unwrap();
+        let resolve = |t| crate::image::tags::resolve_tag(&tgt.paths, t).unwrap();
+        assert_eq!(resolve("mine").as_deref(), Some("sha256:aa"));
+        assert_eq!(
+            resolve("ubuntu"),
+            None,
+            "unreferenced manifest tag was planted"
+        );
+        assert!(
+            rep.warnings
+                .iter()
+                .any(|w| w.contains("created local image tag 'mine'")),
+            "{:?}",
+            rep.warnings
+        );
+    }
+
+    #[test]
+    fn an_existing_tag_is_never_overridden() {
+        let src = Src::new();
+        edit_src_config(&src, "a", |c| c.image_ref = "mine".into());
+        crate::image::tags::set_tag(&src.paths, "mine", "sha256:aa").unwrap();
+        let ar = src.save(&["a"], false);
+        let tgt = Tgt::new();
+        crate::image::tags::set_tag(&tgt.paths, "mine", "sha256:other").unwrap();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let rep = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks()).unwrap();
+        assert_eq!(
+            crate::image::tags::resolve_tag(&tgt.paths, "mine")
+                .unwrap()
+                .as_deref(),
+            Some("sha256:other")
+        );
+        assert!(!rep
+            .warnings
+            .iter()
+            .any(|w| w.contains("created local image tag")));
+    }
+
+    #[test]
+    fn an_incomplete_target_image_gains_only_the_metadata_it_lacks() {
+        let src = Src::new();
+        let src_img = src.paths.image_dir("sha256:aa");
+        std::fs::write(src_img.join("passwd"), b"root:x:0:0::/root:/bin/sh\n").unwrap();
+        let ar = src.save(&["a"], false);
+        let incomplete = |tgt: &Tgt| {
+            let img = tgt.paths.image_dir("sha256:aa");
+            std::fs::create_dir_all(&img).unwrap();
+            std::fs::write(img.join("rootfs.erofs"), b"legacy rootfs").unwrap();
+            img
+        };
+        // A failed load removes exactly what it added to the entry.
+        let tgt = Tgt::new();
+        incomplete(&tgt);
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let o = opts(ar.clone(), Some(ws));
+        let before = tgt.snapshot();
+        let mut hooks = tgt.hooks();
+        hooks.fail_at = Some(CommitStep::Volumes);
+        load_with(&tgt.paths, &o, &mut |_| {}, &hooks).unwrap_err();
+        assert_eq!(tgt.snapshot(), before);
+        // A successful one completes it without touching the rootfs.
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        assert_eq!(rep.sandboxes.len(), 1);
+        let img = tgt.paths.image_dir("sha256:aa");
+        assert_eq!(
+            std::fs::read(img.join("rootfs.erofs")).unwrap(),
+            b"legacy rootfs"
+        );
+        assert_eq!(
+            std::fs::read(img.join("config.json")).unwrap(),
+            std::fs::read(src_img.join("config.json")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(img.join("passwd")).unwrap(),
+            std::fs::read(src_img.join("passwd")).unwrap()
+        );
+        assert!(!img.join("group").exists());
+        assert!(!img.join("ref.txt").exists());
+    }
+
+    #[test]
+    fn rollback_after_the_sandbox_commit_removes_the_run_dir_owner_marker() {
+        // An invalid tag makes the load fail AFTER the sandbox dir and the
+        // run-dir claim were committed (tags are the last step).
+        let src = Src::new();
+        edit_src_config(&src, "a", |c| c.image_ref = "Not A Tag".into());
+        let ar = src.save(&["a"], false);
+        edit_manifest(&ar, |m| {
+            m.tags.insert("Not A Tag".into(), "sha256:aa".into());
+        });
+        let tgt = Tgt::new();
+        // A run dir left without an owner marker (pre-existing, unclaimed).
+        std::fs::create_dir_all(tgt.paths.run_dir("a")).unwrap();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks()).unwrap_err();
+        assert!(format!("{e:#}").contains("tag"), "{e:#}");
+        assert_eq!(tgt.snapshot(), before);
+        assert!(!tgt.paths.run_dir("a").join("owner").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_reports_what_it_could_not_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // root ignores the permission this relies on
+        }
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("locked");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), b"x").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = rollback(vec![
+            Undo::Remove(d.join("f")),
+            Undo::Remove(t.path().join("absent")),
+        ]);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("could not remove") && failed[0].contains("locked/f"));
     }
 
     #[test]

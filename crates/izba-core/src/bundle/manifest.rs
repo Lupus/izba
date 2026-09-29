@@ -42,6 +42,10 @@ pub struct Manifest {
     pub tags: BTreeMap<String, String>,
     /// digests included in the archive
     pub images: Vec<String>,
+    /// digest -> allocated bytes of that image's archived files (load
+    /// space preflight).
+    #[serde(default)]
+    pub image_sizes: BTreeMap<String, u64>,
     /// `path` = `volumes/<name>.img`
     pub named_volumes: Vec<BlobInfo>,
     pub sandboxes: Vec<SandboxEntry>,
@@ -50,6 +54,12 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxEntry {
     pub name: String,
+    /// Image digest the sandbox runs (lets load drain unused images).
+    #[serde(default)]
+    pub image_digest: String,
+    /// Names of the named volumes the sandbox uses.
+    #[serde(default)]
+    pub named_volumes: Vec<String>,
     pub disk_owner: (u32, u32),
     pub workspace_bundled: bool,
     /// Lossless display of the source path.
@@ -184,9 +194,12 @@ mod tests {
             created_unix_ms: 1,
             tags: Default::default(),
             images: vec!["sha256:ab".into()],
+            image_sizes: Default::default(),
             named_volumes: vec![],
             sandboxes: vec![SandboxEntry {
                 name: "a".into(),
+                image_digest: "sha256:ab".into(),
+                named_volumes: vec![],
                 disk_owner: (1000, 1000),
                 workspace_bundled: false,
                 source_workspace: "/home/u/p".into(),
