@@ -288,12 +288,13 @@ fn buildout_share_dir(paths: &Paths, name: &str) -> PathBuf {
 }
 
 /// Does this launch Low-label the workspace tree? Only the Windows drivers
-/// label (`spawn_default_confined_vmm` for a confined launch,
-/// `spawn_locked_vmm` for a lock-down launch — a locked launch is never
-/// `allow_unconfined`, so it is covered); `--allow-unconfined` launches
+/// label. `openvmm::spawn_confined_vmm` checks `spec.lockdown` BEFORE
+/// `allow_unconfined`, so a locked-down sandbox takes `spawn_locked_vmm`
+/// (which Low-labels `confined_write_surfaces()`) even when started with
+/// `--allow-unconfined`; a merely unlocked `--allow-unconfined` launch is
 /// unlabelled, and Linux never labels at all.
-fn workspace_label_guard_applies(windows: bool, allow_unconfined: bool) -> bool {
-    windows && !allow_unconfined
+fn workspace_label_guard_applies(windows: bool, allow_unconfined: bool, locked_down: bool) -> bool {
+    windows && (!allow_unconfined || locked_down)
 }
 
 /// `cfg!(windows)`, with a test-only override so the call-site test can drive
@@ -320,13 +321,13 @@ fn check_workspace_spares_control_socket(paths: &Paths, workspace: &Path) -> any
     let ws = resolve_for_compare(workspace);
     if path_is_ancestor_or_equal(&ws, &daemon, cfg!(windows)) {
         bail!(
-            "workspace {} contains izba's data dir {}; a confined Windows start Low-labels the \
-             whole workspace tree, which would include the izbad control socket and let the \
-             sandbox's VMM drive every sandbox (F-09). Choose a narrower workspace directory \
-             (a project dir that does not contain {}).",
+            "workspace {} contains izba's control-socket dir {}; a confined Windows start \
+             Low-labels the whole workspace tree, which would include the izbad control socket \
+             and let the sandbox's VMM drive every sandbox (F-09). Choose a narrower workspace \
+             directory (a project dir that does not contain {}).",
             workspace.display(),
-            paths.root().display(),
-            paths.root().display(),
+            paths.daemon_dir().display(),
+            paths.daemon_dir().display(),
         );
     }
     Ok(())
@@ -354,6 +355,7 @@ fn path_is_ancestor_or_equal(ancestor: &Path, path: &Path, case_insensitive: boo
     let norm = |c: std::path::Component<'_>| {
         let s = c.as_os_str().to_string_lossy().into_owned();
         if case_insensitive {
+            // Approximation of NTFS's $UpCase folding (Unicode lowercase).
             s.to_lowercase()
         } else {
             s
@@ -1078,7 +1080,8 @@ pub fn start_with_timeouts(
     // (or locked-down) Windows launch Low-labels the whole workspace tree, so
     // a workspace that contains `<data>/daemon` would hand the VMM the izbad
     // control socket. Gated to exactly the launches that Low-label.
-    if workspace_label_guard_applies(host_is_windows(), allow_unconfined) {
+    let locked_down = crate::jail_account::orchestrate::lockdown_state(paths, name).is_locked();
+    if workspace_label_guard_applies(host_is_windows(), allow_unconfined, locked_down) {
         check_workspace_spares_control_socket(paths, &config.workspace)?;
     }
 
@@ -5207,6 +5210,10 @@ mod tests {
             FORCE_WINDOWS.with(|c| c.set(Some(true)));
             ForceWindows
         }
+        fn off() -> Self {
+            FORCE_WINDOWS.with(|c| c.set(Some(false)));
+            ForceWindows
+        }
     }
     impl Drop for ForceWindows {
         fn drop(&mut self) {
@@ -5334,19 +5341,33 @@ mod tests {
     }
 
     #[test]
-    fn workspace_label_guard_applies_only_to_confined_windows() {
-        assert!(workspace_label_guard_applies(true, false));
-        assert!(!workspace_label_guard_applies(true, true));
-        assert!(!workspace_label_guard_applies(false, false));
-        assert!(!workspace_label_guard_applies(false, true));
+    fn workspace_label_guard_applies_only_to_labelling_windows_launches() {
+        // (windows, allow_unconfined, locked_down)
+        assert!(workspace_label_guard_applies(true, false, false));
+        assert!(workspace_label_guard_applies(true, false, true));
+        // locked-down + --allow-unconfined still goes through spawn_locked_vmm
+        assert!(workspace_label_guard_applies(true, true, true));
+        assert!(!workspace_label_guard_applies(true, true, false));
+        for (u, l) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(!workspace_label_guard_applies(false, u, l));
+        }
     }
 
     fn start_with_workspace_containing_root(
         allow_unconfined: bool,
+        locked: bool,
     ) -> (MockDriver, anyhow::Result<()>) {
         let (dir, paths) = test_paths();
         // The tempdir parent of the data root: an ANCESTOR of <data>/daemon.
         create(&paths, "web", &opts(dir.path())).unwrap();
+        if locked {
+            // Same on-disk shape `orchestrate::lockdown` persists.
+            std::fs::write(
+                paths.sandbox_dir("web").join("lockdown.json"),
+                r#"{"state":{"account":"izba-spk-web","sid":"S-1-5-21-1-2-3-1001","net_blocked":true}}"#,
+            )
+            .unwrap();
+        }
         let driver = MockDriver::new();
         let r = start(&paths, "web", &driver, &arts(), allow_unconfined);
         (driver, r)
@@ -5358,7 +5379,7 @@ mod tests {
     #[test]
     fn start_refuses_ancestor_workspace_on_confined_windows_before_launch() {
         let _w = ForceWindows::on();
-        let (driver, r) = start_with_workspace_containing_root(false);
+        let (driver, r) = start_with_workspace_containing_root(false, false);
         let err = r.expect_err("must refuse").to_string();
         assert!(
             err.contains("F-09") && err.contains("control socket"),
@@ -5371,15 +5392,26 @@ mod tests {
     }
 
     #[test]
+    fn start_refuses_ancestor_workspace_when_locked_even_if_allow_unconfined() {
+        let _w = ForceWindows::on();
+        let (driver, r) = start_with_workspace_containing_root(true, true);
+        let err = r.expect_err("must refuse").to_string();
+        assert!(err.contains("F-09"), "{err}");
+        assert!(driver.captured.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn start_allows_ancestor_workspace_when_unconfined_or_not_windows() {
         {
             let _w = ForceWindows::on();
-            let (driver, r) = start_with_workspace_containing_root(true);
-            r.expect("allow_unconfined never labels");
+            let (driver, r) = start_with_workspace_containing_root(true, false);
+            r.expect("unlocked allow_unconfined never labels");
             assert!(driver.captured.lock().unwrap().is_some());
         }
-        // Linux (no override): never labels, `izba run` from $HOME keeps working.
-        let (driver, r) = start_with_workspace_containing_root(false);
+        // Non-Windows host (forced, so the Windows CI job agrees): never
+        // labels, `izba run` from $HOME keeps working.
+        let _w = ForceWindows::off();
+        let (driver, r) = start_with_workspace_containing_root(false, false);
         r.expect("non-windows never labels");
         assert!(driver.captured.lock().unwrap().is_some());
     }
