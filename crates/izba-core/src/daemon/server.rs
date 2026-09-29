@@ -29,7 +29,7 @@ use crate::portfwd::copy_until_eof;
 use crate::procmgr;
 use crate::sandbox::{self, Artifacts, Connector, CreateOpts};
 use crate::state::{load_json, SandboxConfig, CONFIG_FILE};
-use crate::vmm::{IoStream, UdsStream, VmmDriver};
+use crate::vmm::{DeadlineStream, IoStream, UdsStream, VmmDriver};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1101,14 +1101,32 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     }))
 }
 
-/// Upper bound for the guest `Health` probe I/O. A wedged-but-accepting guest
-/// must not pin the inspect handler (and, transitively, a polling GUI client)
-/// forever — after this deadline the probe degrades to `None`/"unknown".
+/// OVERALL deadline for the guest `Health` probe, measured from probe start
+/// (not a per-read timeout a trickling guest could keep resetting — #205). A
+/// wedged-but-accepting guest must not pin the inspect handler (and,
+/// transitively, a polling GUI client) forever — after this deadline the probe
+/// degrades to `None`/"unknown".
 const CONTAINER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Dial a running sandbox's control port for a probe whose guest I/O must all
+/// finish by `deadline`. Every stream the connector hands out — including the
+/// liveness `Health` check `sandbox::control` runs before the real dial — is a
+/// [`DeadlineStream`], so a guest that trickles bytes can stretch neither
+/// exchange past the deadline. The dial itself (the VMM's hybrid-vsock
+/// `CONNECT` handshake, answered by the VMM rather than the guest) stays
+/// outside it.
+fn probe_control(d: &Arc<Daemon>, name: &str, deadline: Instant) -> Option<Box<dyn IoStream>> {
+    let bounded = |paths: &Paths, name: &str| -> anyhow::Result<Box<dyn IoStream>> {
+        let inner = (d.connector())(paths, name)?;
+        Ok(Box::new(DeadlineStream::new(inner, deadline)))
+    };
+    sandbox::control(&d.paths, name, &bounded).ok()
+}
 
 /// Best-effort probe of a sandbox's in-guest container state via the guest
 /// `Health` RPC. Returns `None` on any failure — a stopped sandbox (the
-/// control dial fails), an unreachable/wedged guest (bounded by `timeout`), or
+/// control dial fails), an unreachable/wedged/trickling guest (bounded by an
+/// overall `timeout` from probe start), or
 /// a guest old enough that its `HealthInfo` carries no `container` field — so
 /// inspect degrades to "unknown" instead of erroring. Mirrors
 /// `handle_guest_rpc`'s single request/response exchange, but swallows errors
@@ -1118,8 +1136,7 @@ fn probe_container_state(
     name: &str,
     timeout: Duration,
 ) -> Option<izba_proto::ContainerState> {
-    let mut conn = sandbox::control(&d.paths, name, d.connector()).ok()?;
-    conn.set_io_timeout(Some(timeout)).ok()?;
+    let mut conn = probe_control(d, name, Instant::now() + timeout)?;
     write_frame(&mut conn, &izba_proto::Request::Health).ok()?;
     match read_frame::<_, Response>(&mut conn).ok()? {
         Response::Health(h) => h.container,
@@ -1133,7 +1150,11 @@ fn probe_container_state(
 /// really did connect to a listening `127.0.0.1:6901` inside the guest — a
 /// dead desktop stays dead and is reported as such (no auto-restart, same
 /// posture as a dead dockerd). Every failure mode (stream port unreachable,
-/// wedged guest, `Error{ConnectFailed}`, junk reply) maps to `false`.
+/// wedged or trickling guest, `Error{ConnectFailed}`, junk reply) maps to
+/// `false`. `timeout` is an OVERALL deadline from probe start (#205): every
+/// read and write goes through a [`DeadlineStream`], so a guest dribbling its
+/// reply cannot keep resetting a per-read timeout. The dial's own `CONNECT`
+/// handshake is answered by the VMM, not the guest, and stays outside it.
 /// (In docker mode the guest-side dial reaches the container's wildcard
 /// listener via the `192.168.127.2` veth fallback instead of loopback — same
 /// TcpDial contract either way.)
@@ -1141,12 +1162,11 @@ fn probe_container_state(
 /// Uses the SAME `StreamOpen::TcpDial` contract as `portfwd::relay_one`, so
 /// what this probes is exactly what the relay in front of it does.
 fn probe_vnc_endpoint(d: &Arc<Daemon>, name: &str, timeout: Duration) -> bool {
-    let Ok(mut s) = (d.deps.stream_connector)(&d.paths, name) else {
+    let deadline = Instant::now() + timeout;
+    let Ok(s) = (d.deps.stream_connector)(&d.paths, name) else {
         return false;
     };
-    if s.set_io_timeout(Some(timeout)).is_err() {
-        return false;
-    }
+    let mut s = DeadlineStream::new(s, deadline);
     let answered = write_frame(
         &mut s,
         &izba_proto::StreamOpen::TcpDial {
@@ -1158,7 +1178,7 @@ fn probe_vnc_endpoint(d: &Arc<Daemon>, name: &str, timeout: Duration) -> bool {
     // Full teardown once we're done talking: CH does not propagate a vsock
     // half-close guest→host (the load-bearing contract), so never leave this
     // probe's connection half-open.
-    let _ = s.shutdown(std::net::Shutdown::Both);
+    let _ = s.inner().shutdown(std::net::Shutdown::Both);
     answered
 }
 
@@ -1234,7 +1254,8 @@ fn rss_kb_from_status(s: &str) -> Option<u64> {
         .ok()
 }
 
-/// Guest Stats probe deadline — same wedged-guest discipline as
+/// Guest Stats probe OVERALL deadline (from probe start) — same wedged- and
+/// trickling-guest discipline as
 /// CONTAINER_PROBE_TIMEOUT, plus headroom for the in-guest 250 ms sampling.
 const STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1276,14 +1297,14 @@ fn handle_stats(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse>
 
 /// Best-effort guest Stats fetch, probe-shaped like probe_container_state:
 /// any failure (unreachable, wedged, pre-stats guest replying Error or
-/// dropping the conn) degrades to None, never an error or a hang.
+/// dropping the conn, trickling past the overall `timeout`) degrades to None,
+/// never an error or a hang.
 fn probe_guest_stats(
     d: &Arc<Daemon>,
     name: &str,
     timeout: Duration,
 ) -> Option<izba_proto::GuestStats> {
-    let mut conn = sandbox::control(&d.paths, name, d.connector()).ok()?;
-    conn.set_io_timeout(Some(timeout)).ok()?;
+    let mut conn = probe_control(d, name, Instant::now() + timeout)?;
     write_frame(&mut conn, &izba_proto::Request::Stats).ok()?;
     match read_frame::<_, Response>(&mut conn).ok()? {
         Response::Stats(g) => Some(g),
@@ -2234,8 +2255,8 @@ mod tests {
         load_json, save_json, RunState, SandboxConfig, UserFallback, CONFIG_FILE, STATE_FILE,
     };
     use crate::testutil::{
-        fake_connector, hanging_connector, live_identity, spawn_sleep, test_paths, wait_dead,
-        write_state, write_state_with_run_dir, MockDriver,
+        fake_connector, hanging_connector, live_identity, spawn_sleep, test_paths, trickle_frame,
+        trickling_connector, wait_dead, write_state, write_state_with_run_dir, MockDriver,
     };
     use crate::vmm::UdsStream;
     use izba_proto::{read_frame, write_frame, Request, Response};
@@ -4387,6 +4408,40 @@ mod tests {
         );
     }
 
+    /// #205, the VNC twin: a guest that answers the `TcpDial` by trickling a
+    /// reply frame must not hold the probe past its overall deadline.
+    #[test]
+    fn vnc_probe_is_bounded_by_an_overall_deadline_against_a_trickling_guest() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(|_paths: &Paths, _name: &str| {
+            let (host, guest) = UdsStream::pair()?;
+            std::thread::spawn(move || {
+                let mut g = guest;
+                if read_frame::<_, izba_proto::StreamOpen>(&mut g).is_ok() {
+                    trickle_frame(g);
+                }
+            });
+            Ok(host)
+        });
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+
+        let t0 = Instant::now();
+        let answered = probe_vnc_endpoint(&d, "desk", Duration::from_millis(300));
+        assert!(!answered, "a trickling guest is not a running desktop");
+        assert!(
+            t0.elapsed() < TRICKLE_PROBE_CEILING,
+            "a trickling guest held the probe {:?}",
+            t0.elapsed()
+        );
+    }
+
     /// Fail-loud, not degrade: a `--vnc` start whose relay cannot be published
     /// must FAIL (a sandbox with an unreachable desktop is silently useless),
     /// with a message that names the retry.
@@ -5255,6 +5310,64 @@ mod tests {
         assert!(
             t0.elapsed() < Duration::from_secs(5),
             "probe blocked {:?} instead of timing out",
+            t0.elapsed()
+        );
+    }
+
+    /// Upper bound a trickle test allows a 300 ms-budget probe: generous for a
+    /// loaded CI host, yet far below the fake guest's 3 s trickle — so passing
+    /// proves the OVERALL deadline fired, not the peer's eventual hang-up.
+    const TRICKLE_PROBE_CEILING: Duration = Duration::from_millis(1500);
+
+    /// #205: a hostile guest that dribbles its reply a byte at a time, each
+    /// byte inside the per-read timeout, must not hold the probe past its
+    /// overall deadline. A per-syscall timeout resets on every partial read,
+    /// so only a deadline measured from probe start bounds this.
+    #[test]
+    fn container_probe_is_bounded_by_an_overall_deadline_against_a_trickling_guest() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = test_deps();
+        deps.connector = Box::new(trickling_connector());
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity());
+
+        let t0 = Instant::now();
+        let state = probe_container_state(&d, "web", Duration::from_millis(300));
+        assert_eq!(state, None);
+        assert!(
+            t0.elapsed() < TRICKLE_PROBE_CEILING,
+            "a trickling guest held the probe {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// #205, the Stats twin of the container-probe trickle test.
+    #[test]
+    fn stats_probe_is_bounded_by_an_overall_deadline_against_a_trickling_guest() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = test_deps();
+        deps.connector = Box::new(trickling_connector());
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity());
+
+        let t0 = Instant::now();
+        let stats = probe_guest_stats(&d, "web", Duration::from_millis(300));
+        assert!(stats.is_none());
+        assert!(
+            t0.elapsed() < TRICKLE_PROBE_CEILING,
+            "a trickling guest held the probe {:?}",
             t0.elapsed()
         );
     }
