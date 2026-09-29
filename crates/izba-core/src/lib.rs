@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod build;
 pub mod build_info;
+pub mod bundle;
 pub mod ca;
 pub mod cp;
 pub mod daemon;
