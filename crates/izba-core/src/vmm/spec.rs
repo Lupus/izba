@@ -109,6 +109,19 @@ impl VmSpec {
     ///     images, and NAMED persistent volumes under `<data>/volumes` (which
     ///     live outside the per-sandbox dir entirely).
     ///
+    /// **`<data>/daemon` (holding `izbad.sock`) must NEVER be, be under, or be
+    /// covered by an ancestor of, any surface returned here (F-09, #281).** The
+    /// control socket keeps the implicit Medium label on purpose: spike #248
+    /// (`docs/spikes/0001-windows-afunix-connect-write-access.md`) proved that
+    /// Windows AF_UNIX `connect()` requires WRITE access to the socket file, so
+    /// a Low-IL peer — the confined VMM — cannot dial it. Labelling any surface
+    /// that contains it (the label is inheritable and propagates to the whole
+    /// subtree) would hand the sandbox's VMM every sandbox. Every izba-owned
+    /// surface is pinned clear of it by a guard test in `sandbox.rs`; the
+    /// workspace is the one USER-CHOSEN surface, so it is policed by the
+    /// start-time check `check_workspace_spares_control_socket`, which refuses
+    /// a workspace equal to or containing the daemon dir.
+    ///
     /// The read-only rootfs (erofs) is omitted: a Low-IL process may read UP to
     /// a Medium object (no-read-up is not part of MIC's default policy), so the
     /// RO image needs no label.
