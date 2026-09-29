@@ -400,7 +400,7 @@ fn peer_auth_mode_line() -> Option<String> {
 fn windows_sibling_exposure_line(is_windows: bool) -> Option<String> {
     is_windows.then(|| {
         "izbad: Windows default tier — every confined VMM runs as you at Low \
-         integrity, and every sandbox's run dir, writable disks, console log \
+         integrity, and every running sandbox's run dir, writable disks, console log \
          and workspace carry a Low label so its VMM can write them; a VMM that \
          escapes its guest therefore reaches every SIBLING sandbox's surfaces \
          too, including that sandbox's own VMM socket (vsock.sock → exec, cp \
@@ -6536,6 +6536,7 @@ mod tests {
         let line = super::windows_sibling_exposure_line(true).expect("Windows gets the line");
         for needle in [
             "SIBLING",
+            "every running sandbox's",
             "vsock.sock",
             "exec",
             "writable disks",
