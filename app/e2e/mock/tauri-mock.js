@@ -221,6 +221,32 @@
         }
         return action();
       }
+      case "lockdown": {
+        calls.push("lockdown:" + args.name);
+        if (scenario.lockdownError) return err(scenario.lockdownError);
+        const outcome = scenario.lockdownOutcome || "locked";
+        const d = scenario.details && scenario.details[args.name];
+        if (d && d.lockdown && outcome === "locked") {
+          d.lockdown.locked = true;
+          d.lockdown.account = "izba-sb-" + args.name;
+          d.lockdown.net_blocked = true;
+          const sbx = (scenario.sandboxes || []).find(function (s) {
+            return s.name === args.name;
+          });
+          d.lockdown.restart_required = !!(sbx && sbx.state && sbx.state.kind === "running");
+        }
+        return Promise.resolve(outcome);
+      }
+      case "unlock": {
+        calls.push("unlock:" + args.name);
+        const d = scenario.details && scenario.details[args.name];
+        if (d && d.lockdown) {
+          d.lockdown.locked = false;
+          d.lockdown.account = null;
+          d.lockdown.restart_required = d.lockdown.booted_as_account;
+        }
+        return action();
+      }
       // Deliberately a loopback URL the iframe cannot actually load
       // (credential-less, unlike detail.vnc_url) — specs assert UI chrome
       // around the embed, never iframe content.

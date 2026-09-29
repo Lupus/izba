@@ -71,6 +71,18 @@ pub struct FakeDaemon {
     pub vnc_running: bool,
     pub vnc_url: Option<String>,
     pub vnc_restart_required: bool,
+    /// Whether lock-down "exists" on this fake host (Windows-only in reality).
+    pub lockdown_supported: bool,
+    /// Sandboxes currently locked down (configured posture).
+    pub locked: std::collections::HashSet<String>,
+    /// `lockdown` answers `Cancelled` (declined UAC prompt).
+    pub lockdown_cancel: bool,
+    /// `unlock` fails with this message.
+    pub unlock_fail: Option<String>,
+    /// Recorded fact echoed by `inspect`: the account the run booted as.
+    pub lockdown_account: Option<String>,
+    /// Recorded fact echoed by `inspect`.
+    pub lockdown_restart_required: bool,
 }
 
 impl Default for FakeDaemon {
@@ -123,6 +135,12 @@ impl Default for FakeDaemon {
             vnc_running: false,
             vnc_url: None,
             vnc_restart_required: false,
+            lockdown_supported: true,
+            locked: std::collections::HashSet::new(),
+            lockdown_cancel: false,
+            unlock_fail: None,
+            lockdown_account: None,
+            lockdown_restart_required: false,
         }
     }
 }
@@ -335,8 +353,8 @@ impl DaemonApi for FakeDaemon {
             vnc_running: self.vnc_running,
             vnc_url: self.vnc_url.clone(),
             vnc_restart_required: self.vnc_restart_required,
-            lockdown_account: None,
-            lockdown_restart_required: false,
+            lockdown_account: self.lockdown_account.clone(),
+            lockdown_restart_required: self.lockdown_restart_required,
         })
     }
 
@@ -587,6 +605,50 @@ impl DaemonApi for FakeDaemon {
             anyhow::bail!("daemon unreachable");
         }
         self.vnc = enabled;
+        Ok(())
+    }
+
+    fn lockdown_supported(&self) -> bool {
+        self.lockdown_supported
+    }
+
+    fn lockdown_state(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<izba_core::jail_account::LockdownState> {
+        Ok(if self.locked.contains(name) {
+            izba_core::jail_account::LockdownState::Locked(izba_core::jail_account::LockedInfo {
+                account: format!("izba-sb-{name}"),
+                sid: "S-1-5-21-0".into(),
+                net_blocked: true,
+            })
+        } else {
+            izba_core::jail_account::LockdownState::Unlocked
+        })
+    }
+
+    fn lockdown(&mut self, name: &str) -> anyhow::Result<izba_core::jail_account::LockdownOutcome> {
+        self.calls.push(format!("lockdown:{name}"));
+        if self.fail_action {
+            anyhow::bail!("provision helper failed: boom");
+        }
+        if self.lockdown_cancel {
+            return Ok(izba_core::jail_account::LockdownOutcome::Cancelled);
+        }
+        self.locked.insert(name.to_string());
+        let izba_core::jail_account::LockdownState::Locked(info) = self.lockdown_state(name)?
+        else {
+            unreachable!("just inserted");
+        };
+        Ok(izba_core::jail_account::LockdownOutcome::Locked(info))
+    }
+
+    fn unlock(&mut self, name: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("unlock:{name}"));
+        if let Some(msg) = &self.unlock_fail {
+            anyhow::bail!("{msg}");
+        }
+        self.locked.remove(name);
         Ok(())
     }
 }

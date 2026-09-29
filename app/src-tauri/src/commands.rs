@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use crate::daemon::DaemonApi;
 use crate::views::{
-    app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView, PromoteView,
-    SandboxDetailView, SandboxStatsView, SandboxView, SeedEntry, UsbDeviceView, UsbStatusView,
-    UsbUpstreamView, VersionView, VolumeInfoView,
+    app_build_info, CreateOpts, DaemonStatusView, DiffView, LockdownView, PolicyView, PortRuleView,
+    PromoteView, SandboxDetailView, SandboxStatsView, SandboxView, SeedEntry, UsbDeviceView,
+    UsbStatusView, UsbUpstreamView, VersionView, VolumeInfoView,
 };
 use crate::vncproxy;
 use izba_core::daemon::egress::audit::EndpointSummary;
@@ -74,8 +74,25 @@ pub fn restart_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
     d.start(name).map_err(|e| e.to_string())
 }
 
-/// Remove a sandbox (force skips the running-state guard).
+/// Core of `remove`. A locked sandbox's Windows account + firewall rule are
+/// released FIRST (the CLI's `izba rm` does the same); if that fails or the
+/// UAC prompt is declined, the remove is ABORTED — nothing has been deleted
+/// yet, so a retry is safe — rather than leaking the account behind a remove
+/// that reports success. (The CLI warns and continues; the GUI has no
+/// channel for a warning attached to a success.) `force` skips the
+/// running-state guard.
 pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(), String> {
+    if d.lockdown_supported() {
+        let configured = d.lockdown_state(name).map_err(|e| e.to_string())?;
+        if configured.is_locked() {
+            d.unlock(name).map_err(|e| {
+                format!(
+                    "Windows account for '{name}' was not released ({e:#}) — approve the \
+                     prompt to remove it, or run 'izba windows-cleanup' later"
+                )
+            })?;
+        }
+    }
     d.remove(name, force).map_err(|e| e.to_string())
 }
 
@@ -273,9 +290,29 @@ pub fn policy_set_enforce_core(d: &mut dyn DaemonApi, name: &str, on: bool) -> R
 
 /// Core of `inspect`: full sandbox detail (ports + volumes) mapped to a view.
 pub fn inspect_core(d: &mut dyn DaemonApi, name: &str) -> Result<SandboxDetailView, String> {
-    d.inspect(name)
-        .map(SandboxDetailView::from)
-        .map_err(|e| e.to_string())
+    let detail = d.inspect(name).map_err(|e| e.to_string())?;
+    let lockdown = if d.lockdown_supported() {
+        let configured = d.lockdown_state(name).map_err(|e| e.to_string())?;
+        Some(LockdownView::new(&configured, &detail))
+    } else {
+        None
+    };
+    let mut view = SandboxDetailView::from(detail);
+    view.lockdown = lockdown;
+    Ok(view)
+}
+
+/// Core of `lockdown`: `"locked"`, or `"cancelled"` when the user declined
+/// the UAC prompt — a choice, not an error, so it is not an `Err`.
+pub fn lockdown_core(d: &mut dyn DaemonApi, name: &str) -> Result<String, String> {
+    match d.lockdown(name).map_err(|e| format!("{e:#}"))? {
+        izba_core::jail_account::LockdownOutcome::Locked(_) => Ok("locked".into()),
+        izba_core::jail_account::LockdownOutcome::Cancelled => Ok("cancelled".into()),
+    }
+}
+
+pub fn unlock_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
+    d.unlock(name).map_err(|e| format!("{e:#}"))
 }
 
 /// Core of `stats`: resource stats for one sandbox mapped to a view.
@@ -997,6 +1034,104 @@ mod tests {
         let bind: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
         port_unpublish_core(&mut d, "web", bind, 8080).unwrap();
         assert!(d.calls.iter().any(|c| c == "unpublish:web:127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn inspect_core_omits_lockdown_when_unsupported() {
+        let mut d = FakeDaemon {
+            lockdown_supported: false,
+            ..FakeDaemon::default()
+        };
+        assert!(inspect_core(&mut d, "web").unwrap().lockdown.is_none());
+    }
+
+    #[test]
+    fn inspect_core_maps_lockdown_state_and_restart_fact() {
+        let mut d = FakeDaemon {
+            lockdown_account: Some("izba-sb-web".into()),
+            lockdown_restart_required: true,
+            ..FakeDaemon::default()
+        };
+        let v = inspect_core(&mut d, "web").unwrap().lockdown.unwrap();
+        assert!(!v.locked);
+        assert!(v.restart_required);
+        assert!(v.booted_as_account);
+        assert_eq!(v.account, None);
+    }
+
+    #[test]
+    fn lockdown_core_locks_then_inspect_reports_locked() {
+        let mut d = FakeDaemon::default();
+        assert_eq!(lockdown_core(&mut d, "web").unwrap(), "locked");
+        let v = inspect_core(&mut d, "web").unwrap().lockdown.unwrap();
+        assert!(v.locked);
+        assert_eq!(v.account.as_deref(), Some("izba-sb-web"));
+        assert!(v.net_blocked);
+    }
+
+    #[test]
+    fn lockdown_core_reports_a_declined_prompt_as_cancelled_not_an_error() {
+        let mut d = FakeDaemon {
+            lockdown_cancel: true,
+            ..FakeDaemon::default()
+        };
+        assert_eq!(lockdown_core(&mut d, "web").unwrap(), "cancelled");
+        assert!(
+            !inspect_core(&mut d, "web")
+                .unwrap()
+                .lockdown
+                .unwrap()
+                .locked
+        );
+    }
+
+    #[test]
+    fn unlock_core_clears_the_lock() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        unlock_core(&mut d, "web").unwrap();
+        assert!(
+            !inspect_core(&mut d, "web")
+                .unwrap()
+                .lockdown
+                .unwrap()
+                .locked
+        );
+    }
+
+    #[test]
+    fn remove_core_releases_a_locked_sandbox_account_before_rm() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.calls.clear();
+        remove_core(&mut d, "web", false).unwrap();
+        assert_eq!(
+            d.calls,
+            vec!["unlock:web".to_string(), "rm:web:false".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_core_aborts_without_rm_when_unlock_is_declined() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.unlock_fail = Some("unlock cancelled by user".into());
+        d.calls.clear();
+        let err = remove_core(&mut d, "web", false).unwrap_err();
+        assert!(err.contains("was not released"), "{err}");
+        assert!(err.contains("izba windows-cleanup"), "{err}");
+        assert!(
+            !d.calls.iter().any(|c| c.starts_with("rm:")),
+            "{:?}",
+            d.calls
+        );
+    }
+
+    #[test]
+    fn remove_core_never_unlocks_an_unlocked_sandbox() {
+        let mut d = FakeDaemon::default();
+        remove_core(&mut d, "web", true).unwrap();
+        assert_eq!(d.calls, vec!["rm:web:true".to_string()]);
     }
 
     #[test]

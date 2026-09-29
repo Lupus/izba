@@ -88,6 +88,8 @@ export const api = {
   manifestPromote: (name: string, restart: boolean) =>
     invoke<PromoteView>("manifest_promote", { name, restart }),
   vncSet: (name: string, enabled: boolean) => invoke<void>("vnc_set", { name, enabled }),
+  lockdown: (name: string) => invoke<"locked" | "cancelled">("lockdown", { name }),
+  unlock: (name: string) => invoke<void>("unlock", { name }),
   vncProxyStart: (name: string) => invoke<string>("vnc_proxy_start", { name }),
   vncProxyStop: (name: string) => invoke<void>("vnc_proxy_stop", { name }),
 };
