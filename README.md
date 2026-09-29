@@ -352,6 +352,8 @@ izba diff    [NAME_OR_DIR] [--name NAME]  # show drift between izba.yml and mana
 izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
                                           # apply manifest → managed truth (human-gated)
 izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
+izba save    NAME... | --all -o FILE.izba [--with-workspace] [--stop]   # archive sandboxes (disks, volumes, config) to one file
+izba load    FILE.izba [NAME...] [--as NEW] [--workspace DIR | --workspace-root DIR]   # restore them, stopped, on this host
 ```
 
 `izba policy revoke` and `izba policy seed` were previously spelled `izba
@@ -380,6 +382,23 @@ client can resize it live; and the clipboard is bidirectional by default.
 VNC works together with `--docker` too: the desktop lives inside the
 container's own network namespace, reached through the same credentialed
 relay.
+
+### Moving sandboxes to another machine
+
+`izba save` writes one `.izba` archive (a sparse-aware zstd tar) holding the
+sandbox's disks, volumes, image and config, optionally the workspace too;
+`izba load` restores it on any host (Linux or Windows) with the disks
+verified byte-identical, ownership as the container saw it, and the sandbox
+left stopped. Lockdown is per-host and is not carried over.
+
+```sh
+izba save --all --with-workspace --stop -o laptop.izba   # on the old machine
+# copy laptop.izba across, then on the new machine:
+izba load laptop.izba && izba start myproj
+```
+
+The archive is plaintext and may contain secrets from the sandbox disks and
+workspace (for example `.env` files) — treat it like a credential.
 
 ### Referring to sandboxes
 

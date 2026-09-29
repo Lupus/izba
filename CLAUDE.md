@@ -94,7 +94,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   unbinds). `broker/session.rs` is the op phase: resolve `vid:pid` → busid via
   `OP_REQ_DEVLIST`, import on a SECOND connection (one op per TCP conn),
   re-verify the returned record, then splice — validating every URB header in
-  the guest→upstream direction only (D6).
+  the guest→upstream direction only (D6);
+  `bundle/` sandbox save/load archives (`izba save`/`izba load`) — a pure
+  library: `save`/`load` stream a zstd tar (`manifest.json` first,
+  `checksums.json` last, disks as sparse `<path>.d/<offset>` chunks with
+  canonical digests, workspaces via `workspace`), load stages then commits
+  atomically with rollback.
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers, NIC-less net bring-up (`net.rs`) + egress stub (`egress.rs`:
   DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half), and
@@ -152,7 +157,9 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   `detach_volume`, `persist_port_rule`/`unpersist_port_rule`, `handle_vnc_set`
   and `manifest::apply::write_managed` (`promote`); a NEW verb that loads and
   saves `config.json` itself reopens the window — `create` is the only
-  legitimate direct writer (a first write, not a read-modify-write). Any check
+  legitimate direct writer (a first write, not a read-modify-write) — and
+  `izba load` is the same kind of first write (it installs a whole new
+  `config.json` carrying `disk_owner`, never edits an existing one). Any check
   that reads config state the edit depends on (the volume cap, the eph_id
   assignment, the single-writer guard) belongs INSIDE the closure. `lock_sandbox`
   is a `try_lock`, so the deliberate, user-visible cost is that the loser fails
@@ -196,10 +203,11 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Control port 1025 also serves `Request::Stats` (`izba-init`'s process/mem/
   mount/docker-engine snapshot — guest-reported, daemon-sanitized before it
   reaches the CLI/GUI; ~250 ms in-call CPU sampling via two `/proc` reads
-  makes the RPC stateless). `DAEMON_PROTO_VERSION = 7` is this: v6 added
+  makes the RPC stateless). `DAEMON_PROTO_VERSION = 8` is this: v6 added
   `DaemonRequest::VncSet`; v7 added the Inspect lock-down facts
   (`lockdown_account`/`lockdown_restart_required`), whose absence an older
-  daemon would otherwise misreport as "applied".
+  daemon would otherwise misreport as "applied"; v8 added
+  `DaemonRequest::Save`/`Load` (sandbox archives).
 - **Disk order:** `sandbox::start()` builds
   `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …, kasmvnc.erofs
   (RO, VNC sandboxes only)]`
@@ -219,7 +227,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
   [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]
   [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,… [izba.wsidmap=1]]
-  [izba.vnc=1]` ↔
+  [izba.diskuidmap=<d-p-n>,… izba.diskgidmap=<d-p-n>,…] [izba.vnc=1]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -237,6 +245,14 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   the initramfs via `IZBA_NFT` (`hack/build-nft.sh`) and applies the nat-output
   REDIRECT ruleset at boot. (passt/consomme/`izba.ipv4only` are GONE from the
   datapath as of M1 — all egress flows through izbad over vsock 1027.)
+  `izba.diskuidmap=`/`izba.diskgidmap=` (`disk-presented-n` triples, same
+  grammar as `izba.uidmap=`) appear only on a MOVED non-docker sandbox
+  (`config.disk_owner` set by `izba load`, and different from the current
+  owner): init applies P = M_tgt ∘ M_src⁻¹ as an idmapped mount over `/upper`
+  and each user volume (never the erofs lower), preserving the container's
+  view of ownership; fail-closed — a kernel that refuses aborts boot. One
+  generator (`sandbox::disk_idmap_for`), one call site. `disk_owner: None` (every
+  sandbox not loaded from an archive) means disks are in the current owner's ids.
 - **Inspectability is DECLARED per PORT, not derived from the port (M5 P1,
   #238):** a `ports:` element carries `protocol: http | tcp` — a bare number
   declares nothing and is inspected by default. The declaration lives on

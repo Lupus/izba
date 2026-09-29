@@ -1,6 +1,6 @@
 # Sandbox save/load (move sandboxes between hosts) — design
 
-Status: approved 2026-09-29. Implementation amendments (from planning) are in §10.
+Status: implemented 2026-09-29. Amendments from planning and implementation are in §10 (where they differ, §10 wins).
 
 ## 1. Goal
 
@@ -234,7 +234,7 @@ Daemon (`daemon/proto.rs`, `daemon/server.rs`):
   `DaemonRequest::Load { path, select, rename, workspace, workspace_root }`,
   returning `SaveReport` / `LoadReport` (sizes, warnings, redo-on-this-host
   list). Progress via existing `DaemonResponse::Progress` (phase + bytes text).
-- `DAEMON_PROTO_VERSION` 6 → 7; CLAUDE.md load-bearing contract updated.
+- `DAEMON_PROTO_VERSION` 7 → 8 (main took v7 for the Inspect lock-down facts first); CLAUDE.md load-bearing contract updated.
 - Load commits via registry rescan + ssh-config regeneration, as `create`.
 - The app (`app/src-tauri`) embeds izba-core/izba-proto, so its gate is run
   even though its UI is deferred.
@@ -299,3 +299,21 @@ TDD throughout.
 - **Client disconnect:** the daemon's progress channel cannot observe the
   client going away, so an interrupted CLI does not abort a running save; the
   archive still lands at `<out>` (atomically, via `.partial`).
+
+### Added during implementation
+
+- **Manifest:** `Manifest.image_sizes`; per sandbox `SandboxEntry.named_volumes`
+  and `SandboxEntry.image_digest`.
+- **Selection-scoped staging:** `load <name>…` stages, verifies and space-checks
+  only the selected sandboxes and the images/volumes they need.
+- **Tags:** a tag is created only for a loaded config's `image_ref`, and each
+  created tag is reported.
+- **Incomplete images:** a target image dir that has its rootfs but lacks
+  metadata files keeps the rootfs and gains only the missing, verified files.
+- **Special files:** sockets and FIFOs in a workspace are skipped with a
+  warning; read-only directories are restored (mode applied) after extraction.
+- **Staging:** the `.partial` output name is unique per run; save also locks
+  every other sandbox referencing a saved named volume for the duration.
+- **Strict chunk names:** `<path>.d/<offset-hex16>` names that are not exactly
+  16 hex digits, or chunks that overlap an earlier one or overrun the `.len`
+  length, are rejected.
