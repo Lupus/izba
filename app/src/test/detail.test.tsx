@@ -150,6 +150,28 @@ describe("Detail actions", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /^remove$/i }));
     await waitFor(() => expect(api.remove).toHaveBeenCalledWith("web", false));
   });
+
+  it("reports a failed Remove via onNotice, not the inline error", async () => {
+    const { api } = await import("../lib/ipc");
+    vi.mocked(api.remove).mockRejectedValueOnce(new Error("was removed, but run 'izba windows-cleanup'"));
+    const onNotice = vi.fn();
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "stopped" } };
+    render(<Detail sandbox={sbx} onChanged={noop} onNotice={onNotice} />);
+    fireEvent.click(screen.getByRole("button", { name: /^remove$/i }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^remove$/i }));
+    await waitFor(() => expect(onNotice).toHaveBeenCalledWith("was removed, but run 'izba windows-cleanup'"));
+    expect(screen.queryByText(/windows-cleanup/)).toBeNull();
+  });
+
+  it("falls back to the inline error for Remove when onNotice is absent", async () => {
+    const { api } = await import("../lib/ipc");
+    vi.mocked(api.remove).mockRejectedValueOnce(new Error("rm failed"));
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "stopped" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("button", { name: /^remove$/i }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^remove$/i }));
+    expect(await screen.findByText("rm failed")).toBeInTheDocument();
+  });
 });
 
 describe("Detail tabs", () => {

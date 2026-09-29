@@ -19,6 +19,9 @@ import { api } from "../lib/ipc";
 interface Props {
   sandbox: SandboxView | null;
   onChanged: () => void;
+  /** App-level notice; a failed Remove reports here so the message outlives
+   *  this Detail (the sandbox may already be gone). */
+  onNotice?: (msg: string) => void;
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
@@ -43,7 +46,7 @@ const ACTION_VERB: Record<Action, string> = {
   remove: "Removing…",
 };
 
-export function Detail({ sandbox, onChanged }: Props) {
+export function Detail({ sandbox, onChanged, onNotice }: Props) {
   const [busyAction, setBusyAction] = useState<Action | null>(null);
   const [pending, setPending] = useState<Pending>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +79,9 @@ export function Detail({ sandbox, onChanged }: Props) {
       setActionRev((r) => r + 1);
       onChanged();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (action === "remove" && onNotice) onNotice(msg);
+      else setError(msg);
     } finally {
       setBusyAction(null);
     }
