@@ -395,6 +395,48 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Save sandboxes (disks, config, egress policy, optionally the workspace)
+    /// into one .izba archive, to move them to another machine
+    ///
+    /// The archive may contain secrets from the sandbox disks and workspace
+    /// (e.g. .env files); treat it like a credential. Restore it elsewhere
+    /// with `izba load`.
+    Save {
+        /// Sandboxes to save
+        #[arg(value_name = "NAME", conflicts_with = "all")]
+        names: Vec<String>,
+        /// Save every sandbox
+        #[arg(long, required_unless_present = "names")]
+        all: bool,
+        /// Archive file to write (must not exist)
+        #[arg(short, long, value_name = "FILE")]
+        output: std::path::PathBuf,
+        /// Also include each sandbox's workspace directory
+        #[arg(long)]
+        with_workspace: bool,
+        /// Stop running sandboxes first instead of refusing
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Load sandboxes from a .izba archive made by `izba save` (move
+    /// sandboxes from another machine)
+    Load {
+        /// Archive file to read
+        #[arg(value_name = "ARCHIVE")]
+        archive: std::path::PathBuf,
+        /// Sandboxes to load (default: every sandbox in the archive)
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Load under a new name (archive must select exactly one sandbox)
+        #[arg(long = "as", value_name = "NEW")]
+        rename: Option<String>,
+        /// Restore the workspace to this directory (exactly one sandbox)
+        #[arg(long, value_name = "DIR", conflicts_with = "workspace_root")]
+        workspace: Option<std::path::PathBuf>,
+        /// Restore each workspace under this directory, as <DIR>/<name>
+        #[arg(long, value_name = "DIR")]
+        workspace_root: Option<std::path::PathBuf>,
+    },
     /// Apply izba.yml to the managed sandbox (requires a prior `izba diff`)
     Promote {
         /// Sandbox name, or workspace directory containing izba.yml
@@ -550,6 +592,20 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Export { target, name } => {
             commands::export::run(paths, target.as_deref(), name.as_deref())
         }
+        Cmd::Save {
+            names,
+            all,
+            output,
+            with_workspace,
+            stop,
+        } => commands::save::run(paths, names, all, output, with_workspace, stop),
+        Cmd::Load {
+            archive,
+            names,
+            rename,
+            workspace,
+            workspace_root,
+        } => commands::load::run(paths, archive, names, rename, workspace, workspace_root),
         Cmd::Promote {
             target,
             name,
@@ -602,6 +658,63 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_parses_names_all_and_flags() {
+        let c = Cli::try_parse_from([
+            "izba",
+            "save",
+            "a",
+            "b",
+            "-o",
+            "x.izba",
+            "--with-workspace",
+            "--stop",
+        ])
+        .unwrap();
+        assert!(
+            matches!(c.cmd, Cmd::Save { ref names, all: false, with_workspace: true, stop: true, .. } if names == &["a", "b"])
+        );
+        assert!(Cli::try_parse_from(["izba", "save", "--all", "-o", "x.izba"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["izba", "save", "a"]).is_err(),
+            "-o is required"
+        );
+        assert!(
+            Cli::try_parse_from(["izba", "save", "-o", "x"]).is_err(),
+            "names or --all required"
+        );
+        assert!(
+            Cli::try_parse_from(["izba", "save", "a", "--all", "-o", "x"]).is_err(),
+            "names conflict with --all"
+        );
+    }
+
+    #[test]
+    fn load_parses_selection_and_placement() {
+        let c = Cli::try_parse_from([
+            "izba",
+            "load",
+            "x.izba",
+            "a",
+            "--as",
+            "b",
+            "--workspace",
+            "/w",
+        ])
+        .unwrap();
+        assert!(matches!(c.cmd, Cmd::Load { .. }));
+        assert!(Cli::try_parse_from([
+            "izba",
+            "load",
+            "x.izba",
+            "--workspace",
+            "/w",
+            "--workspace-root",
+            "/r"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn parse_create_defaults() {
