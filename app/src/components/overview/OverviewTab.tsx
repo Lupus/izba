@@ -7,10 +7,16 @@ import { ResourcesCard } from "./ResourcesCard";
 import { StorageCard } from "./StorageCard";
 import { ProcessesCard } from "./ProcessesCard";
 
+/** Slow re-fetch of `inspect` while the tab is mounted. `izba lockdown` /
+ *  `izba unlock` (and any other CLI) change the posture outside the app, so
+ *  without this the lock-down row would present a stale posture as fact. */
+const INSPECT_REFRESH_MS = 15_000;
+
 /** The Overview dashboard: four cards over ONE stats poller (plus a single
  *  non-polling `inspect` for workspace, confinement, docker mode and the
  *  lock-down facts, re-fetched when the sandbox name, its state kind, the
- *  lock-down `rev` or the parent's `actionRev` changes). Each card takes its
+ *  lock-down `rev` or the parent's `actionRev` changes, every
+ *  `INSPECT_REFRESH_MS`, and on window focus / tab-visible). Each card takes its
  *  data slice as props, so every degraded state is a plain-props case. */
 export function OverviewTab({
   sandbox,
@@ -27,6 +33,11 @@ export function OverviewTab({
   // `rev` bumps on a lock-down/unlock; `state.kind` because the restart-required
   // fact flips on start/stop. Only a NAME change blanks the card ("…").
   const [rev, setRev] = useState(0);
+  // Bumped by the slow interval and focus/visibility events (external changes).
+  const [tick, setTick] = useState(0);
+  // The last inspect rejected: the held posture may be stale, so the lock-down
+  // row shows "unknown" instead. Reset on a name change.
+  const [refreshFailed, setRefreshFailed] = useState(false);
   const lastName = useRef(sandbox.name);
   const stateKind = sandbox.state.kind;
 
@@ -35,19 +46,38 @@ export function OverviewTab({
     if (lastName.current !== sandbox.name) {
       lastName.current = sandbox.name;
       setDetail(null);
+      setRefreshFailed(false);
     }
     api.inspect(sandbox.name).then(
       (d) => {
-        if (alive) setDetail(d);
+        if (!alive) return;
+        setDetail(d);
+        setRefreshFailed(false);
       },
       () => {
         // Best-effort: the cards render their placeholder rows without it.
+        if (alive) setRefreshFailed(true);
       },
     );
     return () => {
       alive = false;
     };
-  }, [sandbox.name, stateKind, rev, actionRev]);
+  }, [sandbox.name, stateKind, rev, actionRev, tick]);
+
+  useEffect(() => {
+    const bump = () => setTick((t) => t + 1);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") bump();
+    };
+    const id = setInterval(bump, INSPECT_REFRESH_MS);
+    window.addEventListener("focus", bump);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", bump);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   return (
     // `overflow-auto`: the tab body is a fixed-height flex child, and four
@@ -72,6 +102,7 @@ export function OverviewTab({
         detail={detail && detail.name === sandbox.name ? detail : null}
         stats={stats}
         stale={error !== null}
+        lockdownUnknown={refreshFailed}
         onChanged={() => setRev((r) => r + 1)}
       />
       <ResourcesCard stats={stats} />

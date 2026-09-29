@@ -38,6 +38,7 @@ export function SandboxCard({
   detail,
   stats,
   stale = false,
+  lockdownUnknown = false,
   onChanged,
 }: Readonly<{
   name: string;
@@ -48,6 +49,9 @@ export function SandboxCard({
    *  live-implying reading (uptime, container state, docker engine) degrades
    *  to its unknown form: a stale byte must never keep claiming health. */
   stale?: boolean;
+  /** The last `inspect` refresh failed: the lock-down posture is withheld as
+   *  unknown (other rows keep their last values). */
+  lockdownUnknown?: boolean;
   /** A lock-down/unlock landed; the parent should re-fetch `detail`. */
   onChanged?: () => void;
 }>) {
@@ -70,7 +74,13 @@ export function SandboxCard({
       <Row label="confinement">{detail === null ? "…" : (detail.confinement ?? "unknown")}</Row>
 
       {detail?.lockdown && (
-        <LockdownRow key={name} name={name} lockdown={detail.lockdown} onChanged={onChanged ?? (() => {})} />
+        <LockdownRow
+          key={name}
+          name={name}
+          lockdown={detail.lockdown}
+          unknown={lockdownUnknown}
+          onChanged={onChanged ?? (() => {})}
+        />
       )}
 
       <Row label="firewall">
