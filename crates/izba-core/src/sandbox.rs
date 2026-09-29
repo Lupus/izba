@@ -316,19 +316,43 @@ fn host_is_windows() -> bool {
 /// VMM drive every sandbox. Fail closed with an actionable error. A workspace
 /// merely INSIDE the data root that does not contain the daemon dir is not
 /// refused by this rule.
-fn check_workspace_spares_control_socket(paths: &Paths, workspace: &Path) -> anyhow::Result<()> {
+fn check_workspace_spares_control_socket(
+    paths: &Paths,
+    name: &str,
+    workspace: &Path,
+) -> anyhow::Result<()> {
     let daemon = resolve_for_compare(&paths.daemon_dir());
     let ws = resolve_for_compare(workspace);
     if path_is_ancestor_or_equal(&ws, &daemon, cfg!(windows)) {
         bail!(
-            "workspace {} contains izba's control-socket dir {}; a confined Windows start \
-             Low-labels the whole workspace tree, which would include the izbad control socket \
-             and let the sandbox's VMM drive every sandbox (F-09). Choose a narrower workspace \
-             directory (a project dir that does not contain {}).",
+            "workspace {} equals or contains izba's control-socket dir {}; a confined Windows \
+             start Low-labels the whole workspace tree, which would include the izbad control \
+             socket and let the sandbox's VMM drive every sandbox (F-09). The workspace is fixed \
+             at create time: remove this sandbox with `izba rm {name}` and recreate it from a \
+             project directory that does not contain {}.",
             workspace.display(),
             paths.daemon_dir().display(),
             paths.daemon_dir().display(),
         );
+    }
+    Ok(())
+}
+
+/// Apply [`check_workspace_spares_control_socket`] iff this launch Low-labels
+/// the workspace. `locked_early` is the lock-down fact read at the top of
+/// `start`; `spec_locked` is whether the built spec actually carries lock-down
+/// credentials. Either one makes the launch take `spawn_locked_vmm`.
+fn guard_workspace_label(
+    paths: &Paths,
+    name: &str,
+    workspace: &Path,
+    windows: bool,
+    allow_unconfined: bool,
+    locked_early: bool,
+    spec_locked: bool,
+) -> anyhow::Result<()> {
+    if workspace_label_guard_applies(windows, allow_unconfined, locked_early || spec_locked) {
+        check_workspace_spares_control_socket(paths, name, workspace)?;
     }
     Ok(())
 }
@@ -1081,9 +1105,15 @@ pub fn start_with_timeouts(
     // a workspace that contains `<data>/daemon` would hand the VMM the izbad
     // control socket. Gated to exactly the launches that Low-label.
     let locked_down = crate::jail_account::orchestrate::lockdown_state(paths, name).is_locked();
-    if workspace_label_guard_applies(host_is_windows(), allow_unconfined, locked_down) {
-        check_workspace_spares_control_socket(paths, &config.workspace)?;
-    }
+    guard_workspace_label(
+        paths,
+        name,
+        &config.workspace,
+        host_is_windows(),
+        allow_unconfined,
+        locked_down,
+        false,
+    )?;
 
     // The kernel was chosen by the caller from ONE read of config.json, and the
     // line above is a SECOND read: a grant (or revoke) landing between the two
@@ -1282,6 +1312,20 @@ pub fn start_with_timeouts(
     // fails the whole start — there is no silent fallback to mis-record.
     let lockdown_account = booted_lockdown_account(&spec);
 
+    // Re-assert right before launch: `izba lockdown` does NOT take
+    // `lock_sandbox`, so a lock-down landing after the early read above (but
+    // before `compute_launch_lockdown`) would otherwise let an
+    // `--allow-unconfined` start skip the check and then Low-label via
+    // `spawn_locked_vmm`. The early check stays for fail-fast.
+    guard_workspace_label(
+        paths,
+        name,
+        &config.workspace,
+        host_is_windows(),
+        allow_unconfined,
+        locked_down,
+        spec.lockdown.is_some(),
+    )?;
     let mut handle = driver.launch(&spec)?;
 
     // Everything after launch must kill the handle on failure, or the VMM
@@ -1561,7 +1605,10 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
 /// A complete no-op on non-Windows and for unconfined/legacy sandboxes
 /// (`is_confined()` gate), and best-effort + idempotent — re-asserting Medium is
 /// safe to repeat, and a missed restore only leaves a benign Low label (Medium
-/// tools write *down* to it).
+/// tools write *down* to it). (Caveat: a sandbox launched by a pre-#281 build
+/// with a workspace containing `<data>/daemon`, whose restore was missed, could
+/// have left `<data>/daemon` Low-labelled; new launches can no longer produce
+/// that.)
 ///
 /// (The scratch dir + the disks inside it — rw.img, anon volumes — are wiped on
 /// `rm` and re-labelled on the next start, so they need no separate restore; only
@@ -5299,7 +5346,7 @@ mod tests {
     fn workspace_guard_refuses_daemon_dir_root_and_ancestors() {
         let paths = Paths::with_root(PathBuf::from("/data/izba"));
         for ws in ["/data/izba/daemon", "/data/izba", "/data", "/"] {
-            let err = check_workspace_spares_control_socket(&paths, Path::new(ws))
+            let err = check_workspace_spares_control_socket(&paths, "web", Path::new(ws))
                 .expect_err(ws)
                 .to_string();
             assert!(err.contains("F-09") && err.contains("/data/izba"), "{err}");
@@ -5317,7 +5364,7 @@ mod tests {
             "/data/izba/daemon/sub",
             "/home/me/proj",
         ] {
-            check_workspace_spares_control_socket(&paths, Path::new(ws)).expect(ws);
+            check_workspace_spares_control_socket(&paths, "web", Path::new(ws)).expect(ws);
         }
     }
 
@@ -5353,6 +5400,25 @@ mod tests {
         }
     }
 
+    /// The launch-time re-assert bites on its own: the early fact says
+    /// "unlocked" but the built spec carries lock-down credentials.
+    #[test]
+    fn late_guard_refuses_when_spec_is_locked_though_early_read_was_not() {
+        let paths = Paths::with_root(PathBuf::from("/data/izba"));
+        let ws = Path::new("/data");
+        let err = guard_workspace_label(&paths, "web", ws, true, true, false, true)
+            .expect_err("locked spec must refuse")
+            .to_string();
+        assert!(
+            err.contains("izba rm web") && err.contains("equals or contains"),
+            "{err}"
+        );
+        guard_workspace_label(&paths, "web", ws, true, true, false, false)
+            .expect("unlocked allow_unconfined is not labelled");
+        guard_workspace_label(&paths, "web", ws, false, true, true, true)
+            .expect("non-windows never labels");
+    }
+
     fn start_with_workspace_containing_root(
         allow_unconfined: bool,
         locked: bool,
@@ -5362,9 +5428,16 @@ mod tests {
         create(&paths, "web", &opts(dir.path())).unwrap();
         if locked {
             // Same on-disk shape `orchestrate::lockdown` persists.
-            std::fs::write(
-                paths.sandbox_dir("web").join("lockdown.json"),
-                r#"{"state":{"account":"izba-spk-web","sid":"S-1-5-21-1-2-3-1001","net_blocked":true}}"#,
+            use crate::jail_account::{LockdownFile, LockedInfo, LOCKDOWN_FILE};
+            save_json(
+                &paths.sandbox_dir("web").join(LOCKDOWN_FILE),
+                &LockdownFile {
+                    state: Some(LockedInfo {
+                        account: "izba-spk-web".into(),
+                        sid: "S-1-5-21-1-2-3-1001".into(),
+                        net_blocked: true,
+                    }),
+                },
             )
             .unwrap();
         }
