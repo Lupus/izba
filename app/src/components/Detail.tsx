@@ -48,6 +48,10 @@ export function Detail({ sandbox, onChanged }: Props) {
   const [pending, setPending] = useState<Pending>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
+  // Bumped after every successful action so the Overview re-fetches `inspect`
+  // even when the list poller never observes a state-kind change (restart is
+  // one blocking stop+start: running -> running).
+  const [actionRev, setActionRev] = useState(0);
   const busy = busyAction !== null;
 
   // Reset to Overview whenever the selected sandbox changes.
@@ -69,6 +73,7 @@ export function Detail({ sandbox, onChanged }: Props) {
     setError(null);
     try {
       await fn();
+      setActionRev((r) => r + 1);
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -178,7 +183,7 @@ export function Detail({ sandbox, onChanged }: Props) {
       </div>
 
       <div className="mt-4 flex min-h-0 flex-1 flex-col">
-        {tab === "overview" && <OverviewTab sandbox={sandbox} />}
+        {tab === "overview" && <OverviewTab sandbox={sandbox} actionRev={actionRev} />}
 
         {tab === "ports" && <PortsTab sandbox={sandbox} />}
 

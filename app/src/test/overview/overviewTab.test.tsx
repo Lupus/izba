@@ -1,15 +1,16 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { SandboxView } from "../../lib/types";
 import { detailFixture, runningStats } from "./fixtures";
 
-const { stats, inspect, policyShow } = vi.hoisted(() => ({
+const { stats, inspect, policyShow, lockdownApi } = vi.hoisted(() => ({
+  lockdownApi: vi.fn(),
   stats: vi.fn(),
   inspect: vi.fn(),
   policyShow: vi.fn(),
 }));
 
-vi.mock("../../lib/ipc", () => ({ api: { stats, inspect, policyShow } }));
+vi.mock("../../lib/ipc", () => ({ api: { stats, inspect, policyShow, lockdown: lockdownApi } }));
 
 import { OverviewTab } from "../../components/overview/OverviewTab";
 
@@ -46,6 +47,37 @@ describe("OverviewTab", () => {
     const { rerender } = render(<OverviewTab sandbox={sandbox} />);
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
     rerender(<OverviewTab sandbox={{ ...sandbox, state: { kind: "stopped" } }} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
+  });
+
+  it("re-fetches inspect when actionRev bumps with the same name and state", async () => {
+    stats.mockResolvedValue(runningStats());
+    inspect.mockResolvedValue(detailFixture());
+    const { rerender } = render(<OverviewTab sandbox={sandbox} actionRev={0} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
+    rerender(<OverviewTab sandbox={sandbox} actionRev={1} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not show the previous sandbox's detail while the new inspect is pending", async () => {
+    stats.mockResolvedValue(runningStats());
+    const lockdown = { locked: false, account: null, net_blocked: false, restart_required: false, booted_as_account: false };
+    inspect.mockResolvedValueOnce(detailFixture({ name: "web", lockdown }));
+    const { rerender } = render(<OverviewTab sandbox={sandbox} />);
+    expect(await screen.findByText("lock-down")).toBeInTheDocument();
+    inspect.mockReturnValueOnce(new Promise(() => {}));
+    rerender(<OverviewTab sandbox={{ ...sandbox, name: "api" }} />);
+    expect(screen.queryByText("lock-down")).toBeNull();
+  });
+
+  it("re-fetches inspect after a lock-down lands (onChanged path)", async () => {
+    stats.mockResolvedValue(runningStats());
+    const lockdown = { locked: false, account: null, net_blocked: false, restart_required: false, booted_as_account: false };
+    inspect.mockResolvedValue(detailFixture({ name: "web", lockdown }));
+    lockdownApi.mockResolvedValue("locked");
+    render(<OverviewTab sandbox={sandbox} />);
+    fireEvent.click(await screen.findByRole("button", { name: /lock down/i }));
+    await waitFor(() => expect(lockdownApi).toHaveBeenCalledWith("web"));
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
   });
 

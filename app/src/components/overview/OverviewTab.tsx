@@ -11,7 +11,15 @@ import { ProcessesCard } from "./ProcessesCard";
  *  non-polling `inspect` for the facts that can't change while the sandbox
  *  runs — workspace, confinement, docker mode). Each card takes its data
  *  slice as props, so every degraded state is a plain-props case. */
-export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
+export function OverviewTab({
+  sandbox,
+  actionRev = 0,
+}: Readonly<{
+  sandbox: SandboxView;
+  /** Bumped by the parent after a successful lifecycle action: forces an
+   *  inspect re-fetch even if the state kind never visibly changed. */
+  actionRev?: number;
+}>) {
   const { stats, error } = useStats(sandbox.name);
   const [detail, setDetail] = useState<SandboxDetail | null>(null);
 
@@ -38,7 +46,7 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
     return () => {
       alive = false;
     };
-  }, [sandbox.name, stateKind, rev]);
+  }, [sandbox.name, stateKind, rev, actionRev]);
 
   return (
     // `overflow-auto`: the tab body is a fixed-height flex child, and four
@@ -60,7 +68,7 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
       <SandboxCard
         name={sandbox.name}
         state={sandbox.state}
-        detail={detail}
+        detail={detail && detail.name === sandbox.name ? detail : null}
         stats={stats}
         stale={error !== null}
         onChanged={() => setRev((r) => r + 1)}
