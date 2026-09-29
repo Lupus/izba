@@ -1608,7 +1608,8 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
 /// tools write *down* to it). (Caveat: a sandbox launched by a pre-#281 build
 /// with a workspace containing `<data>/daemon`, whose restore was missed, could
 /// have left `<data>/daemon` Low-labelled; new launches can no longer produce
-/// that.)
+/// that, and izbad re-stamps that dir Medium before every bind —
+/// `daemon::transport::bind_socket`.)
 ///
 /// (The scratch dir + the disks inside it — rw.img, anon volumes — are wiped on
 /// `rm` and re-labelled on the next start, so they need no separate restore; only
