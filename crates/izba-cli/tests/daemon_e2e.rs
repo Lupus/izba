@@ -1829,7 +1829,7 @@ fn disk_digests(data: &Path, name: &str) -> std::collections::BTreeMap<String, S
         |p: &Path| content_digest(p).unwrap_or_else(|e| panic!("digest {}: {e:#}", p.display()));
     out.insert("rw.img".to_string(), digest(&dir.join("rw.img")));
     if let Ok(entries) = std::fs::read_dir(dir.join("volumes")) {
-        for e in entries.filter_map(|e| e.ok()) {
+        for e in entries.filter_map(Result::ok) {
             let f = e.file_name().to_string_lossy().into_owned();
             if f.ends_with(".img") {
                 out.insert(format!("anon/{f}"), digest(&e.path()));

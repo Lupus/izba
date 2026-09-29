@@ -188,7 +188,7 @@ impl Src {
             &self.paths,
             &no_conn,
             &crate::bundle::save::SaveOpts {
-                names: names.iter().map(|n| n.to_string()).collect(),
+                names: names.iter().map(ToString::to_string).collect(),
                 out: out.to_path_buf(),
                 with_workspace,
             },
