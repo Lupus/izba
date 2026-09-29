@@ -38,16 +38,20 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "fetching $ARTIFACT from microsoft/openvmm run $RUN_ID (commit ${COMMIT:0:9})..."
-if ! gh run download "$RUN_ID" -R microsoft/openvmm -n "$ARTIFACT" -D "$TMP"; then
+# Each source downloads into its OWN dir and only that dir is searched, so a
+# partial file left by a failed upstream download can never shadow the mirror.
+SRC="$TMP/upstream"
+if ! gh run download "$RUN_ID" -R microsoft/openvmm -n "$ARTIFACT" -D "$SRC"; then
     # Never fall back while recording a first pin: the mirror is only a
     # second source for an ALREADY-vetted sha256.
     [[ -n "$SHA256" ]] || { echo "error: artifact download failed and no pinned sha256 to verify a mirror against" >&2; exit 1; }
     echo "upstream artifact unavailable (likely EXPIRED); falling back to the Lupus/izba $MIRROR_TAG mirror (same sha256 pin)..."
-    gh release download "$MIRROR_TAG" -R Lupus/izba -p openvmm.exe -D "$TMP" \
+    SRC="$TMP/mirror"
+    gh release download "$MIRROR_TAG" -R Lupus/izba -p openvmm.exe -D "$SRC" \
         || { echo "error: artifact download failed — likely EXPIRED — and the $MIRROR_TAG mirror is unavailable; see re-pin procedure in this script's header" >&2; exit 1; }
 fi
 
-EXE="$(find "$TMP" -name openvmm.exe | head -1)"
+EXE="$(find "$SRC" -name openvmm.exe | head -1)"
 [[ -n "$EXE" ]] || { echo "error: openvmm.exe not found in artifact" >&2; exit 1; }
 
 GOT="$(sha256sum "$EXE" | cut -d' ' -f1)"
