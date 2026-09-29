@@ -196,8 +196,10 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Control port 1025 also serves `Request::Stats` (`izba-init`'s process/mem/
   mount/docker-engine snapshot — guest-reported, daemon-sanitized before it
   reaches the CLI/GUI; ~250 ms in-call CPU sampling via two `/proc` reads
-  makes the RPC stateless). `DAEMON_PROTO_VERSION = 6` is this: v6 added
-  `DaemonRequest::VncSet`.
+  makes the RPC stateless). `DAEMON_PROTO_VERSION = 7` is this: v6 added
+  `DaemonRequest::VncSet`; v7 added the Inspect lock-down facts
+  (`lockdown_account`/`lockdown_restart_required`), whose absence an older
+  daemon would otherwise misreport as "applied".
 - **Disk order:** `sandbox::start()` builds
   `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …, kasmvnc.erofs
   (RO, VNC sandboxes only)]`

@@ -32,8 +32,11 @@ use izba_proto::{Request, Response};
 /// clean error instead of a dropped connection. v3 covers the `Usb*`
 /// control-plane requests; v4 covers `UsbAttach`/`UsbDetach` and the guest
 /// `Request` variants they forward. v5 covers `DaemonRequest::Stats` /
-/// `DaemonResponse::Stats`. v6 added `DaemonRequest::VncSet`.)
-pub const DAEMON_PROTO_VERSION: u32 = 6;
+/// `DaemonResponse::Stats`. v6 added `DaemonRequest::VncSet`. v7 added the
+/// Inspect lock-down facts (`lockdown_account` / `lockdown_restart_required`):
+/// an older same-proto daemon would read them as `None`/`false` and the app
+/// would misreport "applied" for a posture that needs a restart.)
+pub const DAEMON_PROTO_VERSION: u32 = 7;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,12 +317,14 @@ pub struct SandboxDetail {
     pub vnc_restart_required: bool,
     /// The lock-down account the live VMM was launched as (from
     /// `RunState.lockdown_account`); `None` when stopped or unconfined.
-    /// Additive + serde(default) → no DAEMON_PROTO_VERSION bump.
+    /// v7: bumped `DAEMON_PROTO_VERSION` so an older daemon (which would read
+    /// this as `None`) is respawned rather than misreported as unconfined.
     #[serde(default)]
     pub lockdown_account: Option<String>,
     /// Running with a lock-down posture other than the configured one
-    /// (`jail_account::lockdown_restart_required`). Additive + serde(default)
-    /// → no DAEMON_PROTO_VERSION bump; an older daemon reads as `false`.
+    /// (`jail_account::lockdown_restart_required`). v7: bumped
+    /// `DAEMON_PROTO_VERSION` because an older daemon reads as `false`, which
+    /// would hide a needed restart.
     #[serde(default)]
     pub lockdown_restart_required: bool,
 }
@@ -1114,7 +1119,8 @@ mod tests {
         // A same-version daemon predating these variants would fail the frame
         // read instead of self-healing via a restart, so the COMPATIBILITY gate
         // must move with them.
-        assert_eq!(DAEMON_PROTO_VERSION, 6);
+        // v7: the Inspect lock-down facts (an older daemon would misreport them).
+        assert_eq!(DAEMON_PROTO_VERSION, 7);
     }
 
     #[test]

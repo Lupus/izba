@@ -504,14 +504,7 @@ impl LockdownView {
             locked: info.is_some(),
             account: info.map(|i| i.account.clone()),
             net_blocked: info.is_some_and(|i| i.net_blocked),
-            // A current daemon never reports a locked, live sandbox that booted
-            // without the account without also setting the flag (the predicates
-            // agree), so the extra clause only fires against a pre-field daemon
-            // (same DAEMON_PROTO_VERSION) that answers `false`.
-            restart_required: detail.lockdown_restart_required
-                || (info.is_some()
-                    && detail.status != "stopped"
-                    && detail.lockdown_account.is_none()),
+            restart_required: detail.lockdown_restart_required,
             booted_as_account: detail.lockdown_account.is_some(),
         }
     }
@@ -1103,39 +1096,46 @@ mod tests {
         assert!(v.vnc_restart_required);
     }
 
-    /// A pre-field daemon answers `lockdown_restart_required=false` for a
-    /// locked sandbox running unconfined; the view must still flag it.
+    /// The view copies the daemon's recorded lock-down facts verbatim (an older
+    /// daemon is respawned by the v7 `DAEMON_PROTO_VERSION` gate, so there is no
+    /// app-side guess about a missing field).
     #[test]
-    fn lockdown_view_flags_restart_against_a_pre_field_daemon() {
+    fn lockdown_view_copies_the_daemons_facts_verbatim() {
         let locked =
             izba_core::jail_account::LockdownState::Locked(izba_core::jail_account::LockedInfo {
                 account: "izba-sb-web".into(),
                 sid: "S-1-5-21-1".into(),
                 net_blocked: true,
             });
-        let detail = |status: &str| izba_core::daemon::proto::SandboxDetail {
-            name: "web".into(),
-            image_ref: "ubuntu:24.04".into(),
-            image_digest: "sha256:x".into(),
-            cpus: 2,
-            mem_mb: 4096,
-            workspace: "/ws".into(),
-            status: status.into(),
-            ports: vec![],
-            volumes: vec![],
-            confinement: None,
-            container: None,
-            user_fallback: None,
-            docker: false,
-            vnc: false,
-            vnc_running: false,
-            vnc_url: None,
-            vnc_restart_required: false,
-            lockdown_account: None,
-            lockdown_restart_required: false,
+        let detail = |status: &str, account: Option<&str>, restart: bool| {
+            izba_core::daemon::proto::SandboxDetail {
+                name: "web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                image_digest: "sha256:x".into(),
+                cpus: 2,
+                mem_mb: 4096,
+                workspace: "/ws".into(),
+                status: status.into(),
+                ports: vec![],
+                volumes: vec![],
+                confinement: None,
+                container: None,
+                user_fallback: None,
+                docker: false,
+                vnc: false,
+                vnc_running: false,
+                vnc_url: None,
+                vnc_restart_required: false,
+                lockdown_account: account.map(String::from),
+                lockdown_restart_required: restart,
+            }
         };
-        assert!(LockdownView::new(&locked, &detail("running")).restart_required);
-        assert!(!LockdownView::new(&locked, &detail("stopped")).restart_required);
+        let v = LockdownView::new(&locked, &detail("running", None, false));
+        assert!(!v.restart_required, "no local re-derivation");
+        assert!(!v.booted_as_account);
+        let v = LockdownView::new(&locked, &detail("running", Some("izba-sb-web"), true));
+        assert!(v.restart_required);
+        assert!(v.booted_as_account);
     }
 
     /// A Windows workspace recorded canonicalized (`\\?\C:\...`) surfaces to
