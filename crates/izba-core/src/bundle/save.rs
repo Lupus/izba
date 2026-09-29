@@ -19,6 +19,7 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::fsutil::ExactLen;
 use super::manifest::{
     BlobInfo, Checksums, Manifest, SandboxEntry, SourceOs, CHECKSUMS_PATH, MANIFEST_PATH,
 };
@@ -426,37 +427,17 @@ fn append_bytes<W: Write>(
         .with_context(|| format!("archiving {path}"))
 }
 
-/// `Read` adapter feeding exactly `remaining` bytes through sha256: never
-/// reads past the length declared in the tar header (a file growing mid-read,
-/// e.g. the daemon appending to egress-audit.jsonl, is cut at the stat length)
-/// and errors on an early EOF (a shrinking file) instead of letting the tar
-/// stream desync from its header.
+/// `Read` adapter feeding exactly the declared length (see [`ExactLen`])
+/// through sha256.
 struct HashingReader<R> {
-    inner: R,
-    remaining: u64,
+    inner: ExactLen<R>,
     h: Sha256,
 }
 
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let cap = buf
-            .len()
-            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-        let n = self.inner.read(&mut buf[..cap])?;
-        if n == 0 && cap > 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "file shrank while archiving ({} bytes short)",
-                    self.remaining
-                ),
-            ));
-        }
+        let n = self.inner.read(buf)?;
         self.h.update(&buf[..n]);
-        self.remaining -= n as u64;
         Ok(n)
     }
 }
@@ -484,8 +465,7 @@ fn append_reader_hashed<W: Write, R: Read>(
     sums: &mut Checksums,
 ) -> anyhow::Result<()> {
     let mut r = HashingReader {
-        inner: reader,
-        remaining: len,
+        inner: ExactLen::new(reader, len),
         h: Sha256::new(),
     };
     tar.append_data(&mut file_header(len), path, &mut r)

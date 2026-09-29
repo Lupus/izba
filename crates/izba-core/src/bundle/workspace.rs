@@ -3,6 +3,7 @@
 //! writing through a symlink, and translate the source workspace path for a
 //! host on another OS.
 
+use crate::bundle::fsutil::ExactLen;
 use crate::bundle::manifest::SourceOs;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
@@ -106,12 +107,22 @@ pub fn append_workspace<W: Write>(
                 walk(tar, &path, &rel, prefix, exec_bits, stats)?;
             } else if ft.is_file() {
                 h.set_entry_type(tar::EntryType::Regular);
-                h.set_size(meta.len());
-                let f =
-                    fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-                tar.append_data(&mut h, &name, f)
+                // The length comes from the OPEN handle, never the earlier
+                // stat: the file may have been replaced in between.
+                let f = open_no_follow(&path)?;
+                let open_meta = f
+                    .metadata()
+                    .with_context(|| format!("stat {}", path.display()))?;
+                if !open_meta.is_file() {
+                    bail!(
+                        "{} changed while being archived; retry the save",
+                        rel.display()
+                    );
+                }
+                let len = open_meta.len();
+                append_regular(tar, &mut h, &name, f, len)
                     .with_context(|| format!("archiving {}", rel.display()))?;
-                stats.bytes += meta.len();
+                stats.bytes += len;
             } else {
                 stats.skipped.push(rel);
             }
@@ -128,6 +139,35 @@ pub fn append_workspace<W: Write>(
         &mut stats,
     )?;
     Ok(stats)
+}
+
+/// Opens a workspace file for archiving without following a symlink swapped
+/// in since the directory walk stat'ed it (Unix; Windows opens normally).
+fn open_no_follow(path: &Path) -> Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)
+        .with_context(|| format!("opening {}", path.display()))
+}
+
+/// Appends a regular-file entry of exactly `len` bytes (header size `len`):
+/// a shorter reader fails the save, a longer one is cut at `len` (see
+/// [`ExactLen`]), so the tar stream can never desync from its headers.
+fn append_regular<W: Write, R: Read>(
+    tar: &mut tar::Builder<W>,
+    h: &mut tar::Header,
+    name: &str,
+    reader: R,
+    len: u64,
+) -> Result<()> {
+    h.set_size(len);
+    tar.append_data(h, name, ExactLen::new(reader, len))?;
+    Ok(())
 }
 
 /// Sum of regular-file sizes under `root` (symlinks not followed).
@@ -612,6 +652,55 @@ mod tests {
         let st = append_workspace(&mut b, t.path(), "w", &Default::default()).unwrap();
         assert_eq!(st.bytes, 3);
         assert_eq!(st.skipped, vec![PathBuf::from("fifo")]);
+    }
+
+    fn gnu_file_header() -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h
+    }
+
+    #[test]
+    fn a_workspace_file_shorter_than_its_declared_len_fails() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let e =
+            append_regular(&mut tar, &mut gnu_file_header(), "w/f", &b"abc"[..], 5).unwrap_err();
+        assert!(format!("{e:#}").contains("shrank"), "{e:#}");
+    }
+
+    #[test]
+    fn a_workspace_file_longer_than_its_declared_len_is_cut_and_the_stream_stays_in_sync() {
+        let mut tar = tar::Builder::new(Vec::new());
+        append_regular(
+            &mut tar,
+            &mut gnu_file_header(),
+            "w/f",
+            &b"hello, grown"[..],
+            5,
+        )
+        .unwrap();
+        append_regular(&mut tar, &mut gnu_file_header(), "w/g", &b"next"[..], 4).unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let mut ar = tar::Archive::new(&bytes[..]);
+        let got: Vec<(String, Vec<u8>)> = ar
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let p = e.path().unwrap().to_string_lossy().into_owned();
+                let mut b = Vec::new();
+                e.read_to_end(&mut b).unwrap();
+                (p, b)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("w/f".into(), b"hello".to_vec()),
+                ("w/g".into(), b"next".to_vec())
+            ]
+        );
     }
 
     #[test]

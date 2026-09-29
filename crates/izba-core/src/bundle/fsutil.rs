@@ -1,8 +1,53 @@
 //! Filesystem helpers for bundle save/load.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+
+/// `Read` adapter yielding exactly `remaining` bytes of `inner`, the length a
+/// tar header already declared: never reads past it (a file growing mid-read
+/// — the daemon appending to egress-audit.jsonl, an IDE rewriting a
+/// workspace file — is cut at that length) and errors on an early EOF (a
+/// shrinking file) instead of letting the tar stream desync from its header.
+/// A desynced stream would make the trailer unreachable and EVERY sandbox in
+/// the archive unloadable while the save reported success.
+pub(crate) struct ExactLen<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> ExactLen<R> {
+    pub(crate) fn new(inner: R, len: u64) -> Self {
+        Self {
+            inner,
+            remaining: len,
+        }
+    }
+}
+
+impl<R: Read> Read for ExactLen<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n == 0 && cap > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file shrank while archiving ({} bytes short)",
+                    self.remaining
+                ),
+            ));
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
 
 /// `p` made absolute, then walked up to its nearest ancestor that exists
 /// (itself if it does). Free space is a property of that ancestor's
