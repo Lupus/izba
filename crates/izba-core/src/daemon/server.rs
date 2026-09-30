@@ -2690,6 +2690,26 @@ mod tests {
     }
 
     #[test]
+    fn save_with_stop_leaves_an_already_stopped_sandbox_alone() {
+        let src = crate::bundle::testutil::Src::new();
+        let d = Arc::new(Daemon::new(src.paths.clone(), test_deps()));
+        let mut msgs = Vec::new();
+        let resp = dispatch(
+            &d,
+            DaemonRequest::Save {
+                names: vec!["a".into()],
+                all: false,
+                out: src.t.path().join("stopped.izba"),
+                with_workspace: false,
+                stop: true,
+            },
+            &mut |m| msgs.push(m),
+        );
+        assert!(matches!(resp, DaemonResponse::Saved(_)), "{resp:?}");
+        assert!(!msgs.iter().any(|m| m.contains("stopping")), "{msgs:?}");
+    }
+
+    #[test]
     fn save_running_without_stop_is_refused() {
         let src = crate::bundle::testutil::Src::new();
         crate::bundle::testutil::write_live_state(&src.paths, "a");
