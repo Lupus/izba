@@ -2384,6 +2384,28 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_naming_a_bundled_tree_root_is_refused() {
+        // Save never emits the bare tree root, only its contents, so a hostile
+        // archive naming `workspaces/a` is refused. (The trailing-slash spelling
+        // never gets this far: `validate_entry_path` rejects it first.)
+        let tgt = Tgt::new();
+        let o = opts_bundled(&tgt);
+        let mut entries = read_entries(&o.archive);
+        let ws = entries
+            .iter()
+            .position(|(n, _)| n.starts_with("workspaces/a/"))
+            .unwrap();
+        entries.insert(ws, ("workspaces/a".into(), Vec::new()));
+        write_entries(&o.archive, &entries);
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unexpected archive entry workspaces/a"), "{e}");
+        assert_eq!(tgt.snapshot(), before);
+    }
+
+    #[test]
     fn malformed_chunk_names_and_bounds_are_refused() {
         type Mutate = fn(&str) -> Option<String>;
         let cases: [(Mutate, &str); 3] = [
