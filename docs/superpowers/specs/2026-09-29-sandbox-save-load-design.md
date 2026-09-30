@@ -57,9 +57,12 @@ izba save <name…> | --all  -o <file.izba>  [--with-workspace] [--stop]
   `config.json` are one state).
 - Writes `<out>.<pid>.<seq>.partial`, created exclusively (O_EXCL, and
   O_NOFOLLOW + mode 0600 on Unix; a taken name is skipped, never followed or
-  truncated), and publishes it WITHOUT replacing anything (hard link; FAT
-  falls back to an exclusive claim of `<out>` + rename): a file appearing at
-  `<out>` meanwhile is kept and the save fails. Deletes the partial and
+  truncated), and publishes it WITHOUT replacing anything: a hard link, or,
+  where the filesystem has no hard links (FAT/exFAT), an atomic no-replace
+  rename (Linux `renameat2(RENAME_NOREPLACE)`, Windows `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING`). A file appearing at `<out>` meanwhile is kept
+  and the save fails; a destination filesystem supporting neither mechanism
+  makes the save fail with an error naming the output directory. Deletes the partial and
   releases all locks on any error or client disconnect.
 - Reports progress in bytes; ends with logical vs archive size and a one-line
   note that the archive may contain secrets from disks/workspace.
