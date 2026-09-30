@@ -102,6 +102,10 @@ pub fn load(paths: &Paths, opts: &LoadOpts, progress: Progress) -> anyhow::Resul
     )
 }
 
+// reason: thin environment reader; the workspace translation it feeds is
+// tested through the `LoadHooks::target_home` seam (tests never touch the
+// process environment, which other threads share).
+#[mutants::skip]
 fn home_dir() -> anyhow::Result<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var)
@@ -112,6 +116,10 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 
 /// A host port is busy when binding it fails right now (the probe listener
 /// is dropped at once). Only a warning is derived from it.
+// reason: a bare bind probe, and unit tests never bind listeners; the
+// warning derived from it is tested through the `LoadHooks::port_in_use`
+// seam (busy_host_ports_are_warned).
+#[mutants::skip]
 fn host_port_in_use(rule: &PortRule) -> bool {
     std::net::TcpListener::bind((rule.bind, rule.host_port)).is_err()
 }
@@ -151,7 +159,7 @@ enum DiskState {
     /// Being written into the stage. `next` = lowest offset the next chunk
     /// may start at (chunks are strictly ascending and non-overlapping).
     Open { file: File, len: u64, next: u64 },
-    /// Not needed here (reused volume / unselected sandbox): chunks drained.
+    /// Not needed here (reused volume / unselected sandbox): chunks skipped.
     Skip { len: u64 },
 }
 
@@ -1235,7 +1243,7 @@ struct Stager<'a> {
     known_disks: HashMap<String, (DiskKind, u64)>,
     /// image dir name -> digest.
     image_dirs: HashMap<String, String>,
-    /// What the selection uses; everything else is drained unstaged.
+    /// What the selection uses; everything else is skipped unstaged.
     need_images: BTreeSet<String>,
     need_volumes: BTreeSet<String>,
     disks: HashMap<String, DiskState>,
@@ -1333,8 +1341,10 @@ impl<'a> Stager<'a> {
             {
                 bail!("unexpected archive entry {p}");
             }
+            // An entry left unread is skipped by the tar reader when the next
+            // one is requested: not staging it is all it takes to drop it.
             if !self.selected.contains(src) {
-                return drain(e);
+                return Ok(());
             }
             let dst = self.stage.join(&p);
             let sha = stage_file(e, &dst)?;
@@ -1367,13 +1377,13 @@ impl<'a> Stager<'a> {
         if !self.need_images.contains(digest)
             || crate::image::ImageStore::new(self.paths).is_complete(digest)
         {
-            return drain(e); // unused here, or the target's copy is kept
+            return Ok(()); // unused here, or the target's copy is kept
         }
         let target = self.paths.image_dir(digest);
         // An incomplete target entry (#222: rootfs without config.json) keeps
         // its rootfs; only the metadata it lacks is taken from the archive.
         if target.exists() && (!IMAGE_META.contains(&file) || target.join(file).exists()) {
-            return drain(e);
+            return Ok(());
         }
         progress(format!("staging image {digest} ({file})"));
         let dst = self.stage.join(p);
@@ -1438,7 +1448,7 @@ impl<'a> Stager<'a> {
             bail!("chunk entry {p} exceeds the disk's declared length or chunk size (corrupt archive)");
         }
         match state {
-            DiskState::Skip { .. } => drain(e),
+            DiskState::Skip { .. } => Ok(()),
             DiskState::Open { file, next, .. } => {
                 if off < *next {
                     bail!("chunk entry {p} overlaps an earlier chunk (corrupt archive)");
@@ -1469,7 +1479,7 @@ impl<'a> Stager<'a> {
             bail!("unexpected archive entry {p}");
         }
         let Some(ws_stage) = self.ws_trees.get(src) else {
-            return drain(e);
+            return Ok(());
         };
         // A Windows host cannot recreate every name another OS can hold
         // (`a:b` would write an alternate data stream, `con` the console
@@ -1602,11 +1612,6 @@ fn read_bounded<R: Read>(e: &mut R, what: &str) -> anyhow::Result<Vec<u8>> {
         bail!("{what} is implausibly large (corrupt archive)");
     }
     Ok(v)
-}
-
-fn drain<R: Read>(e: &mut R) -> anyhow::Result<()> {
-    std::io::copy(e, &mut std::io::sink()).context("reading archive")?;
-    Ok(())
 }
 
 /// Copy an entry body to `dst`, returning its sha256.
@@ -2152,9 +2157,23 @@ mod tests {
         hooks.fail_at = Some(CommitStep::Volumes);
         load_with(&tgt.paths, &o, &mut |_| {}, &hooks).unwrap_err();
         assert_eq!(tgt.snapshot(), before);
-        // A successful one completes it without touching the rootfs.
-        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        // A successful one completes it without touching the rootfs, and
+        // stages only the metadata files the entry lacks.
+        let mut msgs = Vec::new();
+        let rep = load_with(&tgt.paths, &o, &mut |m| msgs.push(m), &tgt.hooks()).unwrap();
         assert_eq!(rep.sandboxes.len(), 1);
+        let staged: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.starts_with("staging image"))
+            .collect();
+        assert_eq!(
+            staged,
+            [
+                "staging image sha256:aa (config.json)",
+                "staging image sha256:aa (passwd)"
+            ],
+            "{msgs:?}"
+        );
         let img = tgt.paths.image_dir("sha256:aa");
         assert_eq!(
             std::fs::read(img.join("rootfs.erofs")).unwrap(),
@@ -2746,7 +2765,8 @@ mod tests {
             let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
                 .unwrap_err()
                 .to_string();
-            assert!(e.contains("workspace"), "{e}");
+            // Refused by the manifest preflight itself, not by a later step.
+            assert!(e.contains("takes its workspace from"), "{e}");
             assert!(!tgt.paths.sandbox_dir("b").exists());
         }
     }
@@ -2872,5 +2892,539 @@ mod tests {
             .to_string();
         assert!(e.contains("evil"), "{e}");
         assert_eq!(tgt.snapshot(), before);
+    }
+
+    // ---- direct tests of the preflight / commit helpers --------------------
+
+    use crate::bundle::manifest::{BlobInfo, SourceOs};
+    use crate::bundle::testutil::add_image;
+
+    fn blob(path: &str, allocated: u64) -> BlobInfo {
+        BlobInfo {
+            path: path.into(),
+            logical_len: allocated,
+            allocated,
+        }
+    }
+
+    /// Sandbox entry `name` on image `sha256:aa`, its `rw.img` allocating
+    /// 1000 bytes, from source workspace `/src/ws`.
+    fn entry(name: &str) -> SandboxEntry {
+        SandboxEntry {
+            name: name.into(),
+            image_digest: "sha256:aa".into(),
+            named_volumes: vec![],
+            disk_owner: (1000, 1000),
+            workspace_bundled: false,
+            workspace_from: None,
+            source_workspace: "/src/ws".into(),
+            source_home: None,
+            disks: vec![blob(&format!("sandboxes/{name}/rw.img"), 1000)],
+            workspace_bytes: 0,
+            locked: false,
+        }
+    }
+
+    fn manifest(sandboxes: Vec<SandboxEntry>) -> Manifest {
+        Manifest {
+            format: crate::bundle::FORMAT_VERSION,
+            izba_version: "t".into(),
+            source_os: SourceOs::current(),
+            created_unix_ms: 0,
+            tags: Default::default(),
+            images: vec!["sha256:aa".into()],
+            image_sizes: Default::default(),
+            named_volumes: vec![],
+            sandboxes,
+        }
+    }
+
+    fn sel(e: SandboxEntry, ws_target: PathBuf, ws_tree: Option<&str>) -> Sel {
+        Sel {
+            src: e.name.clone(),
+            name: e.name.clone(),
+            entry: e,
+            ws_target,
+            ws_tree: ws_tree.map(Into::into),
+            ws_stage: None,
+        }
+    }
+
+    fn no_staged() -> Staged {
+        Staged {
+            files: BTreeMap::new(),
+            disks: BTreeMap::new(),
+            sums: None,
+        }
+    }
+
+    #[test]
+    fn removing_an_absent_file_is_done_not_an_error() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("f");
+        remove_file_if_present(&p).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        remove_file_if_present(&p).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn valid_digest_is_alg_colon_hex_in_lowercase_alphanumerics() {
+        assert!(valid_digest("sha256:ab12"));
+        for bad in [
+            "",
+            "sha256",
+            "sha256:",
+            ":ab",
+            "SHA256:ab",
+            "sha256:AB",
+            "sha256:a-b",
+            "sha256:a/b",
+        ] {
+            assert!(!valid_digest(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_disks_accepts_only_rw_and_numbered_anonymous_volumes() {
+        let mut e = entry("a");
+        e.disks.push(blob("sandboxes/a/volumes/3.img", 1));
+        validate_disks(&e).unwrap();
+        for bad in [
+            "sandboxes/a/volumes/.img",
+            "sandboxes/a/volumes/x.img",
+            "sandboxes/a/volumes/1a.img",
+            "sandboxes/b/rw.img",
+        ] {
+            let mut e = entry("a");
+            e.disks.push(blob(bad, 1));
+            let err = validate_disks(&e).unwrap_err().to_string();
+            assert!(err.contains("unexpected disk"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn workspace_from_must_name_a_matching_bundled_owner() {
+        let owner = || SandboxEntry {
+            workspace_bundled: true,
+            ..entry("a")
+        };
+        let sharer = || SandboxEntry {
+            workspace_bundled: true,
+            workspace_from: Some("a".into()),
+            ..entry("b")
+        };
+        validate_workspace_from(&manifest(vec![owner(), sharer()]), &sharer()).unwrap();
+        type Case = fn(&mut SandboxEntry, &mut SandboxEntry);
+        let cases: [(&str, Case); 6] = [
+            ("sharer not bundled", |_, b| b.workspace_bundled = false),
+            ("owner not bundled", |a, _| a.workspace_bundled = false),
+            ("owner itself a sharer", |a, _| {
+                a.workspace_from = Some("c".into())
+            }),
+            ("different source", |a, _| {
+                a.source_workspace = "/other".into()
+            }),
+            ("self reference", |_, b| b.workspace_from = Some("b".into())),
+            ("no such owner", |_, b| {
+                b.workspace_from = Some("ghost".into())
+            }),
+        ];
+        for (what, edit) in cases {
+            let (mut a, mut b) = (owner(), sharer());
+            edit(&mut a, &mut b);
+            let e = validate_workspace_from(&manifest(vec![a, b.clone()]), &b)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("takes its workspace from"), "{what}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_may_only_reference_what_the_archive_carries() {
+        let mut m = manifest(vec![]);
+        m.named_volumes.push(blob("volumes/data.img", 1));
+        let mut e = entry("a");
+        e.named_volumes = vec!["data".into()];
+        validate_references(&m, &e).unwrap();
+        let mut ghost_vol = e.clone();
+        ghost_vol.named_volumes = vec!["ghost".into()];
+        let err = validate_references(&m, &ghost_vol).unwrap_err().to_string();
+        assert!(err.contains("named volume \"ghost\""), "{err}");
+        let mut ghost_img = e;
+        ghost_img.image_digest = "sha256:bb".into();
+        let err = validate_references(&m, &ghost_img).unwrap_err().to_string();
+        assert!(err.contains("sha256:bb"), "{err}");
+    }
+
+    #[test]
+    fn source_basename_is_one_plain_component() {
+        assert_eq!(source_basename("/a/b"), Some("b"));
+        assert_eq!(source_basename("/a/b/"), Some("b"));
+        assert_eq!(source_basename(r"C:\x\y"), Some("y"));
+        for bad in ["", "/", "/a/.", "/a/..", "/a/b:c", r"C:\"] {
+            assert_eq!(source_basename(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn two_bundled_trees_never_share_a_target_even_from_one_source() {
+        let t = PathBuf::from("/t/ws");
+        let sels = vec![sel(entry("a"), t.clone(), Some("a"))];
+        // Same source dir, but two separately archived trees: refused.
+        let e = check_target_collision(&sels, &entry("b"), "b", &t, Some("b"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("two sandboxes would use workspace"), "{e}");
+        // The same tree (a sharer) lands there together with its owner.
+        check_target_collision(&sels, &entry("b"), "b", &t, Some("a")).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_selection_loads_the_sandbox_once() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let o = LoadOpts {
+            select: vec!["a".into(), "a".into()],
+            ..opts(ar, Some(ws))
+        };
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        assert_eq!(rep.sandboxes.len(), 1);
+    }
+
+    /// `check_space` with `free_root` bytes free on the data root's
+    /// filesystem and `free_ws` everywhere else.
+    fn space(tgt: &Tgt, m: &Manifest, sels: &[Sel], free_root: u64, free_ws: u64) -> bool {
+        let root = nearest_existing(tgt.paths.root()).unwrap();
+        let free = move |d: &Path| -> anyhow::Result<u64> {
+            Ok(if d == root { free_root } else { free_ws })
+        };
+        let mut hooks = tgt.hooks();
+        hooks.free_bytes = &free;
+        match check_space(&tgt.paths, m, sels, &hooks) {
+            Ok(()) => true,
+            Err(e) => {
+                assert!(e.to_string().contains("not enough free space"), "{e}");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn space_check_asks_exactly_the_missing_data_plus_five_percent() {
+        let tgt = Tgt::new();
+        let mut a = entry("a");
+        a.named_volumes = vec!["data".into()];
+        let mut m = manifest(vec![a.clone()]);
+        // `other` is not used by the selection: never counted.
+        m.named_volumes = vec![
+            blob("volumes/data.img", 1000),
+            blob("volumes/other.img", 1 << 30),
+        ];
+        let sels = [sel(a, tgt.dir("ws/a"), None)];
+        // rw.img 1000 + volume 1000 = 2000, +5% = 2100.
+        assert!(space(&tgt, &m, &sels, 2100, 0));
+        assert!(!space(&tgt, &m, &sels, 2099, 0));
+        // A volume already on this host is reused, not counted: 1050.
+        crate::bundle::testutil::write_sparse_disk(&tgt.paths.volume_image("data"), 1);
+        assert!(space(&tgt, &m, &sels, 1050, 0));
+        assert!(!space(&tgt, &m, &sels, 1049, 0));
+    }
+
+    #[test]
+    fn space_check_counts_a_bundled_tree_once_on_its_target_filesystem() {
+        let tgt = Tgt::new();
+        let bundled = |name: &str| SandboxEntry {
+            workspace_bundled: true,
+            workspace_bytes: 500,
+            ..entry(name)
+        };
+        let m = manifest(vec![bundled("a"), bundled("b")]);
+        let one = [sel(bundled("a"), tgt.dir("ws/a"), Some("a"))];
+        // 500 +5% = 525 on the workspace's filesystem.
+        assert!(space(&tgt, &m, &one, u64::MAX, 525));
+        assert!(!space(&tgt, &m, &one, u64::MAX, 524));
+        // A second sharer of the same tree needs no more room.
+        let two = [
+            sel(bundled("a"), tgt.dir("ws/a"), Some("a")),
+            sel(bundled("b"), tgt.dir("ws/a"), Some("a")),
+        ];
+        assert!(space(&tgt, &m, &two, u64::MAX, 525));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_stage_dirs_of_dead_processes_are_swept() {
+        let t = tempfile::tempdir().unwrap();
+        // Above any pid_max: never a live process.
+        let dead = t.path().join(".load-4000000000-0");
+        let live = t.path().join(format!(".load-{}-0", std::process::id()));
+        let other = t.path().join("sandboxes");
+        let odd = t.path().join(".load-x-0");
+        for d in [&dead, &live, &other, &odd] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        sweep_stale_stages(t.path());
+        assert!(!dead.exists());
+        assert!(live.exists() && other.exists() && odd.exists());
+    }
+
+    #[test]
+    fn read_bounded_takes_up_to_the_cap_and_refuses_one_byte_more() {
+        let v = read_bounded(&mut std::io::repeat(b'x').take(MAX_JSON), "m").unwrap();
+        assert_eq!(v.len() as u64, MAX_JSON);
+        let e = read_bounded(&mut std::io::repeat(b'x').take(MAX_JSON + 1), "m")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("implausibly large"), "{e}");
+    }
+
+    #[test]
+    fn chunk_sizes_and_bounds_are_enforced() {
+        use crate::bundle::sparse::chunk_entry_name;
+        use crate::bundle::ZERO_BLOCK;
+        let tgt = Tgt::new();
+        let m = manifest(vec![]);
+        let mut st = Stager::new(&tgt.paths, &m, &[], tgt.dir("stage"));
+        st.disks
+            .insert("d".into(), DiskState::Skip { len: 2 * MAX_CHUNK });
+        let feed = |st: &mut Stager<'_>, off: u64, size: u64| {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(size);
+            h.set_mode(0o600);
+            h.set_cksum();
+            b.append_data(
+                &mut h,
+                chunk_entry_name("d", off),
+                std::io::repeat(0).take(size),
+            )
+            .unwrap();
+            let buf = b.into_inner().unwrap();
+            let mut ar = tar::Archive::new(&buf[..]);
+            let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+            let p = entry_name(&e).unwrap();
+            st.chunk(&mut e, &p).map_err(|e| e.to_string())
+        };
+        feed(&mut st, 0, MAX_CHUNK).unwrap();
+        feed(&mut st, MAX_CHUNK, MAX_CHUNK).unwrap(); // ends exactly at len
+        for (off, size) in [
+            (0, 0),
+            (0, MAX_CHUNK + 1),
+            (MAX_CHUNK + ZERO_BLOCK, MAX_CHUNK),
+        ] {
+            let e = feed(&mut st, off, size).unwrap_err();
+            assert!(e.contains("exceeds"), "{off}+{size}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_existing_image_config_is_never_replaced() {
+        let tgt = Tgt::new();
+        add_image(&tgt.paths, "sha256:aa");
+        let store = crate::image::ImageStore::new(&tgt.paths);
+        let before = std::fs::read(store.config_path("sha256:aa")).unwrap();
+        let from = tgt.dir("from");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("config.json"), b"{}").unwrap();
+        let mut undo = Vec::new();
+        complete_image(&store, "sha256:aa", &from, &mut undo).unwrap();
+        assert_eq!(
+            std::fs::read(store.config_path("sha256:aa")).unwrap(),
+            before
+        );
+        assert!(undo.is_empty());
+    }
+
+    #[test]
+    fn a_volume_install_tells_a_concurrent_create_from_an_io_failure() {
+        let tgt = Tgt::new();
+        let stage = tgt.dir("stage");
+        std::fs::create_dir_all(stage.join("volumes")).unwrap();
+        let v = BTreeSet::from(["v".to_string()]);
+        let mut undo = Vec::new();
+        // Nothing staged: the I/O error itself.
+        let e = format!(
+            "{:#}",
+            commit_volumes(&tgt.paths, &v, &stage, &mut undo).unwrap_err()
+        );
+        assert!(
+            e.contains("installing volume 'v'") && !e.contains("appeared"),
+            "{e}"
+        );
+        // A volume that appeared meanwhile: refused, never overwritten.
+        std::fs::write(stage.join("volumes/v.img"), b"new").unwrap();
+        std::fs::write(tgt.paths.volume_image("v"), b"old").unwrap();
+        let e = format!(
+            "{:#}",
+            commit_volumes(&tgt.paths, &v, &stage, &mut undo).unwrap_err()
+        );
+        assert!(e.contains("appeared on this host during the load"), "{e}");
+        assert_eq!(std::fs::read(tgt.paths.volume_image("v")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_sandbox_install_tells_a_name_clash_from_an_io_failure() {
+        let (_t, src) = crate::bundle::testutil::fixture();
+        let cfg = add_sandbox(&src, "a", "sha256:aa", &[]);
+        let tgt = Tgt::new();
+        let s = sel(entry("a"), tgt.dir("ws"), None);
+        let install = |cfg: SandboxConfig| {
+            let (mut undo, mut rep) = (Vec::new(), LoadReport::default());
+            install_sandbox(&tgt.paths, &s, cfg, &no_staged(), &mut undo, &mut rep)
+                .map_err(|e| format!("{e:#}"))
+        };
+        // A sandbox created meanwhile under the same name.
+        std::fs::create_dir(tgt.paths.sandbox_dir("a")).unwrap();
+        let e = install(cfg.clone()).unwrap_err();
+        assert!(e.contains("already exists here"), "{e}");
+        // No sandboxes dir at all: the I/O error itself.
+        std::fs::remove_dir_all(tgt.paths.sandboxes_dir()).unwrap();
+        let e = install(cfg).unwrap_err();
+        assert!(
+            e.contains("creating") && !e.contains("already exists"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn claiming_an_already_claimed_run_dir_leaves_nothing_to_undo() {
+        let tgt = Tgt::new();
+        crate::sandbox::claim_run_dir(&tgt.paths, "a").unwrap();
+        let mut undo = Vec::new();
+        claim_run_dir(&tgt.paths, "a", &mut undo).unwrap();
+        assert!(undo.is_empty());
+        assert!(tgt.paths.run_dir("a").join("owner").is_file());
+    }
+
+    #[test]
+    fn a_failed_tag_step_restores_the_tags_it_already_created() {
+        let src = Src::new();
+        add_sandbox(&src.paths, "b", "sha256:aa", &[]);
+        edit_src_config(&src, "a", |c| c.image_ref = "mine".into());
+        edit_src_config(&src, "b", |c| c.image_ref = "Not A Tag".into());
+        crate::image::tags::set_tag(&src.paths, "mine", "sha256:aa").unwrap();
+        let ar = src.save(&["a", "b"], false);
+        edit_manifest(&ar, |m| {
+            m.tags.insert("Not A Tag".into(), "sha256:aa".into());
+        });
+        let tgt = Tgt::new();
+        // A tag store already here (so the images dir is not this load's
+        // own, which a rollback would remove wholesale).
+        crate::image::tags::set_tag(&tgt.paths, "keep", "sha256:ff").unwrap();
+        for d in ["ws/a", "ws/b"] {
+            std::fs::create_dir_all(tgt.dir(d)).unwrap();
+        }
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("ws")),
+            ..opts(ar, None)
+        };
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap_err();
+        assert!(format!("{e:#}").contains("tag"), "{e:#}");
+        assert_eq!(tgt.snapshot(), before);
+        assert_eq!(
+            crate::image::tags::resolve_tag(&tgt.paths, "mine").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_config_disagreeing_with_the_manifest_is_refused() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        edit_manifest(&ar, |m| m.sandboxes[0].named_volumes.clear());
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("disagrees with the manifest"), "{e}");
+        assert_eq!(tgt.snapshot(), before);
+    }
+
+    #[test]
+    fn an_archive_missing_an_image_rootfs_is_refused() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        rewrite_archive(&ar, |n, b| (!n.ends_with("/rootfs.erofs")).then_some(b));
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("archive is missing image sha256:aa"), "{e}");
+        assert_eq!(tgt.snapshot(), before);
+    }
+
+    /// `archive` (no bundled workspace) with `extra` inserted before its trailer.
+    fn with_extra_entry(archive: &Path, extra: &str) {
+        let mut entries = read_entries(archive);
+        let trailer = entries.pop().unwrap();
+        entries.push((extra.into(), b"{}".to_vec()));
+        entries.push(trailer);
+        write_entries(archive, &entries);
+    }
+
+    #[test]
+    fn stray_sandbox_and_workspace_entries_are_refused() {
+        for extra in [
+            "sandboxes/ghost/config.json",
+            "sandboxes/a/evil",
+            // "a" was saved without its workspace.
+            "workspaces/a/x",
+        ] {
+            let src = Src::new();
+            let ar = src.save(&["a"], false);
+            with_extra_entry(&ar, extra);
+            let tgt = Tgt::new();
+            let ws = tgt.dir("ws");
+            std::fs::create_dir_all(&ws).unwrap();
+            let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("unexpected archive entry {extra}")),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docker_sandbox_loads() {
+        let src = Src::new();
+        edit_src_config(&src, "a", |c| c.docker = true);
+        let ar = src.save(&["a"], false);
+        let tgt = Tgt::new();
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks()).unwrap();
+        let cfg: SandboxConfig = load_json(&tgt.paths.sandbox_dir("a").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.docker);
+    }
+
+    #[test]
+    fn a_volume_guest_path_the_cmdline_cannot_carry_is_refused() {
+        for bad in ["scratch", "/a,b"] {
+            let src = Src::new();
+            edit_src_config(&src, "a", |c| c.volumes[1].guest_path = bad.into());
+            let ar = src.save(&["a"], false);
+            let tgt = Tgt::new();
+            let ws = tgt.dir("ws");
+            std::fs::create_dir_all(&ws).unwrap();
+            let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("invalid volume guest path"), "{bad}: {e}");
+        }
     }
 }
