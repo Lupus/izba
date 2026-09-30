@@ -16,67 +16,87 @@ pub struct Chunk {
     pub data: Vec<u8>,
 }
 
-/// Possibly-non-hole regions of `f` as `(offset, len)`, ascending. Any
-/// enumeration failure falls back to one full extent (always correct, just
-/// slower — zero elision still keeps the archive small).
+/// Possibly-non-hole regions of `f` as `(offset, len)`, ascending, within
+/// `0..len`. Any enumeration failure falls back to one full extent (always
+/// correct, just slower — zero elision still keeps the archive small).
 pub fn data_extents(f: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    Ok(os_extents(f, len).unwrap_or_else(|_| vec![(0, len)]))
+    Ok(os_extents(f, len).map_or_else(|_| vec![(0, len)], |raw| clip_extents(raw, len)))
 }
 
+/// Ascending `(offset, len)` regions cut to `0..len`: the OS reports the
+/// file as it is NOW, which may have grown since `len` was measured.
+fn clip_extents(raw: Vec<(u64, u64)>, len: u64) -> Vec<(u64, u64)> {
+    raw.into_iter()
+        .take_while(|&(off, _)| off < len)
+        .map(|(off, n)| (off, n.min(len - off)))
+        .collect()
+}
+
+/// Every data region of the whole file, as the filesystem reports it (`len`
+/// is not consulted: [`clip_extents`] cuts the answer).
 #[cfg(target_os = "linux")]
-fn os_extents(f: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+fn os_extents(f: &File, _len: u64) -> std::io::Result<Vec<(u64, u64)>> {
     use std::os::fd::AsRawFd;
     let fd = f.as_raw_fd();
     let mut out = Vec::new();
-    let mut pos: i64 = 0;
-    while (pos as u64) < len {
-        // SAFETY: lseek on an owned, open fd.
-        let data = unsafe { libc::lseek(fd, pos, libc::SEEK_DATA) };
-        if data < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ENXIO) {
-                break; // no more data
-            }
-            return Err(e);
+    let mut pos = 0;
+    loop {
+        let data = lseek(fd, pos, libc::SEEK_DATA);
+        // SEEK_DATA at or past the end of the file fails with ENXIO: done.
+        if data
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::ENXIO))
+        {
+            break;
         }
-        // SAFETY: as above.
-        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let end = (hole as u64).min(len);
-        if end > data as u64 {
-            out.push((data as u64, end - data as u64));
-        }
+        let data = data?;
+        let hole = lseek(fd, data, libc::SEEK_HOLE)?;
+        out.push((data, hole - data));
         pos = hole;
     }
     Ok(out)
 }
 
+/// `lseek(2)` on unsigned offsets; a negative return is the OS error.
+// reason: a bare syscall wrapper, exercised by os_extents' tests; a constant
+// return (the only mutants) never advances os_extents' walk, so it spins
+// until the timeout instead of failing a test.
+#[mutants::skip]
+#[cfg(target_os = "linux")]
+fn lseek(fd: std::os::fd::RawFd, off: u64, whence: libc::c_int) -> std::io::Result<u64> {
+    let off =
+        i64::try_from(off).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: lseek on an owned, open fd.
+    let r = unsafe { libc::lseek(fd, off, whence) };
+    u64::try_from(r).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// Allocated ranges of `0..len` (and possibly beyond, if the file grew —
+/// [`clip_extents`] cuts them), paging through `FSCTL_QUERY_ALLOCATED_RANGES`.
 #[cfg(windows)]
 fn os_extents(f: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
     use windows_sys::Win32::System::Ioctl::{
         FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
+    const EMPTY: FILE_ALLOCATED_RANGE_BUFFER = FILE_ALLOCATED_RANGE_BUFFER {
+        FileOffset: 0,
+        Length: 0,
+    };
     let mut out = Vec::new();
     let mut start: i64 = 0;
     loop {
+        // `len` bytes from `start` always covers the rest of `0..len`.
         let query = FILE_ALLOCATED_RANGE_BUFFER {
             FileOffset: start,
-            Length: len as i64 - start,
+            Length: len as i64,
         };
-        let mut buf = vec![
-            FILE_ALLOCATED_RANGE_BUFFER {
-                FileOffset: 0,
-                Length: 0
-            };
-            512
-        ];
+        let mut buf = [EMPTY; 512];
         let mut returned: u32 = 0;
         // SAFETY: valid handle; in/out buffers sized as passed.
         let ok = unsafe {
@@ -84,32 +104,37 @@ fn os_extents(f: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
                 f.as_raw_handle() as _,
                 FSCTL_QUERY_ALLOCATED_RANGES,
                 &query as *const _ as _,
-                std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                std::mem::size_of_val(&query) as u32,
                 buf.as_mut_ptr() as _,
-                (buf.len() * std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>()) as u32,
+                std::mem::size_of_val(&buf) as u32,
                 &mut returned,
                 std::ptr::null_mut(),
             )
         };
-        let more = ok == 0
-            && std::io::Error::last_os_error().raw_os_error()
-                == Some(windows_sys::Win32::Foundation::ERROR_MORE_DATA as i32);
-        if ok == 0 && !more {
-            return Err(std::io::Error::last_os_error());
+        // ERROR_MORE_DATA: `buf` holds a full page and more ranges follow.
+        let more = ok == 0;
+        if more {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(e);
+            }
         }
-        let n = returned as usize / std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
-        for r in &buf[..n] {
-            out.push((r.FileOffset as u64, r.Length as u64));
-        }
-        if !more || n == 0 {
+        let got = &buf[..returned as usize / std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>()];
+        out.extend(got.iter().map(|r| (r.FileOffset as u64, r.Length as u64)));
+        if !more {
             break;
         }
-        let last = buf[n - 1];
+        let Some(last) = got.last() else {
+            break;
+        };
         start = last.FileOffset + last.Length;
     }
     Ok(out)
 }
 
+// reason: compiled on no platform izba builds or tests (Linux, Windows); the
+// one-full-extent answer is the documented always-correct fallback.
+#[mutants::skip]
 #[cfg(not(any(target_os = "linux", windows)))]
 fn os_extents(_f: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
     Ok(vec![(0, len)])
@@ -362,18 +387,20 @@ mod tests {
 
     #[test]
     fn digest_is_independent_of_chunk_merging() {
-        let mut one = DigestBuilder::new(2 * ZERO_BLOCK);
+        // At a non-zero offset, so each block's own offset (chunk offset +
+        // its index within the chunk) is what the digest must agree on.
+        let mut one = DigestBuilder::new(3 * ZERO_BLOCK);
         one.chunk(&Chunk {
-            offset: 0,
+            offset: ZERO_BLOCK,
             data: vec![1u8; (2 * ZERO_BLOCK) as usize],
         });
-        let mut two = DigestBuilder::new(2 * ZERO_BLOCK);
+        let mut two = DigestBuilder::new(3 * ZERO_BLOCK);
         two.chunk(&Chunk {
-            offset: 0,
+            offset: ZERO_BLOCK,
             data: vec![1u8; ZERO_BLOCK as usize],
         });
         two.chunk(&Chunk {
-            offset: ZERO_BLOCK,
+            offset: 2 * ZERO_BLOCK,
             data: vec![1u8; ZERO_BLOCK as usize],
         });
         assert_eq!(one.finish(), two.finish());
@@ -441,5 +468,73 @@ mod tests {
         let covered: u64 = ext.iter().map(|e| e.1).sum();
         assert!(covered < 64 << 20, "tmpfs/ext4 report holes: {ext:?}");
         assert!(ext.iter().any(|&(o, l)| o <= 32 << 20 && 32 << 20 < o + l));
+    }
+
+    #[test]
+    fn extents_are_cut_at_len() {
+        let raw = vec![(0, 10), (20, 10), (40, 10)];
+        assert_eq!(clip_extents(raw.clone(), 50), raw);
+        // An extent running past `len` is cut there.
+        assert_eq!(clip_extents(raw.clone(), 25), vec![(0, 10), (20, 5)]);
+        // One starting exactly at, or beyond, `len` is dropped.
+        assert_eq!(clip_extents(raw.clone(), 20), vec![(0, 10)]);
+        assert_eq!(clip_extents(raw, 15), vec![(0, 10)]);
+    }
+
+    /// Writes `blk` at each of `offs` into a fresh sparse file of `len`
+    /// (on NTFS the sparse flag is what lets it have holes at all).
+    fn sparse_file(path: &Path, len: u64, offs: &[u64]) -> std::fs::File {
+        let blk = vec![5u8; ZERO_BLOCK as usize];
+        let mut f = create_sparse(path, len).unwrap();
+        for &off in offs {
+            f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(&blk).unwrap();
+        }
+        f.sync_all().unwrap();
+        drop(f);
+        std::fs::File::open(path).unwrap()
+    }
+
+    /// `ext` is ascending, non-overlapping, non-empty, inside `0..len`, and
+    /// covers every written block.
+    fn assert_extents(ext: &[(u64, u64)], len: u64, offs: &[u64]) {
+        let mut end = 0;
+        for &(o, l) in ext {
+            assert!(o >= end && l > 0 && o + l <= len, "{ext:?}");
+            end = o + l;
+        }
+        for &off in offs {
+            assert!(
+                ext.iter()
+                    .any(|&(o, l)| o <= off && off + ZERO_BLOCK <= o + l),
+                "block at {off} not covered: {ext:?}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn os_extents_report_the_data_and_skip_the_holes() {
+        const MIB: u64 = 1 << 20;
+        let t = tempfile::tempdir().unwrap();
+        let offs = [0, 4 * MIB];
+        let f = sparse_file(&t.path().join("a.img"), 8 * MIB, &offs);
+        let ext = os_extents(&f, 8 * MIB).unwrap();
+        assert_extents(&ext, 8 * MIB, &offs);
+        assert_eq!(ext[0].0, 0, "data at offset 0 is data: {ext:?}");
+        assert!(ext.iter().map(|e| e.1).sum::<u64>() < 8 * MIB, "{ext:?}");
+    }
+
+    /// More ranges than one query returns (512): the walk pages through them.
+    #[cfg(windows)]
+    #[test]
+    fn os_extents_page_through_many_ranges() {
+        let t = tempfile::tempdir().unwrap();
+        let offs: Vec<u64> = (0..600).map(|i| i * 2 * ZERO_BLOCK).collect();
+        let len = 1200 * ZERO_BLOCK;
+        let f = sparse_file(&t.path().join("a.img"), len, &offs);
+        let ext = os_extents(&f, len).unwrap();
+        assert_extents(&ext, len, &offs);
+        assert!(ext.len() > 512, "{}", ext.len());
     }
 }
