@@ -998,7 +998,9 @@ if (-not (Test-Path $vncBundle)) {
 # real %LOCALAPPDATA% (the natural real-world repro is `izba run` from
 # %USERPROFILE%).
 $f09Fails0 = $fails
-$f09Root   = "$env:TEMP\izba-f09"
+# Per-run dir ($PID) so a concurrent validation run's data root is never
+# deleted out from under its live daemon.
+$f09Root   = "$env:TEMP\izba-f09-$PID"
 $f09Data   = "$f09Root\data"
 $f09Daemon = "$f09Data\daemon"
 $f09PrevDataDir = $env:IZBA_DATA_DIR
