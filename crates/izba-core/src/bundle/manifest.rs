@@ -217,6 +217,8 @@ mod tests {
             "sandboxes//a",
             "C:/x",
             "sandboxes\\a",
+            // A backslash deeper in a known tree is refused too.
+            "sandboxes/a\\b",
             "workspaces/a/../../b",
             "manifest.json/x",
             "images",

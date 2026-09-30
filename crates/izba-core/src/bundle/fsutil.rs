@@ -101,6 +101,9 @@ fn os_free_bytes(dir: &Path) -> anyhow::Result<u64> {
     Ok(avail)
 }
 
+// reason: compiled on no platform izba builds or tests (Linux, Windows); a
+// constant "unknown, assume room" answer that no CI job can execute.
+#[mutants::skip]
 #[cfg(not(any(unix, windows)))]
 fn os_free_bytes(_dir: &Path) -> anyhow::Result<u64> {
     Ok(u64::MAX)
@@ -138,7 +141,20 @@ mod tests {
     fn free_bytes_of_a_missing_dir_measures_its_ancestor() {
         let t = tempfile::tempdir().unwrap();
         let n = free_bytes(&t.path().join("not/yet")).unwrap();
-        assert!(n > 0);
+        // A host that just built this test binary has far more than 1 MiB
+        // free: a constant 0/1 answer, or a failed OS call read as success,
+        // cannot pass this.
+        assert!(n >= 1 << 20, "{n}");
+    }
+
+    #[test]
+    fn exact_len_answers_an_empty_buffer_without_reading_or_failing() {
+        // A zero-length read is not an early EOF, even with bytes owed.
+        let mut r = ExactLen::new(&b"abc"[..], 3);
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abc");
     }
 
     #[test]

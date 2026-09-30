@@ -304,16 +304,23 @@ fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
     if rc == 0 {
         return Ok(());
     }
-    let e = std::io::Error::last_os_error();
+    Err(rename_failed(std::io::Error::last_os_error(), partial, out))
+}
+
+/// The error for a failed `renameat2(RENAME_NOREPLACE)`, the partial removed:
+/// an existing target is the "appeared" refusal, a filesystem (or kernel)
+/// without the flag is "unsupported", anything else is the OS error itself.
+#[cfg(target_os = "linux")]
+fn rename_failed(e: std::io::Error, partial: &Path, out: &Path) -> anyhow::Error {
     match e.raw_os_error() {
         Some(libc::EEXIST) => {
             let _ = std::fs::remove_file(partial);
-            Err(appeared(out))
+            appeared(out)
         }
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Err(unsupported(partial, out)),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => unsupported(partial, out),
         _ => {
             let _ = std::fs::remove_file(partial);
-            Err(e).with_context(|| format!("renaming to {}", out.display()))
+            anyhow::Error::new(e).context(format!("renaming to {}", out.display()))
         }
     }
 }
@@ -344,6 +351,9 @@ fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
 }
 
 /// Other unix targets have no portable no-replace rename here.
+// reason: compiled on no platform izba builds or tests (Linux, Windows); a
+// constant refusal no CI job can execute.
+#[mutants::skip]
 #[cfg(all(unix, not(target_os = "linux")))]
 fn rename_no_replace(partial: &Path, out: &Path) -> anyhow::Result<()> {
     Err(unsupported(partial, out))
@@ -685,14 +695,15 @@ fn append_disk<W: Write>(
         .len();
     append_bytes(tar, &format!("{prefix}.len"), &len.to_le_bytes())?;
     let mut d = DigestBuilder::new(len);
-    let mut done = 0u64;
+    let mut ticker = Ticker {
+        done: 0,
+        step: PROGRESS_STEP,
+    };
     let read_len = for_each_chunk(src, |c| {
         d.chunk(&c);
         append_bytes(tar, &chunk_entry_name(prefix, c.offset), &c.data)?;
-        let before = done;
-        done += c.data.len() as u64;
-        if done / PROGRESS_STEP != before / PROGRESS_STEP {
-            progress(format!("{prefix}: {} MiB", done >> 20));
+        if let Some(mib) = ticker.add(c.data.len() as u64) {
+            progress(format!("{prefix}: {mib} MiB"));
         }
         Ok(())
     })?;
@@ -701,6 +712,22 @@ fn append_disk<W: Write>(
     }
     sums.files.insert(prefix.to_string(), d.finish());
     Ok(len)
+}
+
+/// Disk-streaming progress: one line each time the bytes done cross a
+/// multiple of `step`.
+struct Ticker {
+    done: u64,
+    step: u64,
+}
+
+impl Ticker {
+    /// Adds `n` bytes; `Some(MiB done)` when that crossed a step boundary.
+    fn add(&mut self, n: u64) -> Option<u64> {
+        let before = self.done;
+        self.done += n;
+        (self.done / self.step != before / self.step).then_some(self.done >> 20)
+    }
 }
 
 #[cfg(test)]
@@ -729,6 +756,23 @@ mod tests {
             .find(|(n, _)| n == name)
             .unwrap_or_else(|| panic!("no entry {name}"))
             .1
+    }
+
+    /// The logical bytes an archive carries: every plain file's body plus
+    /// each disk's declared length (its `.len` marker, not its chunks).
+    fn logical_of(entries: &[(String, Vec<u8>)]) -> u64 {
+        entries
+            .iter()
+            .map(|(n, b)| {
+                if n == MANIFEST_PATH || n == CHECKSUMS_PATH || n.contains(".d/") {
+                    0
+                } else if n.ends_with(".len") {
+                    u64::from_le_bytes(b[..].try_into().unwrap())
+                } else {
+                    b.len() as u64
+                }
+            })
+            .sum()
     }
 
     fn manifest_and_sums(entries: &[(String, Vec<u8>)]) -> (Manifest, Checksums) {
@@ -1085,6 +1129,98 @@ mod tests {
     }
 
     #[test]
+    fn progress_ticks_once_per_step_crossed() {
+        let mut t = Ticker {
+            done: 0,
+            step: 1 << 20,
+        };
+        assert_eq!(t.add(512 << 10), None);
+        assert_eq!(t.add(512 << 10), Some(1));
+        assert_eq!(t.add(100), None);
+        assert_eq!(t.add(3 << 20), Some(4));
+    }
+
+    #[test]
+    fn a_partial_that_cannot_be_created_fails_at_once() {
+        // Not "name taken": the directory is missing, so no retry can help.
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("missing/x.izba");
+        let mut calls = 0;
+        let e = create_partial(&out, &mut || {
+            calls += 1;
+            0
+        })
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("creating") && !e.contains("names already taken"),
+            "{e}"
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn publish_reports_a_failed_move_as_itself_not_as_an_appeared_output() {
+        // The partial is gone: neither the link nor the rename can succeed,
+        // and nothing appeared at `out`.
+        let t = tempfile::tempdir().unwrap();
+        let (partial, out) = (t.path().join("p.partial"), t.path().join("x.izba"));
+        let e = format!("{:#}", publish(&partial, &out).unwrap_err());
+        assert!(e.contains("renaming to") && !e.contains("appeared"), "{e}");
+        assert!(!out.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_no_replace_rename_is_classified_and_the_partial_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let (partial, out) = (t.path().join("p.partial"), t.path().join("x.izba"));
+        for (errno, want) in [
+            (libc::EEXIST, "appeared during the save"),
+            (
+                libc::EINVAL,
+                "supports neither hard links nor no-replace renames",
+            ),
+            (
+                libc::ENOSYS,
+                "supports neither hard links nor no-replace renames",
+            ),
+            (
+                libc::EOPNOTSUPP,
+                "supports neither hard links nor no-replace renames",
+            ),
+            (libc::EACCES, "renaming to"),
+        ] {
+            std::fs::write(&partial, b"archive").unwrap();
+            let e = rename_failed(std::io::Error::from_raw_os_error(errno), &partial, &out);
+            let e = format!("{e:#}");
+            assert!(e.contains(want), "errno {errno}: {e}");
+            assert!(!partial.exists(), "errno {errno}: partial removed");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_no_replace_publishes_fresh_and_never_replaces() {
+        let t = tempfile::tempdir().unwrap();
+        let (partial, out) = (t.path().join("p.partial"), t.path().join("x.izba"));
+        std::fs::write(&partial, b"archive").unwrap();
+        std::fs::write(&out, b"precious").unwrap();
+        let e = rename_no_replace(&partial, &out).unwrap_err().to_string();
+        assert!(e.contains("appeared during the save"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        assert!(!partial.exists(), "partial removed on refusal");
+        std::fs::remove_file(&out).unwrap();
+        std::fs::write(&partial, b"archive").unwrap();
+        rename_no_replace(&partial, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"archive");
+        assert!(!partial.exists());
+        // Any other failure is reported as itself.
+        let e = format!("{:#}", rename_no_replace(&partial, &out).unwrap_err());
+        assert!(e.contains("renaming to") && !e.contains("appeared"), "{e}");
+    }
+
+    #[test]
     fn a_partial_name_already_taken_is_skipped_never_truncated() {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("x.izba");
@@ -1227,7 +1363,7 @@ mod tests {
         assert_eq!(r.path, out);
         assert_eq!(r.sandboxes, vec!["a".to_string()]);
         assert_eq!(r.archive_bytes, std::fs::metadata(&out).unwrap().len());
-        assert!(r.logical_bytes >= 3 * DISK_LEN, "{r:?}");
+        assert_eq!(r.logical_bytes, logical_of(&read_entries(&out)), "{r:?}");
         assert!(r.warnings.is_empty());
         assert!(!msgs.is_empty());
 
@@ -1235,7 +1371,14 @@ mod tests {
         let (m, sums) = manifest_and_sums(&entries);
         assert_eq!(m.format, crate::bundle::FORMAT_VERSION);
         assert_eq!(m.images, vec!["sha256:aa".to_string()]);
-        assert!(m.image_sizes["sha256:aa"] > 0, "{:?}", m.image_sizes);
+        // Allocation is at least the image files' own bytes on every OS.
+        let img_len: u64 = IMAGE_FILES
+            .iter()
+            .filter_map(|f| std::fs::metadata(paths.image_dir("sha256:aa").join(f)).ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(img_len > 1);
+        assert!(m.image_sizes["sha256:aa"] >= img_len, "{:?}", m.image_sizes);
         assert_eq!(m.sandboxes[0].image_digest, "sha256:aa");
         assert_eq!(m.sandboxes[0].named_volumes, vec!["data".to_string()]);
         assert_eq!(m.named_volumes.len(), 1);
@@ -1378,7 +1521,7 @@ mod tests {
         let (t, paths) = fixture();
         add_sandbox(&paths, "a", "sha256:aa", &[]);
         let out = t.path().join("x.izba");
-        save(
+        let r = save(
             &paths,
             &no_conn,
             &opts(&["a"], out.clone(), true),
@@ -1387,6 +1530,7 @@ mod tests {
         .unwrap();
         let entries = read_entries(&out);
         assert_eq!(body(&entries, "workspaces/a/README"), b"hello");
+        assert_eq!(r.logical_bytes, logical_of(&entries));
         let (m, _) = manifest_and_sums(&entries);
         assert!(m.sandboxes[0].workspace_bundled);
         assert_eq!(m.sandboxes[0].workspace_bytes, 5);
