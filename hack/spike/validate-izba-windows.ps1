@@ -16,7 +16,9 @@
 #           [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker,
 #           [15] VNC display: izba vnc url + auth matrix over the real relay,
 #                a real websocket/RFB session, and the same again after a
-#                stop/start (skips loudly when kasmvnc.erofs is not staged).
+#                stop/start (skips loudly when kasmvnc.erofs is not staged),
+#           [16] F-09 control-socket barrier: ancestor-workspace start refused
+#                + a Low-labelled daemon dir re-stamped Medium by izbad (#281).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -980,6 +982,82 @@ if (-not (Test-Path $vncBundle)) {
     if ($vncSectionFails -gt 0) {
         [Console]::Error.WriteLine("  [15] vnc section: $vncSectionFails check(s) failed")
     }
+}
+
+# [16] F-09 control-socket barrier (#281). izbad.sock is unreachable from the
+# Low-IL confined VMM only because <data>\daemon keeps a Medium integrity label
+# (spike #248: AF_UNIX connect() needs write access). Two real-WHP proofs:
+#   (16a) a confined start whose workspace CONTAINS the daemon dir is refused
+#         before anything is labelled (SetNamedSecurityInfoW would otherwise
+#         propagate the Low label over the existing subtree, izbad.sock
+#         included) — and nothing ends up Low;
+#   (16b) a daemon dir left Low by an older build is re-stamped Medium by
+#         izbad before it binds.
+# Runs against a THROWAWAY data root under %TEMP% (IZBA_DATA_DIR) whose parent
+# is the ancestor workspace, so a regression can never Low-label the runner's
+# real %LOCALAPPDATA% (the natural real-world repro is `izba run` from
+# %USERPROFILE%).
+$f09Fails0 = $fails
+$f09Root   = "$env:TEMP\izba-f09"
+$f09Data   = "$f09Root\data"
+$f09Daemon = "$f09Data\daemon"
+$f09PrevDataDir = $env:IZBA_DATA_DIR
+try {
+    if (Test-Path $f09Root) { Remove-Item -Recurse -Force $f09Root -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $f09Data -Force | Out-Null
+    $env:IZBA_DATA_DIR = $f09Data
+
+    # (16a) workspace = the data root's PARENT => an ancestor of <data>\daemon.
+    $f09Out = (& $exe run --image $image --name f09 $f09Root -- /bin/true 2>&1 | Out-String)
+    $f09Rc  = $LASTEXITCODE
+    Check 'f09: confined start with a workspace containing the daemon dir is refused' ($f09Rc -ne 0)
+    Check 'f09: refusal names F-09 and the izba rm + recreate remedy' `
+        ($f09Out -match 'F-09' -and $f09Out -match 'izba rm')
+    if ($f09Rc -eq 0 -or -not ($f09Out -match 'F-09')) {
+        [Console]::Error.WriteLine("  f09 run rc=$f09Rc out='$($f09Out.Trim())'")
+    }
+    $f09DaemonLabel = (& icacls $f09Daemon 2>$null) -join "`n"
+    Check 'f09: daemon dir carries no Low label after the refused start' `
+        ($f09DaemonLabel -notmatch 'Low Mandatory Level')
+    $f09WsLabel = (& icacls $f09Root 2>$null) -join "`n"
+    Check 'f09: refused start labelled nothing (workspace has no Low label)' `
+        ($f09WsLabel -notmatch 'Low Mandatory Level')
+    & $exe rm --force f09 2>$null | Out-Null
+
+    # (16b) Simulate a pre-#281 leftover: stop izbad, Low-label <data>\daemon
+    # (inheritable, like the confined-start relabel), then let the next command
+    # auto-start izbad — it must re-stamp the dir Medium before binding.
+    & $exe daemon stop 2>$null | Out-Null
+    & icacls $f09Daemon /setintegritylevel '(OI)(CI)low' 2>$null | Out-Null
+    $f09Pre = (& icacls $f09Daemon 2>$null) -join "`n"
+    Check 'f09: precondition - daemon dir was Low-labelled for the re-stamp proof' `
+        ($f09Pre -match 'Low Mandatory Level')
+    & $exe ls 2>$null | Out-Null
+    Check 'f09: izbad restarts over a Low-labelled daemon dir (ls exits 0)' ($LASTEXITCODE -eq 0)
+    $f09Post = (& icacls $f09Daemon 2>$null) -join "`n"
+    Check 'f09: izbad re-stamped the daemon dir (no Low label after bind)' `
+        ($f09Post -notmatch 'Low Mandatory Level')
+    if ($f09Post -match 'Low Mandatory Level') {
+        [Console]::Error.WriteLine("  --- icacls $f09Daemon ---")
+        ($f09Post -split "`n") | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+    }
+    # The socket itself: icacls may not read an AF_UNIX reparse point on every
+    # build, so assert only when it answers.
+    $f09SockLabel = (& icacls "$f09Daemon\izbad.sock" 2>$null) -join "`n"
+    if ($LASTEXITCODE -eq 0) {
+        Check 'f09: izbad.sock carries no Low label' ($f09SockLabel -notmatch 'Low Mandatory Level')
+    } else {
+        Write-Output "  (icacls cannot read izbad.sock on this build; the daemon-dir check above covers inheritance)"
+    }
+} finally {
+    & $exe daemon stop 2>$null | Out-Null
+    $env:IZBA_DATA_DIR = $f09PrevDataDir
+    if ($fails -eq $f09Fails0 -and (Test-Path $f09Root)) {
+        Remove-Item -Recurse -Force $f09Root -ErrorAction SilentlyContinue
+    }
+}
+if ($fails -gt $f09Fails0) {
+    [Console]::Error.WriteLine("  [16] f09 section: $($fails - $f09Fails0) check(s) failed")
 }
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
