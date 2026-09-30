@@ -2137,11 +2137,22 @@ mod tests {
 
     #[test]
     fn disk_idmap_is_a_sorted_full_range_bijection() {
-        let ext = disk_idmap_extents(1001, 1000, 0).unwrap();
+        // The last two: an owner at the very top of the range (the gap after
+        // it is empty) and one just past it (never a disk id of its own).
+        for (w, src, tgt) in [
+            (1001, 1000, 0),
+            (1000, USERNS_RANGE_END - 1, 0),
+            (1000, USERNS_RANGE_END, 0),
+        ] {
+            assert_full_range_bijection(&disk_idmap_extents(w, src, tgt).unwrap());
+        }
+    }
+
+    fn assert_full_range_bijection(ext: &[oci_spec::runtime::LinuxIdMapping]) {
         let mut next = 0u32;
-        for m in &ext {
-            assert_eq!(m.container_id(), next, "contiguous disk ranges");
-            assert!(m.size() > 0);
+        for m in ext {
+            assert_eq!(m.container_id(), next, "contiguous disk ranges: {ext:?}");
+            assert!(m.size() > 0, "{ext:?}");
             next = m.container_id() + m.size();
         }
         assert_eq!(next, USERNS_RANGE_END);
