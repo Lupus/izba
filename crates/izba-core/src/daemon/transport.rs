@@ -203,12 +203,14 @@ mod tests {
             assert!(p.is_dir());
             assert!(!p.join("izbad.sock").exists());
             SEEN.lock().unwrap().push(p.to_path_buf());
-            Ok(())
+            // Stop here: unit tests never bind listeners (the fail-closed
+            // path is what keeps this one from reaching the bind).
+            anyhow::bail!("stop before bind")
         }
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(dir.path().join("izba"));
-        // Bind may be denied in this sandbox; the re-assert runs regardless.
-        let _ = bind_socket_with(&paths, recording);
+        bind_socket_with(&paths, recording).expect_err("recorder stops the bind");
+        assert!(!paths.daemon_socket().exists());
         assert_eq!(*SEEN.lock().unwrap(), vec![paths.daemon_dir()]);
     }
 }
