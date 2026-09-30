@@ -53,10 +53,10 @@ check("plan lists 0-indexed shards", sp.plan(21, TOY) == {"shards": [0, 1, 2], "
 check("linux floor is 2", sp.shard_count(0, sp.LINUX) == 2)
 check("windows floor is 4", sp.shard_count(0, sp.WINDOWS) == 4)
 check("linux cap is 16", sp.shard_count(100_000, sp.LINUX) == 16)
-check("windows cap is 24", sp.shard_count(100_000, sp.WINDOWS) == 24)
-# 641 mutants (PR #300): linux 641*40/1800 = 14.2 -> 15; windows 641*120/2400 = 32 -> capped 24.
+check("windows cap is 36", sp.shard_count(100_000, sp.WINDOWS) == 36)
+# 641 mutants (PR #300): linux 641*40/1800 = 14.2 -> 15; windows 641*120/2400 = 32.05 -> 33 (under the 36 cap).
 check("linux 641 -> 15", sp.shard_count(641, sp.LINUX) == 15)
-check("windows 641 -> capped 24", sp.shard_count(641, sp.WINDOWS) == 24)
+check("windows 641 -> 33", sp.shard_count(641, sp.WINDOWS) == 33)
 # Every production budget must leave headroom under its job's timeout-minutes
 # (baseline build + cache restore + install also spend wall clock).
 check("linux budget < 45-min job cap", sp.LINUX.shard_budget_secs < 45 * 60)

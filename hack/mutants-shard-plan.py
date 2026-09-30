@@ -45,7 +45,7 @@ class Platform:
 # mutant. The max caps parallel runner fan-out; past it a shard's slice exceeds
 # the budget (a PR that big should be split, or the cap raised deliberately).
 LINUX = Platform(name="linux", secs_per_mutant=40, shard_budget_secs=30 * 60, min_shards=2, max_shards=16)
-WINDOWS = Platform(name="windows", secs_per_mutant=120, shard_budget_secs=40 * 60, min_shards=4, max_shards=24)
+WINDOWS = Platform(name="windows", secs_per_mutant=120, shard_budget_secs=40 * 60, min_shards=4, max_shards=36)
 PLATFORMS = (LINUX, WINDOWS)
 
 
