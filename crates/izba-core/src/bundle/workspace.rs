@@ -75,19 +75,20 @@ pub fn append_workspace<W: Write>(
         for de in sorted_entries(dir)? {
             let path = de.path();
             let rel = rel_dir.join(de.file_name());
-            let mut name = prefix.to_string();
-            for c in rel.components() {
-                let s = c
-                    .as_os_str()
-                    .to_str()
-                    .with_context(|| format!("non-UTF-8 workspace path {}", rel.display()))?;
-                name.push('/');
-                name.push_str(s);
-            }
+            let rel_name = rel
+                .components()
+                .map(|c| {
+                    c.as_os_str()
+                        .to_str()
+                        .with_context(|| format!("non-UTF-8 workspace path {}", rel.display()))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("/");
+            let name = format!("{prefix}/{rel_name}");
             // Never emit a name some load would refuse (spec §10): the whole
             // archive would otherwise be unloadable, found out only on load.
             validate_entry_path(&name)
-                .and_then(|()| check_portable_rel(&name[prefix.len() + 1..]))
+                .and_then(|()| check_portable_rel(&rel_name))
                 .with_context(|| {
                     format!(
                         "workspace file {} cannot be restored portably; rename it or \
@@ -109,7 +110,7 @@ pub fn append_workspace<W: Write>(
                 // Windows needs to know a link's kind at creation; a
                 // dangling link (no target metadata) is recorded as a file.
                 if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
-                    append_pax(tar, SYMLINK_DIR_PAX_KEY, "1")
+                    append_pax_record(tar, SYMLINK_DIR_PAX_RECORD)
                         .with_context(|| format!("archiving symlink {}", rel.display()))?;
                 }
                 h.set_entry_type(tar::EntryType::Symlink);
@@ -163,19 +164,18 @@ pub fn append_workspace<W: Write>(
 /// directory symlink explicitly); tar readers ignore unknown PAX keys.
 pub const SYMLINK_DIR_PAX_KEY: &str = "IZBA.symlink.dir";
 
-/// Appends a PAX local extended header (`x`) carrying one `key=value`
-/// record; it applies to the NEXT entry and is consumed by the reader (it is
-/// never yielded as an entry). The header's own name is short and fixed, so
-/// it never needs a GNU long-name entry of its own.
-fn append_pax<W: Write>(tar: &mut tar::Builder<W>, key: &str, value: &str) -> Result<()> {
-    // "<len> <key>=<value>\n", where <len> counts the whole record,
-    // including its own digits.
-    let body = format!(" {key}={value}\n");
-    let mut len = body.len();
-    while (len.to_string().len() + body.len()) != len {
-        len = len.to_string().len() + body.len();
-    }
-    let record = format!("{len}{body}");
+/// The PAX record marking a directory symlink: `<len> <key>=<value>\n`,
+/// where `<len>` counts the WHOLE record including its own digits — the 20
+/// bytes of ` IZBA.symlink.dir=1\n` plus the two of `22`. A literal rather
+/// than a computed fixed point (pinned against [`SYMLINK_DIR_PAX_KEY`] by a
+/// test): izba writes no other PAX record.
+const SYMLINK_DIR_PAX_RECORD: &str = "22 IZBA.symlink.dir=1\n";
+
+/// Appends a PAX local extended header (`x`) carrying `record`; it applies to
+/// the NEXT entry and is consumed by the reader (it is never yielded as an
+/// entry). The header's own name is short and fixed, so it never needs a GNU
+/// long-name entry of its own.
+fn append_pax_record<W: Write>(tar: &mut tar::Builder<W>, record: &str) -> Result<()> {
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::XHeader);
     // A PAX header is metadata, never extracted as a file: its mode is
@@ -886,5 +886,242 @@ mod tests {
     fn git_exec_bits_is_empty_outside_a_repo() {
         let t = tempfile::tempdir().unwrap();
         assert!(git_exec_bits(&t.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn translate_same_os_keeps_the_home_itself_and_longer_paths_outside_it() {
+        let (_, home, tgt) = same_os_paths();
+        let outside = if SourceOs::current() == SourceOs::Windows {
+            r"E:\work\deep\proj"
+        } else {
+            "/opt/work/deep/proj"
+        };
+        // The source home itself is not "under" it; a path longer than the
+        // home but outside it is not either: both keep their path.
+        for src in [home, outside] {
+            let p = translate_workspace(src, Some(home), &SourceOs::current(), Path::new(tgt));
+            assert_eq!(p, Some(PathBuf::from(src)), "{src}");
+        }
+    }
+
+    #[test]
+    fn translate_same_os_rebases_under_a_target_home_nested_in_the_source_home() {
+        let (src, home, _) = same_os_paths();
+        let tgt = Path::new(home).join("sub");
+        let p = translate_workspace(src, Some(home), &SourceOs::current(), &tgt);
+        assert_eq!(p, Some(tgt.join("proj")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_an_empty_dir_is_not_a_free_target() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir(t.path().join("empty")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("empty"), t.path().join("link")).unwrap();
+        assert!(!is_free_target(&t.path().join("link")));
+    }
+
+    #[test]
+    fn mtime_is_the_modification_time_in_unix_seconds() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("f");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567))
+            .unwrap();
+        drop(f);
+        assert_eq!(mtime(&std::fs::metadata(&p).unwrap()), 1_234_567);
+    }
+
+    #[test]
+    fn the_symlink_dir_pax_record_is_self_describing() {
+        let (len, body) = SYMLINK_DIR_PAX_RECORD.split_once(' ').unwrap();
+        assert_eq!(len.parse::<usize>().unwrap(), SYMLINK_DIR_PAX_RECORD.len());
+        assert_eq!(body, format!("{SYMLINK_DIR_PAX_KEY}=1\n"));
+    }
+
+    /// A symlink entry preceded by the PAX `record` (if any), read back.
+    fn symlink_after_pax(record: Option<&str>) -> bool {
+        let mut b = tar::Builder::new(Vec::new());
+        if let Some(r) = record {
+            append_pax_record(&mut b, r).unwrap();
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        b.append_link(&mut h, "workspaces/a/l", "target").unwrap();
+        let buf = b.into_inner().unwrap();
+        let mut ar = tar::Archive::new(&buf[..]);
+        let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(e.path().unwrap(), Path::new("workspaces/a/l"));
+        is_dir_symlink(&mut e)
+    }
+
+    #[test]
+    fn only_the_exact_dir_marker_makes_a_dir_symlink() {
+        assert!(symlink_after_pax(Some(SYMLINK_DIR_PAX_RECORD)));
+        assert!(!symlink_after_pax(None));
+        // The marker key with another value, or another key valued "1".
+        assert!(!symlink_after_pax(Some("22 IZBA.symlink.dir=0\n")));
+        assert!(!symlink_after_pax(Some("6 x=1\n")));
+    }
+
+    #[test]
+    fn git_exec_bits_lists_the_files_git_records_as_executable() {
+        if which::which("git").is_err() {
+            return; // no git here: nothing to ask
+        }
+        let t = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .arg("-C")
+                .arg(t.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "git {args:?}: {st:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(t.path().join("run.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(t.path().join("data.txt"), b"x").unwrap();
+        git(&["add", "run.sh", "data.txt"]);
+        git(&["update-index", "--chmod=+x", "run.sh"]);
+        git(&["update-index", "--chmod=-x", "data.txt"]);
+        assert_eq!(
+            git_exec_bits(t.path()),
+            HashSet::from([PathBuf::from("run.sh")])
+        );
+    }
+
+    #[cfg(unix)]
+    fn one_entry(ty: tar::EntryType, name: &str, mode: u32) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(ty);
+        h.set_mode(mode);
+        let body: &[u8] = if ty == tar::EntryType::Regular {
+            b"z"
+        } else {
+            b""
+        };
+        h.set_size(body.len() as u64);
+        h.set_cksum();
+        b.append_data(&mut h, name, body).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_read_only_directory_is_made_writable_and_deferred() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let mut modes = DirModes::new();
+        let unpack = |ty, rel: &str, mode, modes: &mut DirModes| {
+            let buf = one_entry(ty, &format!("workspaces/a/{rel}"), mode);
+            let mut ar = tar::Archive::new(&buf[..]);
+            let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+            unpack_entry(&mut e, t.path(), Path::new(rel), modes).unwrap();
+        };
+        // A read-only FILE keeps its mode and is not deferred.
+        unpack(tar::EntryType::Regular, "f", 0o444, &mut modes);
+        assert_eq!(mode_of(&t.path().join("f")) & 0o200, 0);
+        assert!(modes.modes.is_empty(), "{:?}", modes.modes);
+        // A read-only DIRECTORY is owner-rwx meanwhile (and nothing more),
+        // its recorded mode deferred.
+        unpack(tar::EntryType::Directory, "ro", 0o555, &mut modes);
+        let m = mode_of(&t.path().join("ro"));
+        assert_eq!((m & 0o700, m & 0o7000), (0o700, 0), "{m:o}");
+        assert_eq!(modes.modes, vec![(t.path().join("ro"), 0o555)]);
+        std::fs::set_permissions(t.path().join("ro"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// Windows files carry no mode bits: files are 0644 unless git records
+    /// the exec bit, directories 0755.
+    #[cfg(not(unix))]
+    #[test]
+    fn windows_entry_modes_come_from_the_kind_and_git_exec_bits() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("run.sh"), b"x").unwrap();
+        std::fs::write(t.path().join("data.txt"), b"x").unwrap();
+        let exec = HashSet::from([PathBuf::from("run.sh")]);
+        let mode = |rel: &str| {
+            let meta = std::fs::metadata(t.path().join(rel)).unwrap();
+            entry_mode(&meta, Path::new(rel), &exec)
+        };
+        assert_eq!(mode("run.sh"), 0o755);
+        assert_eq!(mode("data.txt"), 0o644);
+        assert_eq!(mode(""), 0o755);
+    }
+
+    /// Windows creates a directory symlink only when asked explicitly; a
+    /// failure to create a symlink hints at Developer Mode, any other
+    /// unpack failure does not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlink_kinds_and_errors() {
+        use std::os::windows::fs::FileTypeExt;
+        let t = tempfile::tempdir().unwrap();
+        let unpack = |rel: &str, record: Option<&str>, ty: tar::EntryType| {
+            let mut b = tar::Builder::new(Vec::new());
+            if let Some(r) = record {
+                append_pax_record(&mut b, r).unwrap();
+            }
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(ty);
+            h.set_size(0);
+            h.set_mode(0o755);
+            if ty == tar::EntryType::Symlink {
+                b.append_link(&mut h, format!("w/{rel}"), "target").unwrap();
+            } else {
+                h.set_cksum();
+                b.append_data(&mut h, format!("w/{rel}"), &b""[..]).unwrap();
+            }
+            let buf = b.into_inner().unwrap();
+            let mut ar = tar::Archive::new(&buf[..]);
+            let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+            unpack_entry(&mut e, t.path(), Path::new(rel), &mut DirModes::new())
+        };
+        std::fs::create_dir(t.path().join("target")).unwrap();
+        if let Err(e) = unpack("flink", None, tar::EntryType::Symlink) {
+            if format!("{e:#}").contains("Developer Mode") {
+                return; // no symlink privilege on this host
+            }
+            panic!("{e:#}");
+        }
+        let kind = |rel: &str| {
+            std::fs::symlink_metadata(t.path().join(rel))
+                .unwrap()
+                .file_type()
+        };
+        assert!(kind("flink").is_symlink_file());
+        unpack(
+            "dlink",
+            Some(SYMLINK_DIR_PAX_RECORD),
+            tar::EntryType::Symlink,
+        )
+        .unwrap();
+        assert!(kind("dlink").is_symlink_dir());
+        // An existing file in the way: a symlink failure hints, a
+        // directory failure does not.
+        std::fs::write(t.path().join("taken"), b"x").unwrap();
+        let e = unpack(
+            "taken",
+            Some(SYMLINK_DIR_PAX_RECORD),
+            tar::EntryType::Symlink,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("Developer Mode"), "{e:#}");
+        let e = unpack("taken", None, tar::EntryType::Directory).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("unpacking") && !e.contains("Developer Mode"),
+            "{e}"
+        );
     }
 }
