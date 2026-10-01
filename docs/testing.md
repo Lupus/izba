@@ -327,6 +327,36 @@ jobs, with an explicit staged-file check before the test steps run — so a
 broken artifact job fails the run loudly instead of the e2e silently
 self-skipping.
 
+### USB passthrough exercise (`usb_attach_e2e`)
+
+Boots real microVMs on the USB kernel variant, attaches a device from a fake
+usbip server over the real `vhci-hcd`-over-vsock-1028 path, and asserts the tty
+appears inside the container and carries bytes both ways. Beyond the usual
+artifacts it needs the USB kernel and the fake server (an excluded crate that
+links libusb — `sudo apt install libusb-1.0-0-dev`):
+
+```sh
+cargo build --release --manifest-path hack/fake-usbipd/Cargo.toml
+IZBA_INTEGRATION=1 IZBA_KERNEL=dist/vmlinux IZBA_KERNEL_USB=dist/vmlinux-usb \
+  IZBA_INITRAMFS=dist/initramfs.cpio.gz \
+  IZBA_FAKE_USBIPD=hack/fake-usbipd/target/release/fake-usbipd \
+  cargo test -p izba-cli --test usb_attach_e2e -- --test-threads=1 --nocapture
+```
+
+With `IZBA_INTEGRATION=1` a missing artifact FAILS the suite rather than
+skipping it. One case
+(`a_granted_device_attaches_on_the_kernel_an_installed_build_resolves`) runs
+with every `IZBA_KERNEL*` / `IZBA_INITRAMFS` override removed, so it resolves
+the kernel the way a `.deb` or installer user does — from
+`<exe-dir>/../artifacts`. Stage that directory first:
+
+```sh
+mkdir -p target/artifacts
+cp dist/vmlinux dist/vmlinux-usb dist/initramfs.cpio.gz target/artifacts/
+```
+
+The Windows/OpenVMM counterpart is `hack/ci/usb-attach-gate.ps1` (§8).
+
 ## 5a. Code coverage
 
 `hack/coverage.sh` measures coverage for the Rust workspace with

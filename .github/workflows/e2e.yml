@@ -360,6 +360,23 @@ jobs:
             echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; vnc_desktop_e2e would silently self-skip instead of proving the feature" >&2
             exit 1
           }
+      - name: Stage boot artifacts at the production exe-relative discovery path
+        # #191: every other USB e2e case is handed its kernel through
+        # IZBA_KERNEL_USB — the path an installed user never takes, and why a
+        # build that shipped no USB kernel (#189) passed a green board. One case
+        # runs with the overrides removed and must find the kernels where an
+        # installer puts them: <exe-dir>/../artifacts (target/artifacts for
+        # target/debug/izba). Installer-shaped on purpose: BOTH kernels + the
+        # initramfs, exactly what packaging/build-deb.sh ships.
+        #
+        # ORDER IS LOAD-BEARING: after Swatinem/rust-cache, which replaces
+        # target/ wholesale (see the kasmvnc staging step above).
+        run: |
+          mkdir -p target/artifacts
+          cp dist/vmlinux dist/vmlinux-usb dist/initramfs.cpio.gz target/artifacts/
+          for f in vmlinux vmlinux-usb initramfs.cpio.gz; do
+            test -s "target/artifacts/$f" || { echo "target/artifacts/$f missing or empty" >&2; exit 1; }
+          done
       - name: Report host confinement capabilities (Landlock probe)
         run: |
           # Authoritative check via the landlock_create_ruleset ABI probe — NOT
