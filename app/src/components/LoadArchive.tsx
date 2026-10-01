@@ -32,6 +32,11 @@ function describe(s: ArchiveSandbox): string {
   return s.locked ? `${ws} · was locked down on the source machine` : ws;
 }
 
+async function browseDir(set: (v: string) => void) {
+  const chosen = await open({ directory: true, multiple: false });
+  if (typeof chosen === "string") set(chosen);
+}
+
 export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
   const [path, setPath] = useState("");
   // The listing is only ever the manifest of the CURRENT path: editing the
@@ -48,6 +53,8 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
   const [report, setReport] = useState<LoadReport | null>(null);
   // Latest path, readable from a read that resolves after the user moved on.
   const pathRef = useRef("");
+  // Id of the newest read: only that one may clear the busy state.
+  const readSeq = useRef(0);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -60,10 +67,16 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
     setPath(v);
     setInfo(null);
     setPicked(new Set());
+    // Placement typed for one archive must not land on another's sandboxes.
+    setRename("");
+    setWorkspace("");
+    setWorkspaceRoot("");
+    setReading(false);
     setError(null);
   }
 
   async function read(target: string) {
+    const seq = ++readSeq.current;
     setReading(true);
     setError(null);
     try {
@@ -74,7 +87,7 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
     } catch (e) {
       if (pathRef.current === target) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setReading(false);
+      if (readSeq.current === seq && pathRef.current === target) setReading(false);
     }
   }
 
@@ -89,12 +102,11 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
     }
   }
 
-  async function browseDir(set: (v: string) => void) {
-    const chosen = await open({ directory: true, multiple: false });
-    if (typeof chosen === "string") set(chosen);
-  }
-
   function toggle(name: string, on: boolean) {
+    // "Load as" and the workspace folder describe ONE sandbox; a different
+    // selection must not inherit them.
+    setRename("");
+    setWorkspace("");
     setPicked((prev) => {
       const next = new Set(prev);
       if (on) next.add(name);
@@ -148,7 +160,9 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
     <Dialog
       open={true}
       onOpenChange={(o) => {
-        if (!o) onClose();
+        // The daemon keeps going whether or not the dialog is open; closing
+        // mid-load would hide the warnings and the redo list from the user.
+        if (!o && !busy) onClose();
       }}
     >
       <DialogContent className="max-w-lg overflow-y-auto max-h-screen sm:max-h-screen">
@@ -321,7 +335,7 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
             {error && <div className="mt-3 text-sm text-destructive">{error}</div>}
 
             <DialogFooter className="gap-2">
-              <Button type="button" variant="ghost" onClick={onClose}>
+              <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
                 Cancel
               </Button>
               <Button
