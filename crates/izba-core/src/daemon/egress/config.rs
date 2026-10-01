@@ -690,12 +690,17 @@ impl EgressPolicyConfig {
     /// where every rule grants independently (see
     /// `collapse_duplicate_hosts`).
     ///
-    /// This is the ONE place "exact host, last-wins" is decided outside the
-    /// compile itself. `InspectionTable::from_config` builds its passthrough
-    /// set from it and `izba policy show` marks superseded entries from it,
-    /// so the reveal surface and the datapath cannot fold duplicates
-    /// differently; `superseded_by_agrees_with_the_compiled_host_rules` pins
-    /// it against the compile.
+    /// `InspectionTable::from_config` builds its passthrough set from this and
+    /// `izba policy show` marks superseded entries from it, so the reveal
+    /// surface and the passthrough set cannot fold duplicates differently;
+    /// `superseded_by_agrees_with_the_compiled_host_rules` pins it against the
+    /// compile. It is NOT the only last-wins fold in the tree:
+    /// `collapse_duplicate_hosts` and `manifest::diff::allow_index` each carry
+    /// their own, mirroring the same compile.
+    ///
+    /// `None` does not mean "exact host and in force": a wildcard entry is
+    /// `None` too. A consumer that wants the in-force EXACT entries must also
+    /// exclude wildcards, as `InspectionTable::from_config` does.
     pub fn superseded_by(&self) -> Vec<Option<usize>> {
         let hosts: Vec<String> = self
             .allow
@@ -1710,7 +1715,7 @@ mod tests {
         assert_eq!(cfg.entries_for_host("*.X.com").len(), 2);
     }
 
-    // ── #243: `superseded_by` — the one "exact host, last-wins" decision ────
+    // ── #243: `superseded_by` — which duplicate exact-host entry wins ──
 
     #[test]
     fn superseded_by_is_all_none_without_duplicates() {
@@ -1839,6 +1844,74 @@ mod tests {
             rules.len(),
             "every compiled exact host is an in-force entry, and vice versa"
         );
+    }
+
+    /// Exhaustive property guard (#243): for EVERY allow-list of up to four
+    /// entries drawn from four spellings (two of them normalize-equal, one a
+    /// wildcard) `superseded_by` and the compile agree on which exact-host
+    /// entry is in force. Each entry carries a distinct port, so the port set
+    /// the compile kept names the winner.
+    #[test]
+    fn superseded_by_agrees_with_the_compile_for_every_small_allow_list() {
+        const SPELLINGS: [&str; 4] = [
+            "a.example.com",
+            "A.example.com.",
+            "b.example.com",
+            "*.a.example.com",
+        ];
+        let mut lists = 0;
+        for len in 0..=4u32 {
+            // Every sequence of `len` spellings, as the base-4 digits of `n`.
+            for n in 0..4usize.pow(len) {
+                lists += 1;
+                let picks: Vec<&str> = (0..len)
+                    .map(|d| SPELLINGS[(n / 4usize.pow(d)) % 4])
+                    .collect();
+                let allow: Vec<AllowEntry> = picks
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &host)| AllowEntry::Scoped {
+                        host: host.into(),
+                        ports: Some(PortSpec::bare_list(&[1000 + pos as u16])),
+                        access: Access::ReadWrite,
+                    })
+                    .collect();
+                let cfg = EgressPolicyConfig {
+                    enforce: true,
+                    allow,
+                    git: vec![],
+                };
+                let ctx = format!("{picks:?}");
+                let superseded = cfg.superseded_by();
+                assert_eq!(superseded.len(), cfg.allow.len(), "{ctx}");
+                let doc: serde_json::Value =
+                    serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+                let rules = doc["sandbox_host_rules"]["web"].as_object();
+                let mut in_force_exact = 0;
+                for (i, e) in cfg.allow.iter().enumerate() {
+                    let host = normalize_policy_host(e.host());
+                    if is_wildcard_host(&host) {
+                        assert_eq!(superseded[i], None, "wildcard entry {i}: {ctx}");
+                        continue;
+                    }
+                    if superseded[i].is_some() {
+                        continue;
+                    }
+                    in_force_exact += 1;
+                    assert_eq!(
+                        rules.expect("an exact host compiled")[&host]["ports"],
+                        serde_json::json!(e.ports()),
+                        "entry {i} ({host}): {ctx}"
+                    );
+                }
+                assert_eq!(
+                    in_force_exact,
+                    rules.map_or(0, |r| r.len()),
+                    "in-force exact entries vs compiled keys: {ctx}"
+                );
+            }
+        }
+        assert_eq!(lists, 341, "1 + 4 + 16 + 64 + 256 lists");
     }
 
     #[test]

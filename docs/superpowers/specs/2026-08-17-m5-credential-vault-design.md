@@ -384,9 +384,10 @@ case below.
   breaks with nothing pointing at the duplicate. A `policy lint` warning would
   close it without touching the fold. Note the deliberate asymmetry:
   `inspect_ports` unions, which is also the safe direction for that set.
-  **Closed by #243**, at the reveal surface rather than as a separate
-  `policy lint`: `izba policy show` marks the superseded entry and reports its
-  declaration as not in effect
+  **Closed for `izba policy show` by #243** (the desktop Policy tab is
+  #312), at the reveal surface rather than as a separate `policy lint`:
+  `izba policy show` marks the superseded entry and reports its
+  declaration as not read
   (`docs/superpowers/specs/2026-10-01-policy-show-superseded-entry-design.md`).
 - **A declined passthrough explains nothing.** When a flow the operator
   declared `protocol: tcp` fails to take the hatch — a record-fragmented
@@ -432,10 +433,10 @@ case below.
   else. `to_rego_data_json` is untouched (D6): `AllowEntry::ports()` still
   answers in `u16`, and the byte-identity guard still passes.
 
-  Two P1 follow-ups above are narrowed by this, not closed: `izba policy allow
-  --protocol http|tcp` is still the missing AUTHORING surface (the command can
-  no longer open a hatch at all), and the superseded-declaration warning has
-  since landed in `izba policy show` (#243).
+  One P1 follow-up above is narrowed by this, not closed: `izba policy
+  allow --protocol http|tcp` is still the missing AUTHORING surface (the
+  command can no longer open a hatch at all). The superseded-declaration
+  warning has since landed in `izba policy show` (#243).
 
 ---
 

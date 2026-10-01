@@ -307,16 +307,23 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   `host_access_ok("read")` requires GET/HEAD); `router::passthrough_names`
   drops the host and the connection stays terminated at L7, so a pinning
   client still sees izba's certificate — the two revealing surfaces must not
-  disagree about posture. A duplicate entry for one EXACT host is superseded
-  wholesale by the later one (the compile's per-host map overwrite), and
-  `izba policy show` says so (#243): the earlier entry is marked
-  `superseded — NOT in force` and a `protocol: tcp` on it reads
-  `NOT in effect`. Which entry wins is decided by `EgressPolicyConfig::superseded_by` and NOWHERE else —
-  `InspectionTable::from_config` builds its passthrough set from the same
-  call, and a guard test pins it against `to_rego_data_json` — so do not fold
-  duplicates in a renderer. The desktop app's Policy tab still lists a
-  superseded row as if in force (#312), the one place the two surfaces
-  currently disagree. `izba status` still renders no egress posture, and
+  disagree about posture. A duplicate entry for one EXACT host is superseded by
+  the later one — its ports, access and any `protocol: tcp` on it (the compile's
+  per-host map overwrite) — and `izba policy show` says so (#243): the earlier
+  entry is marked `superseded — NOT in force`, and a `protocol: tcp` on it reads
+  `NOT in effect`, or `declaration not read` when the winning entry declares
+  `tcp` on that port itself (the winner's own line then states whether the hatch
+  is live). A superseded `protocol: http` is the exception and renders as still
+  in force: `inspect_ports` unions over every entry, so the remedy `policy show`
+  names is to MERGE the duplicates, never to delete one. The renderer does not
+  fold duplicates itself: it asks `EgressPolicyConfig::superseded_by`, the same
+  call `InspectionTable::from_config` builds its passthrough set from, pinned
+  against `to_rego_data_json` by a guard test. That is NOT the tree's only
+  last-wins fold — `collapse_duplicate_hosts` and `manifest::diff::allow_index`
+  each still carry their own and must keep agreeing with the compile. The
+  desktop app's Policy tab still lists a superseded row as if in force (#312),
+  the one place the two surfaces currently disagree. `izba status` still
+  renders no egress posture, and
   `izba policy allow` writes `policy.yaml` without passing the diff/promote
   gate (it can no longer open a hatch, so that gap is now only a reporting
   one). Neither revealing surface can author a hatch, and the desktop editor
