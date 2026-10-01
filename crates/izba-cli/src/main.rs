@@ -335,7 +335,8 @@ enum Cmd {
     /// $IZBA_DATA_DIR); each daemon instance starts a fresh file. Look there
     /// when a command cannot reach the daemon. On Linux the daemon serves
     /// only the user who started it and logs every connection it refuses
-    /// from another user — for example `sudo izba` against your own daemon.
+    /// from another user — for example root pointed at your data directory
+    /// (`sudo -E izba ...`).
     #[command(subcommand)]
     Daemon(DaemonCmd),
     /// Show detailed build info for the CLI and (if running) the daemon
