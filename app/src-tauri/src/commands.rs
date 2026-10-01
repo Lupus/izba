@@ -614,10 +614,25 @@ fn non_blank(v: Option<String>) -> Option<String> {
 /// this one — must never block the next.
 fn replacement_path(out: &std::path::Path) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut name = out.as_os_str().to_os_string();
-    name.push(format!(".{}.{seq}.replacing", std::process::id()));
-    PathBuf::from(name)
+    unused_sibling(|| {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = out.as_os_str().to_os_string();
+        name.push(format!(".{}.{seq}.replacing", std::process::id()));
+        PathBuf::from(name)
+    })
+}
+
+/// The first candidate nothing exists at. A sibling can outlive the app that
+/// wrote it (a complete archive whose final rename failed), and a later run
+/// can be handed the same pid: such a file is the user's, so it is stepped
+/// over — never chosen, and therefore never the file a failed save removes.
+fn unused_sibling(mut candidate: impl FnMut() -> PathBuf) -> PathBuf {
+    loop {
+        let p = candidate();
+        if std::fs::symlink_metadata(&p).is_err() {
+            return p;
+        }
+    }
 }
 
 /// Save sandboxes into a `.izba` archive (`izba save`), forwarding daemon
@@ -1939,6 +1954,26 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("old.izba")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_sibling_that_already_exists_is_stepped_over_and_left_alone() {
+        let dir = scratch_dir("sibling-taken");
+        let taken = dir.join("old.izba.1.0.replacing");
+        std::fs::write(&taken, b"a complete archive from an earlier run").unwrap();
+        let free = dir.join("old.izba.1.1.replacing");
+        let mut offers = vec![free.clone(), taken.clone()];
+        let got = unused_sibling(|| offers.pop().unwrap());
+        assert_eq!(got, free);
+        assert!(
+            offers.is_empty(),
+            "both candidates were considered, in order"
+        );
+        assert_eq!(
+            std::fs::read(&taken).unwrap(),
+            b"a complete archive from an earlier run"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
