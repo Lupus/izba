@@ -9,7 +9,7 @@ license = "Apache-2.0"
 # `usbip` pulls in rusb/nusb, which link libusb — a C library izba's shipped
 # tree must not acquire, and which `cargo clippy --all-targets` and the
 # windows-gnu cross-check would both try to build if this crate were a member.
-# Only the KVM e2e job builds it.
+# Only the two real-VM e2e jobs (linux-kvm, windows-whp) build it.
 [workspace]
 
 [dependencies]

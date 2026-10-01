@@ -795,6 +795,8 @@ jobs:
         run: cargo build --locked --release --manifest-path hack/fake-usbipd/Cargo.toml
       - name: USB passthrough gate (real vhci over vsock 1028, installed-layout kernel)
         if: ${{ !cancelled() }}
+        # A step timeout is a failure, so the `if: failure()` log upload below still runs; a job timeout would cancel and skip it.
+        timeout-minutes: 15
         env:
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
           IZBA_FAKE_USBIPD: ${{ github.workspace }}\hack\fake-usbipd\target\release\fake-usbipd.exe
@@ -810,6 +812,7 @@ jobs:
             ${{ runner.temp }}\tty-data\sandboxes\*\logs\*
             ${{ runner.temp }}\storm-data\sandboxes\*\logs\*
             ${{ runner.temp }}\usb-data\kept-logs\*
+            ${{ runner.temp }}\usb-data\sandboxes\*\logs\*
             ${{ runner.temp }}\usb-data\daemon\daemon.log
           if-no-files-found: ignore
 

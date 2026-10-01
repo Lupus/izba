@@ -190,6 +190,7 @@ finally {
         # this directory.
         $logs = Join-Path $data "sandboxes\$name\logs"
         if (Test-Path $logs) {
+            Remove-Item (Join-Path $data 'kept-logs') -Recurse -Force -ErrorAction SilentlyContinue
             Copy-Item $logs (Join-Path $data 'kept-logs') -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
