@@ -676,6 +676,45 @@ impl EgressPolicyConfig {
             .collect()
     }
 
+    /// Which `allow` entries a LATER entry for the same exact host
+    /// supersedes (#243).
+    ///
+    /// One slot per `self.allow` entry, same indexing: `Some(j)` when entry
+    /// `j` (always `j > i`) is the LAST entry whose host is normalize-equal
+    /// to entry `i`'s — the one `to_rego_data_json`'s `sandbox_host_rules`
+    /// map keeps, because a later `Map::insert` under the same key
+    /// overwrites the earlier entry's whole `{ports, access}` — and `None`
+    /// when entry `i` is itself in force.
+    ///
+    /// A wildcard entry is never superseded: wildcards compile into a LIST
+    /// where every rule grants independently (see
+    /// `collapse_duplicate_hosts`).
+    ///
+    /// This is the ONE place "exact host, last-wins" is decided outside the
+    /// compile itself. `InspectionTable::from_config` builds its passthrough
+    /// set from it and `izba policy show` marks superseded entries from it,
+    /// so the reveal surface and the datapath cannot fold duplicates
+    /// differently; `superseded_by_agrees_with_the_compiled_host_rules` pins
+    /// it against the compile.
+    pub fn superseded_by(&self) -> Vec<Option<usize>> {
+        let hosts: Vec<String> = self
+            .allow
+            .iter()
+            .map(|e| normalize_policy_host(e.host()))
+            .collect();
+        let mut winner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, host) in hosts.iter().enumerate() {
+            if !is_wildcard_host(host) {
+                winner.insert(host, i); // a later index overwrites an earlier one
+            }
+        }
+        hosts
+            .iter()
+            .enumerate()
+            .map(|(i, host)| winner.get(host.as_str()).copied().filter(|&w| w != i))
+            .collect()
+    }
+
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
     ///
@@ -1669,6 +1708,137 @@ mod tests {
             git: vec![],
         };
         assert_eq!(cfg.entries_for_host("*.X.com").len(), 2);
+    }
+
+    // ── #243: `superseded_by` — the one "exact host, last-wins" decision ────
+
+    #[test]
+    fn superseded_by_is_all_none_without_duplicates() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("a.example.com".into()),
+                AllowEntry::Host("b.example.com".into()),
+                AllowEntry::Host("*.example.com".into()),
+            ],
+            git: vec![],
+        };
+        assert_eq!(cfg.superseded_by(), vec![None, None, None]);
+    }
+
+    /// Three entries for one host: BOTH earlier ones point at the LAST
+    /// (index 3), never at their immediate successor — the compile keeps
+    /// only the last `Map::insert`.
+    #[test]
+    fn superseded_by_points_every_earlier_duplicate_at_the_last_one() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("a.example.com".into()),
+                AllowEntry::Host("b.example.com".into()),
+                AllowEntry::Host("a.example.com".into()),
+                AllowEntry::Host("a.example.com".into()),
+            ],
+            git: vec![],
+        };
+        assert_eq!(cfg.superseded_by(), vec![Some(3), None, Some(3), None]);
+    }
+
+    /// Supersession is keyed on `normalize_policy_host` (trim + trailing-dot
+    /// strip + lowercase), the identity the compile uses — not on the raw
+    /// spelling in the file.
+    #[test]
+    fn superseded_by_matches_normalize_equal_spellings() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("API.X.com.".into()),
+                AllowEntry::Host("api.x.com".into()),
+            ],
+            git: vec![],
+        };
+        assert_eq!(cfg.superseded_by(), vec![Some(1), None]);
+    }
+
+    /// Wildcards compile into a LIST where every rule grants independently
+    /// (union) — a duplicate wildcard supersedes nothing, and a wildcard and
+    /// the exact host under it never supersede each other.
+    #[test]
+    fn superseded_by_never_marks_a_wildcard() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "*.x.com".into(),
+                    ports: Some(PortSpec::bare_list(&[443])),
+                    access: Access::ReadWrite,
+                },
+                AllowEntry::Scoped {
+                    host: "*.X.com".into(),
+                    ports: Some(PortSpec::bare_list(&[8443])),
+                    access: Access::Read,
+                },
+                AllowEntry::Host("x.com".into()),
+            ],
+            git: vec![],
+        };
+        assert_eq!(cfg.superseded_by(), vec![None, None, None]);
+    }
+
+    /// Guard (#243): `superseded_by` must describe exactly what
+    /// `to_rego_data_json` compiles. Every exact-host entry it reports as in
+    /// force must be the one sitting in `sandbox_host_rules`, with that
+    /// entry's ports and access; and there must be no compiled host it did
+    /// not account for. If this fails, the reveal surface and the compiled
+    /// policy disagree about which duplicate wins.
+    #[test]
+    fn superseded_by_agrees_with_the_compiled_host_rules() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "dup.example.com".into(),
+                    ports: Some(PortSpec::bare_list(&[8443])),
+                    access: Access::Read,
+                },
+                AllowEntry::Host("solo.example.com".into()),
+                AllowEntry::Host("*.example.com".into()),
+                AllowEntry::Scoped {
+                    host: "DUP.example.com.".into(),
+                    ports: Some(PortSpec::bare_list(&[9443])),
+                    access: Access::ReadWrite,
+                },
+            ],
+            git: vec![],
+        };
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        let rules = doc["sandbox_host_rules"]["web"].as_object().unwrap();
+        let superseded = cfg.superseded_by();
+        assert_eq!(superseded, vec![Some(3), None, None, None]);
+
+        let mut in_force_exact = 0;
+        for (i, e) in cfg.allow.iter().enumerate() {
+            let host = normalize_policy_host(e.host());
+            if is_wildcard_host(&host) || superseded[i].is_some() {
+                continue;
+            }
+            in_force_exact += 1;
+            let access = match e.access() {
+                Access::Read => "read",
+                Access::ReadWrite => "read-write",
+            };
+            assert_eq!(
+                rules[&host]["ports"],
+                serde_json::json!(e.ports()),
+                "{host}"
+            );
+            assert_eq!(rules[&host]["access"], access, "{host}");
+        }
+        assert_eq!(
+            in_force_exact,
+            rules.len(),
+            "every compiled exact host is an in-force entry, and vice versa"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!    derived from a port number is a convenience, never an operator decision
 //!    to disable a control.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::config::{
     is_wildcard_host, normalize_policy_host, AllowEntry, EgressPolicyConfig, Protocol,
@@ -87,19 +87,18 @@ impl InspectionTable {
         }
 
         // passthrough: LAST-WINS per exact host, mirroring `to_rego_data_json`.
-        // Wildcards are excluded from this map entirely — `parse_allow_entry`
-        // refuses an explicit `tcp` on a wildcard (DP-3), and this guard keeps
-        // the invariant true for a config built in code rather than parsed —
-        // so "exact host, last-wins" is the whole rule; no wildcard ever
-        // reaches it.
-        let mut winner_by_host: BTreeMap<String, usize> = BTreeMap::new();
+        // The fold itself lives in `EgressPolicyConfig::superseded_by` — the
+        // same answer `izba policy show` renders (#243) — so this table and
+        // the reveal surface cannot disagree about which duplicate wins.
+        // Wildcards are excluded entirely — `parse_allow_entry` refuses an
+        // explicit `tcp` on a wildcard (DP-3), and this guard keeps the
+        // invariant true for a config built in code rather than parsed.
+        let superseded = cfg.superseded_by();
         for (idx, e) in cfg.allow.iter().enumerate() {
             let host = normalize_policy_host(e.host());
-            if !is_wildcard_host(&host) {
-                winner_by_host.insert(host, idx); // later idx overwrites earlier
+            if is_wildcard_host(&host) || superseded[idx].is_some() {
+                continue;
             }
-        }
-        for (host, idx) in &winner_by_host {
             // Per-PORT since #238: a port registers a passthrough only when a
             // declaration was written against that port. There is no
             // entry-level declaration left to project onto the entry's other
@@ -116,7 +115,6 @@ impl InspectionTable {
             // `parse_allow_entry` now refuses that input, but this fold must
             // not depend on the parser having been the only way in —
             // `AllowEntry::Scoped`'s fields are public.
-            let e = &cfg.allow[*idx];
             for port in e.ports() {
                 if e.declared_protocol_for(port) == Some(Protocol::Tcp) {
                     passthrough.insert((host.clone(), port));
