@@ -3543,7 +3543,10 @@ fn foreign_uid_client_is_refused_without_spawning_a_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("izba");
     let my_uid = std::fs::metadata(dir.path()).unwrap().uid();
-    assert_ne!(my_uid, 0, "the test itself must not run as root");
+    if my_uid == 0 {
+        eprintln!("SKIP: needs a non-root owner for the daemon (the suite is running as root)");
+        return;
+    }
 
     // Auto-start the user's daemon.
     assert_ok(&izba(&data, &[], &["ls"]), "ls (starts the daemon)");
@@ -3551,11 +3554,19 @@ fn foreign_uid_client_is_refused_without_spawning_a_daemon() {
     let log = data.join("daemon").join("daemon.log");
 
     let as_root = |args: &[&str]| {
-        std::process::Command::new("sudo")
-            .arg("-n")
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n")
             .arg("env")
-            .arg(format!("IZBA_DATA_DIR={}", data.display()))
-            .arg(env!("CARGO_BIN_EXE_izba"))
+            .arg(format!("IZBA_DATA_DIR={}", data.display()));
+        // sudo resets the environment: forward the coverage profile so the
+        // instrumented root `izba` neither loses its data nor litters a
+        // root-owned `default_*.profraw` in the crate directory.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            let mut arg = std::ffi::OsString::from("LLVM_PROFILE_FILE=");
+            arg.push(profile);
+            cmd.arg(arg);
+        }
+        cmd.arg(env!("CARGO_BIN_EXE_izba"))
             .args(args)
             .output()
             .expect("run izba as root")
