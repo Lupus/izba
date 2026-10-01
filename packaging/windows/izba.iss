@@ -10,6 +10,11 @@
 ;   <StageDir>\artifacts\vmlinux
 ;   <StageDir>\artifacts\vmlinux-usb
 ;   <StageDir>\artifacts\initramfs.cpio.gz
+;   <StageDir>\artifacts\kasmvnc.erofs
+; The artifacts\ and bin\libexec\ entries below are GLOBS: a file missing from
+; the stage is silently left out of the installer. Run
+;   packaging/verify-payload.sh stage <StageDir>
+; before iscc (the release and devbuild workflows do).
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"

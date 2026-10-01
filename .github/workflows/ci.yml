@@ -118,6 +118,8 @@ jobs:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Run fetch-openvmm.sh fallback tests
         run: python3 hack/fetch-openvmm.test.py
+      - name: Run installer payload verifier tests
+        run: python3 packaging/verify-payload.test.py
 
   dogfood-harness:
     # The LLM-dogfooding harness (hack/dogfood/**) is pure-stdlib Python with its

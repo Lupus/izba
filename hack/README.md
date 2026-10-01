@@ -407,3 +407,10 @@ iscc /DMyAppVersion=<ver> /DStageDir=<abs stage dir> /O<abs out dir> packaging/w
 It expects the stage dir to contain `bin/izba.exe`, `bin/libexec/{openvmm.exe,
 mkfs.erofs.exe}`, and `artifacts/{vmlinux, initramfs.cpio.gz}`, and installs them
 under `%ProgramFiles%\izba`, adding `%ProgramFiles%\izba\bin` to the system PATH.
+
+`packaging/verify-payload.sh` asserts that an installer payload carries every
+boot artifact and VMM tool: `verify-payload.sh deb <izba_*.deb>` reads the built
+package's contents, `verify-payload.sh stage <StageDir>` checks the Windows
+installer's input directory (which `izba.iss` installs by glob, so an absent
+file would otherwise be omitted silently). Both packaging workflows run it on
+every build; its own tests are `python3 packaging/verify-payload.test.py`.
