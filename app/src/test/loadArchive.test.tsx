@@ -300,4 +300,31 @@ describe("LoadArchive", () => {
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog", { name: "Load sandboxes" })).toBeInTheDocument();
   });
+
+  it("never lets an older read replace a newer listing of the same path", async () => {
+    const finish: ((a: typeof archive) => void)[] = [];
+    archiveInspect.mockImplementation(() => new Promise((res) => finish.push(res)));
+    setup();
+    const readButton = () => screen.getByRole("button", { name: "Read archive" });
+    setPath("/in/a.izba");
+    fireEvent.click(readButton());
+    setPath("/in/b.izba");
+    setPath("/in/a.izba");
+    fireEvent.click(readButton());
+    await waitFor(() => expect(finish).toHaveLength(2));
+    const newer = {
+      ...archive,
+      sandboxes: [
+        { name: "fresh", workspace_bundled: true, source_workspace: "/src/fresh", locked: false },
+      ],
+    };
+    finish[1](newer);
+    await screen.findByRole("checkbox", { name: "Load fresh" });
+    // The first read of the same path answers last, with what the file held before.
+    finish[0](archive);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.getByRole("checkbox", { name: "Load fresh" })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Load web" })).toBeNull();
+  });
 });

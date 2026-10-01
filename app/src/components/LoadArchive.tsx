@@ -51,9 +51,9 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<string[]>([]);
   const [report, setReport] = useState<LoadReport | null>(null);
-  // Latest path, readable from a read that resolves after the user moved on.
-  const pathRef = useRef("");
-  // Id of the newest read: only that one may clear the busy state.
+  // Bumped by every read AND every path edit: a read whose number is no
+  // longer the latest was overtaken (by a newer read, or by the user moving
+  // to another path) and must not touch the dialog's state.
   const readSeq = useRef(0);
 
   useEffect(() => {
@@ -63,7 +63,7 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
   }, []);
 
   function changePath(v: string) {
-    pathRef.current = v;
+    readSeq.current += 1;
     setPath(v);
     setInfo(null);
     setPicked(new Set());
@@ -81,13 +81,13 @@ export function LoadArchive({ existing, onClose, onLoaded }: Readonly<Props>) {
     setError(null);
     try {
       const got = await api.archiveInspect(target.trim());
-      if (pathRef.current !== target) return;
+      if (readSeq.current !== seq) return;
       setInfo(got);
       setPicked(new Set(got.sandboxes.map((s) => s.name)));
     } catch (e) {
-      if (pathRef.current === target) setError(e instanceof Error ? e.message : String(e));
+      if (readSeq.current === seq) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (readSeq.current === seq && pathRef.current === target) setReading(false);
+      if (readSeq.current === seq) setReading(false);
     }
   }
 
