@@ -55,6 +55,9 @@ export function SaveArchive({ sandboxes, initial, onClose, onSaved }: Readonly<P
     .map((s) => s.name);
 
   function toggle(name: string, on: boolean) {
+    // Consent to stop was given for the selection as it stood; a different
+    // selection may stop a different sandbox, so it has to be given again.
+    setStop(false);
     setPicked((prev) => {
       const next = new Set(prev);
       if (on) next.add(name);
@@ -111,7 +114,9 @@ export function SaveArchive({ sandboxes, initial, onClose, onSaved }: Readonly<P
     <Dialog
       open={true}
       onOpenChange={(open) => {
-        if (!open) onClose();
+        // The daemon keeps going whether or not the dialog is open; closing
+        // mid-save would only hide the outcome (and any warnings) from the user.
+        if (!open && !busy) onClose();
       }}
     >
       <DialogContent className="max-w-lg overflow-y-auto max-h-screen sm:max-h-screen">
@@ -217,7 +222,7 @@ export function SaveArchive({ sandboxes, initial, onClose, onSaved }: Readonly<P
             {error && <div className="mt-3 text-sm text-destructive">{error}</div>}
 
             <DialogFooter className="gap-2">
-              <Button type="button" variant="ghost" onClick={onClose}>
+              <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
                 Cancel
               </Button>
               <Button

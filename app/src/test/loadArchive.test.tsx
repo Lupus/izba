@@ -236,4 +236,68 @@ describe("LoadArchive", () => {
     expect(await screen.findByText("not enough free space")).toBeInTheDocument();
     expect(loadButton()).toBeEnabled();
   });
+
+  it("does not carry a new name or folder over to a different sandbox", async () => {
+    setup();
+    await read();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Load db" }));
+    fireEvent.change(screen.getByLabelText("Load as"), { target: { value: "web2" } });
+    fireEvent.change(screen.getByLabelText("Workspace folder"), {
+      target: { value: "/home/u/web2" },
+    });
+    // Switch the single selection from web to db.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Load db" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Load web" }));
+    expect(screen.getByLabelText("Load as")).toHaveValue("");
+    expect(screen.getByLabelText("Workspace folder")).toHaveValue("");
+    fireEvent.click(loadButton());
+    await waitFor(() =>
+      expect(loadArchive).toHaveBeenCalledWith(
+        expect.objectContaining({ select: ["db"], rename: null, workspace: null }),
+      ),
+    );
+  });
+
+  it("does not carry placement options over to a different archive", async () => {
+    setup();
+    await read();
+    fireEvent.change(screen.getByLabelText("Workspace parent folder"), {
+      target: { value: "/home/u/moved" },
+    });
+    await read("/in/other.izba");
+    expect(screen.getByLabelText("Workspace parent folder")).toHaveValue("");
+  });
+
+  it("keeps Read archive busy until the latest read finishes", async () => {
+    const finish: ((a: typeof archive) => void)[] = [];
+    archiveInspect.mockImplementation(() => new Promise((res) => finish.push(res)));
+    setup();
+    const readButton = () => screen.getByRole("button", { name: "Read archive" });
+    setPath("/in/a.izba");
+    fireEvent.click(readButton());
+    setPath("/in/b.izba");
+    // The path changed, so a fresh read may start even though A is in flight.
+    fireEvent.click(readButton());
+    await waitFor(() => expect(finish).toHaveLength(2));
+    finish[0](archive);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(readButton()).toBeDisabled();
+    finish[1](archive);
+    await screen.findByRole("checkbox", { name: "Load web" });
+    expect(readButton()).toBeEnabled();
+  });
+
+  it("cannot be dismissed while the load is running", async () => {
+    loadArchive.mockReturnValue(new Promise(() => {}));
+    const { onClose } = setup();
+    await read();
+    fireEvent.click(loadButton());
+    await waitFor(() => expect(loadArchive).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Load sandboxes" })).toBeInTheDocument();
+  });
 });

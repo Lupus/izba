@@ -609,9 +609,14 @@ fn non_blank(v: Option<String>) -> Option<String> {
 
 /// Where the daemon writes when the user agreed to replace `out`: a sibling
 /// in the same directory, so the final swap is a same-filesystem rename.
+/// Unique per attempt (pid + a process-wide counter): the daemon refuses an
+/// existing output, so a leftover from one attempt — or a second save racing
+/// this one — must never block the next.
 fn replacement_path(out: &std::path::Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = out.as_os_str().to_os_string();
-    name.push(format!(".{}.replacing", std::process::id()));
+    name.push(format!(".{}.{seq}.replacing", std::process::id()));
     PathBuf::from(name)
 }
 
@@ -647,17 +652,26 @@ pub fn save_archive_core(
     } else {
         out.clone()
     };
-    let mut report = d
-        .save(
-            SaveArchive {
-                names: opts.names,
-                out: target.clone(),
-                with_workspace: opts.with_workspace,
-                stop: opts.stop,
-            },
-            on_progress,
-        )
-        .map_err(|e| e.to_string())?;
+    let saved = d.save(
+        SaveArchive {
+            names: opts.names,
+            out: target.clone(),
+            with_workspace: opts.with_workspace,
+            stop: opts.stop,
+        },
+        on_progress,
+    );
+    let mut report = match saved {
+        Ok(r) => r,
+        Err(e) => {
+            if replacing {
+                // Whatever a failed save left at the sibling is not an
+                // archive; `out` itself was never the daemon's target.
+                let _ = std::fs::remove_file(&target);
+            }
+            return Err(e.to_string());
+        }
+    };
     if replacing {
         std::fs::rename(&target, &out).map_err(|e| {
             format!(
@@ -1889,6 +1903,42 @@ mod tests {
         assert!(e.contains("archive"), "{e}");
         let e = archive_inspect_core("  ").unwrap_err();
         assert!(e.contains("choose an archive"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn each_replacement_attempt_writes_to_its_own_sibling() {
+        let out = std::env::temp_dir().join("old.izba");
+        let a = replacement_path(&out);
+        let b = replacement_path(&out);
+        assert_ne!(a, b, "a leftover from one attempt must not block the next");
+        for p in [&a, &b] {
+            assert_eq!(p.parent(), out.parent(), "same dir => the swap is a rename");
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with("old.izba."), "{name}");
+            assert!(name.ends_with(".replacing"), "{name}");
+        }
+    }
+
+    #[test]
+    fn save_archive_core_leaves_no_sibling_behind_when_the_save_fails_midway() {
+        let dir = scratch_dir("save-midway");
+        let out = dir.join("old.izba");
+        std::fs::write(&out, b"old archive").unwrap();
+        let mut d = FakeDaemon {
+            save_fail_after_write: true,
+            ..Default::default()
+        };
+        let mut opts = save_opts(&out);
+        opts.overwrite = true;
+        let e = save_archive_core(&mut d, opts, &mut |_| {}).unwrap_err();
+        assert!(e.contains("disk full"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"old archive");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("old.izba")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

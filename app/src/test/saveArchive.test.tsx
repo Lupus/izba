@@ -189,4 +189,36 @@ describe("SaveArchive", () => {
     expect(await screen.findByText(/already exists/)).toBeInTheDocument();
     expect(saveButton()).toBeEnabled();
   });
+
+  it("asks again before stopping when the selection changes", () => {
+    render(
+      <SaveArchive
+        sandboxes={[...sandboxes, { name: "api", image: "node:22", state: { kind: "running" } }]}
+        initial="web"
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    setPath("/backups/x.izba");
+    const stop = () => screen.getByRole("checkbox", { name: /stop running sandboxes/i });
+    fireEvent.click(stop());
+    expect(saveButton()).toBeEnabled();
+    // Consent was for stopping web; api was not part of it.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Save api" }));
+    expect(stop()).not.toBeChecked();
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("cannot be dismissed while the save is running", async () => {
+    saveArchive.mockReturnValue(new Promise(() => {}));
+    const { onClose } = setup("db");
+    setPath("/backups/db.izba");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(saveArchive).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Save sandboxes" })).toBeInTheDocument();
+  });
 });

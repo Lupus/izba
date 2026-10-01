@@ -83,6 +83,8 @@ pub struct FakeDaemon {
     pub lockdown_account: Option<String>,
     /// Recorded fact echoed by `inspect`.
     pub lockdown_restart_required: bool,
+    /// `save` fails AFTER leaving a file at its output path.
+    pub save_fail_after_write: bool,
     /// `remove` fails (unlike `fail_action`, leaves every other verb working).
     pub fail_remove: bool,
     /// Simulates another client recreating a same-name, lock-down-carrying
@@ -146,6 +148,7 @@ impl Default for FakeDaemon {
             unlock_fail: None,
             lockdown_account: None,
             lockdown_restart_required: false,
+            save_fail_after_write: false,
             fail_remove: false,
             relock_after_remove: false,
         }
@@ -236,6 +239,9 @@ impl DaemonApi for FakeDaemon {
         // Like the real daemon, leave a file at `out` (best-effort: most
         // tests name a path whose parent does not exist).
         let _ = std::fs::write(&req.out, b"fake archive");
+        if self.save_fail_after_write {
+            anyhow::bail!("disk full");
+        }
         Ok(izba_core::bundle::save::SaveReport {
             path: req.out,
             sandboxes: req.names,
