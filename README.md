@@ -68,7 +68,10 @@ Key properties:
   TLS-pinning passthrough, printed against the specific port that carries it.
   `izba status` renders no egress posture at all, so "nothing unusual in
   `izba status`" is *not* evidence that nothing is bypassing the firewall; ask
-  `izba policy show` (or the desktop app's Policy tab).
+  `izba policy show` (or the desktop app's Policy tab). If `policy.yaml` names
+  the same exact host twice, the later entry replaces the earlier one
+  wholesale; `policy show` marks the earlier one `superseded — NOT in force`,
+  so a passthrough declared only there is reported as not in effect.
 
   A `policy.yaml` allow entry is a bare host (web ports 80/443 only) or an
   explicit host+ports pair, and the file carries the enforce posture plus

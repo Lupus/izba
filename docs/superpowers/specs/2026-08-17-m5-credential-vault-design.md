@@ -384,6 +384,10 @@ case below.
   breaks with nothing pointing at the duplicate. A `policy lint` warning would
   close it without touching the fold. Note the deliberate asymmetry:
   `inspect_ports` unions, which is also the safe direction for that set.
+  **Closed by #243**, at the reveal surface rather than as a separate
+  `policy lint`: `izba policy show` marks the superseded entry and reports its
+  declaration as not in effect
+  (`docs/superpowers/specs/2026-10-01-policy-show-superseded-entry-design.md`).
 - **A declined passthrough explains nothing.** When a flow the operator
   declared `protocol: tcp` fails to take the hatch — a record-fragmented
   ClientHello exhausting the peek budget, an SNI absent from the DNS-snoop
@@ -430,8 +434,8 @@ case below.
 
   Two P1 follow-ups above are narrowed by this, not closed: `izba policy allow
   --protocol http|tcp` is still the missing AUTHORING surface (the command can
-  no longer open a hatch at all), and the superseded-declaration warning is
-  still a `policy lint` job.
+  no longer open a hatch at all), and the superseded-declaration warning has
+  since landed in `izba policy show` (#243).
 
 ---
 

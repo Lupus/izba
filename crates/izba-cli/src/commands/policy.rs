@@ -416,9 +416,11 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     );
                 }
                 let _ = writeln!(out, "  http allow-list:");
-                for e in &cfg.allow {
-                    let specs = e.port_specs();
-                    let ports = specs
+                // `host  [ports] (access)` — the host line's body, and the
+                // way a superseding entry is named in the line below.
+                let summary = |e: &AllowEntry| {
+                    let ports = e
+                        .port_specs()
                         .iter()
                         .map(|s| s.port.to_string())
                         .collect::<Vec<_>>()
@@ -427,7 +429,32 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                         Access::Read => "read",
                         Access::ReadWrite => "read-write",
                     };
-                    let _ = writeln!(out, "    {}  [{ports}] ({access_str})", e.host());
+                    format!("{}  [{ports}] ({access_str})", e.host())
+                };
+                // Duplicate entries for one EXACT host do not add up: the
+                // compile keeps only the last (#243). Asked of the core
+                // rather than folded here — a renderer-local fold is a second
+                // reading of the allow-list, and the last time two readings
+                // of it disagreed a host the allow-list denied was spliced
+                // with no certificate verification.
+                let superseded = cfg.superseded_by();
+                for (idx, e) in cfg.allow.iter().enumerate() {
+                    let specs = e.port_specs();
+                    let winner = superseded[idx].map(|w| &cfg.allow[w]);
+                    let _ = writeln!(out, "    {}", summary(e));
+                    // Everything this entry says — ports, access, any
+                    // declaration below — is not what is enforced. Said
+                    // against the entry itself, naming the one that is, so
+                    // the operator can find both lines in the file.
+                    if let Some(w) = winner {
+                        let _ = writeln!(
+                            out,
+                            "        \u{26A0} superseded — NOT in force: a later entry for this \
+                             host ({}) replaces this one wholesale; the last entry for an exact \
+                             host wins — remove the duplicate",
+                            summary(w)
+                        );
+                    }
                     // The inspectability axis (M5 §5), rendered against the
                     // SPECIFIC port that carries it (#238) — the declaration
                     // is per-port, so a line that named only the host would
@@ -450,6 +477,17 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                             Some(Protocol::Http) => {
                                 format!(":{} protocol: http (inspected)", s.port)
                             }
+                            // Superseded outranks both branches below: their
+                            // remedies ("turn enforcement on", "widen to
+                            // read-write") would not pin an entry the compile
+                            // never reads.
+                            Some(Protocol::Tcp) if winner.is_some() => format!(
+                                "\u{26A0} :{} protocol: tcp — pinning passthrough NOT in \
+                                 effect: this entry is superseded by a later entry for the \
+                                 same host, so its declaration is never read; declare it on \
+                                 the later entry (or remove that entry) to pin",
+                                s.port
+                            ),
                             // Enforcement off ⇒ nothing is terminated, so
                             // there is nothing to splice:
                             // `router::passthrough_names` returns empty for a
@@ -1925,6 +1963,277 @@ mod tests {
         assert!(
             !out.contains("NOT in effect"),
             "the cancellation wording belongs only to the narrowed-access case:\n{out}"
+        );
+    }
+
+    /// #243 guard: a policy with no duplicate exact hosts renders
+    /// byte-identically to how it did before supersession was rendered.
+    /// Whole-output equality, so any stray line or reworded annotation fails.
+    #[test]
+    fn show_renders_a_duplicate_free_policy_byte_identically() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - api.example.com\n\
+             \x20 - host: internal.example.com\n\
+             \x20   ports: [8000]\n\
+             \x20   protocol: http\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n\
+             \x20 - host: ro.example.com\n\
+             \x20   access: read\n\
+             \x20 - \"*.example.org\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render_policy("web", Some(&cfg)),
+            "'web' egress policy (enforce: on):\n\
+             \x20 http allow-list:\n\
+             \x20   api.example.com  [80, 443] (read-write)\n\
+             \x20   internal.example.com  [8000] (read-write)\n\
+             \x20       :8000 protocol: http (inspected)\n\
+             \x20   pinned.vendor.com  [443] (read-write)\n\
+             \x20       \u{26A0} :443 protocol: tcp — pinning passthrough: spliced opaquely; \
+             no L7 rules, no request audit, no upstream certificate verification\n\
+             \x20   ro.example.com  [80, 443] (read)\n\
+             \x20   *.example.org  [80, 443] (read-write)\n"
+        );
+    }
+
+    // ── #243: a superseded duplicate exact-host entry ───────────────────────
+
+    /// The issue's reproducer: an earlier `protocol: tcp` entry superseded by
+    /// a later bare entry for the same host. `InspectionTable` registers no
+    /// passthrough; `policy show` used to print the in-force line anyway.
+    #[test]
+    fn show_marks_a_superseded_entry_and_its_passthrough_as_not_in_force() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n\
+             \x20 - pinned.vendor.com\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render_policy("web", Some(&cfg)),
+            "'web' egress policy (enforce: on):\n\
+             \x20 http allow-list:\n\
+             \x20   pinned.vendor.com  [443] (read-write)\n\
+             \x20       \u{26A0} superseded — NOT in force: a later entry for this host \
+             (pinned.vendor.com  [80, 443] (read-write)) replaces this one wholesale; \
+             the last entry for an exact host wins — remove the duplicate\n\
+             \x20       \u{26A0} :443 protocol: tcp — pinning passthrough NOT in effect: this \
+             entry is superseded by a later entry for the same host, so its declaration is \
+             never read; declare it on the later entry (or remove that entry) to pin\n\
+             \x20   pinned.vendor.com  [80, 443] (read-write)\n"
+        );
+    }
+
+    /// The inverse ordering: the `protocol: tcp` entry is LAST, so it wins and
+    /// the passthrough is in force — matching `InspectionTable`'s fold. The
+    /// earlier bare entry is the superseded one.
+    #[test]
+    fn show_keeps_a_later_passthrough_in_force_over_an_earlier_bare_entry() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - pinned.vendor.com\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render_policy("web", Some(&cfg)),
+            "'web' egress policy (enforce: on):\n\
+             \x20 http allow-list:\n\
+             \x20   pinned.vendor.com  [80, 443] (read-write)\n\
+             \x20       \u{26A0} superseded — NOT in force: a later entry for this host \
+             (pinned.vendor.com  [443] (read-write)) replaces this one wholesale; \
+             the last entry for an exact host wins — remove the duplicate\n\
+             \x20   pinned.vendor.com  [443] (read-write)\n\
+             \x20       \u{26A0} :443 protocol: tcp — pinning passthrough: spliced opaquely; \
+             no L7 rules, no request audit, no upstream certificate verification\n"
+        );
+    }
+
+    /// Both duplicates declare `tcp` on :443 — the passthrough IS in force,
+    /// through the winner. Exactly one in-force line, and it belongs to the
+    /// last entry.
+    #[test]
+    fn show_keeps_the_winning_entrys_passthrough_in_force() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert_eq!(out.matches("spliced opaquely").count(), 1, "{out}");
+        assert_eq!(out.matches("superseded — NOT in force").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("pinning passthrough NOT in effect").count(),
+            1,
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "    pinned.vendor.com  [443] (read-write)\n        \u{26A0} :443 protocol: tcp \
+                 — pinning passthrough: spliced opaquely; no L7 rules, no request audit, no \
+                 upstream certificate verification\n"
+            ),
+            "the in-force line belongs to the LAST entry:\n{out}"
+        );
+    }
+
+    /// Three duplicates: both earlier entries name the LAST one as the
+    /// winner (ports [9999]), never the middle one (ports [8443]).
+    #[test]
+    fn show_names_the_last_duplicate_as_the_winner() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: dup.example.com\n\
+             \x20   ports: [443]\n\
+             \x20 - host: dup.example.com\n\
+             \x20   ports: [8443]\n\
+             \x20 - host: dup.example.com\n\
+             \x20   ports: [9999]\n\
+             \x20   access: read\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert_eq!(
+            out.matches("a later entry for this host (dup.example.com  [9999] (read))")
+                .count(),
+            2,
+            "{out}"
+        );
+        assert!(
+            !out.contains("a later entry for this host (dup.example.com  [8443]"),
+            "the middle duplicate is itself superseded — it is never the winner:\n{out}"
+        );
+        assert_eq!(out.matches("superseded — NOT in force").count(), 2, "{out}");
+    }
+
+    /// Supersession is keyed on the normalized host, so a differently-spelled
+    /// earlier entry is superseded too.
+    #[test]
+    fn show_marks_a_superseded_entry_under_a_different_spelling() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("Pinned.Vendor.COM.".into()),
+                AllowEntry::Host("pinned.vendor.com".into()),
+            ],
+            git: vec![],
+        };
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains(
+                "    Pinned.Vendor.COM.  [80, 443] (read-write)\n        \u{26A0} superseded \
+                 — NOT in force: a later entry for this host (pinned.vendor.com  [80, 443] \
+                 (read-write))"
+            ),
+            "{out}"
+        );
+        assert_eq!(out.matches("superseded — NOT in force").count(), 1, "{out}");
+    }
+
+    /// Wildcards union — a duplicate wildcard supersedes nothing, and a
+    /// wildcard does not supersede (nor is superseded by) an exact host.
+    #[test]
+    fn show_never_marks_a_wildcard_duplicate_as_superseded() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: \"*.example.com\"\n\
+             \x20   ports: [443]\n\
+             \x20 - host: \"*.example.com\"\n\
+             \x20   ports: [8443]\n\
+             \x20   access: read\n\
+             \x20 - example.com\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(!out.contains("superseded"), "{out}");
+    }
+
+    /// With enforcement off the existing wording ends "turn enforcement on to
+    /// pin" — a false remedy for an entry that is never read. The superseded
+    /// wording must win.
+    #[test]
+    fn show_prefers_the_superseded_wording_over_the_enforce_off_wording() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: false\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n\
+             \x20 - pinned.vendor.com\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("this entry is superseded by a later entry for the same host"),
+            "{out}"
+        );
+        assert!(!out.contains("turn enforcement on to pin"), "{out}");
+    }
+
+    /// Likewise for a narrow access level: "widen to read-write to pin" would
+    /// not pin a superseded entry.
+    #[test]
+    fn show_prefers_the_superseded_wording_over_the_narrow_access_wording() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   access: read\n\
+             \x20   protocol: tcp\n\
+             \x20 - pinned.vendor.com\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("this entry is superseded by a later entry for the same host"),
+            "{out}"
+        );
+        assert!(!out.contains("widen to read-write to pin"), "{out}");
+    }
+
+    /// A superseded entry's `protocol: http` line stays: `inspect_ports`
+    /// unions over EVERY entry, superseded ones included, so the port really
+    /// is inspected.
+    #[test]
+    fn show_keeps_the_inspected_line_on_a_superseded_entry() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: internal.example.com\n\
+             \x20   ports: [8000]\n\
+             \x20   protocol: http\n\
+             \x20 - internal.example.com\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("        :8000 protocol: http (inspected)\n"),
+            "{out}"
+        );
+        assert_eq!(out.matches("superseded — NOT in force").count(), 1, "{out}");
+        assert!(
+            izba_core::daemon::egress::inspect::InspectionTable::from_config(&cfg).inspects(8000),
+            "the rendering claim must match the table"
         );
     }
 
