@@ -202,7 +202,9 @@ clears `IZBA_KERNEL` / `IZBA_KERNEL_USB` / `IZBA_INITRAMFS` and uses a fresh
 data root, so the kernel is resolved from `<exe-dir>\..\artifacts` exactly as
 an installed build does. Env: `IZBA_EXE`, `IZBA_FAKE_USBIPD` (required),
 `IZBA_IMAGE` (default `alpine:3.20`), `IZBA_DATA_DIR` (default: a per-run dir
-under `%TEMP%`).
+under `%TEMP%`). On a failure it copies the sandbox's logs to
+`<data root>\kept-logs` before removing the sandbox (which deletes them) and
+keeps the data root.
 
 ### `fetch-artifacts.sh`
 
