@@ -194,7 +194,12 @@ finally {
             Copy-Item $logs (Join-Path $data 'kept-logs') -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # A removal that fails must fail the gate: `ALL PASS` over a VM that is
+    # still running would also delete the data root out from under it. Only
+    # asserted when there is a sandbox to remove (an early abort creates none).
+    $hadSandbox = Test-Path (Join-Path $data "sandboxes\$name")
     & $exe rm --force $name 2>$null | Out-Null
+    if ($hadSandbox) { Check 'sandbox removal exits 0' ($LASTEXITCODE -eq 0) }
     & $exe daemon stop 2>$null | Out-Null
     if ($null -ne $fakeProc -and -not $fakeProc.HasExited) {
         Stop-Process -Id $fakeProc.Id -Force -ErrorAction SilentlyContinue
