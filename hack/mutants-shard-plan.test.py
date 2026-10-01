@@ -80,7 +80,7 @@ check(
     "default outputs cover both platforms",
     default_keys == {"mutants", "linux_shards", "linux_n", "windows_shards", "windows_n"},
 )
-kv = dict(line.split("=", 1) for line in sp.github_outputs(641))
+kv = {k: v for k, v in (line.split("=", 1) for line in sp.github_outputs(641))}
 for plat in ("linux", "windows"):
     check(
         f"{plat}_shards parses as JSON [0..N)",
