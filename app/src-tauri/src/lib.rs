@@ -1794,13 +1794,15 @@ mod dispatch_tests {
     fn dispatch_archive_inspect_reports_an_unreadable_archive() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
+        // Absolute on every OS (a bare "/x" is not absolute on Windows).
+        let missing = std::env::temp_dir().join("izba-app-dispatch-not-here.izba");
         let e = dispatch(
             &st,
             "archive_inspect",
-            serde_json::json!({"path": "/definitely/not/here.izba"}),
+            serde_json::json!({"path": missing.to_string_lossy()}),
             &mut emit,
         )
         .unwrap_err();
-        assert!(e.contains("here.izba"), "{e}");
+        assert!(e.contains("not-here.izba"), "{e}");
     }
 }
