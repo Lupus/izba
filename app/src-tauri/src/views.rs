@@ -723,6 +723,141 @@ impl From<SandboxStats> for SandboxStatsView {
     }
 }
 
+/// Save-dialog options (`izba save`). `overwrite` is the user's answer to the
+/// native save dialog's "replace?" prompt — see `commands::save_archive_core`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaveArchiveOpts {
+    pub names: Vec<String>,
+    pub out: String,
+    #[serde(default)]
+    pub with_workspace: bool,
+    /// Stop the selected sandboxes that are still running (`--stop`).
+    #[serde(default)]
+    pub stop: bool,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// Load-dialog options (`izba load`). Blank optional fields mean "not given".
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadArchiveOpts {
+    pub archive: String,
+    /// Archived names to load; empty = everything in the archive.
+    #[serde(default)]
+    pub select: Vec<String>,
+    /// New name (`--as`); needs exactly one selected sandbox.
+    #[serde(default)]
+    pub rename: Option<String>,
+    /// Explicit workspace dir (`--workspace`); needs exactly one sandbox.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Parent dir for every workspace (`--workspace-root`).
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+/// Outcome of a save, paths rendered for display.
+#[derive(Debug, Clone, Serialize)]
+pub struct SaveReportView {
+    pub path: String,
+    pub sandboxes: Vec<String>,
+    pub logical_bytes: u64,
+    pub archive_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+impl From<izba_core::bundle::save::SaveReport> for SaveReportView {
+    fn from(r: izba_core::bundle::save::SaveReport) -> Self {
+        SaveReportView {
+            path: izba_core::paths::display_path(&r.path),
+            sandboxes: r.sandboxes,
+            logical_bytes: r.logical_bytes,
+            archive_bytes: r.archive_bytes,
+            warnings: r.warnings,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadedSandboxView {
+    pub name: String,
+    pub image: String,
+    pub workspace: String,
+}
+
+/// Outcome of a load: what arrived, what to know, what to redo on this host.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadReportView {
+    pub sandboxes: Vec<LoadedSandboxView>,
+    pub warnings: Vec<String>,
+    pub redo: Vec<String>,
+}
+
+impl From<izba_core::bundle::load::LoadReport> for LoadReportView {
+    fn from(r: izba_core::bundle::load::LoadReport) -> Self {
+        LoadReportView {
+            sandboxes: r
+                .sandboxes
+                .into_iter()
+                .map(|s| LoadedSandboxView {
+                    name: s.name,
+                    image: s.image_ref,
+                    workspace: izba_core::paths::display_path(&s.workspace),
+                })
+                .collect(),
+            warnings: r.warnings,
+            redo: r.redo,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveSandboxView {
+    pub name: String,
+    /// The archive carries this sandbox's workspace folder.
+    pub workspace_bundled: bool,
+    /// Where the workspace lived on the machine that saved it.
+    pub source_workspace: String,
+    /// Locked down on the source host (lock-down is never carried over).
+    pub locked: bool,
+}
+
+/// What an archive holds, for the Load dialog (from its manifest).
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveView {
+    pub izba_version: String,
+    /// "linux" | "windows" | "other".
+    pub source_os: String,
+    pub created_unix_ms: u64,
+    pub sandboxes: Vec<ArchiveSandboxView>,
+}
+
+impl From<izba_core::bundle::manifest::Manifest> for ArchiveView {
+    fn from(m: izba_core::bundle::manifest::Manifest) -> Self {
+        use izba_core::bundle::manifest::SourceOs;
+        ArchiveView {
+            izba_version: m.izba_version,
+            source_os: match m.source_os {
+                SourceOs::Linux => "linux",
+                SourceOs::Windows => "windows",
+                SourceOs::Other => "other",
+            }
+            .to_string(),
+            created_unix_ms: m.created_unix_ms,
+            sandboxes: m
+                .sandboxes
+                .into_iter()
+                .map(|s| ArchiveSandboxView {
+                    name: s.name,
+                    workspace_bundled: s.workspace_bundled,
+                    source_workspace: s.source_workspace,
+                    locked: s.locked,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1404,44 @@ mod tests {
         assert_eq!(g.mounts[0].path, "/var/lib/docker");
         assert!(g.docker.as_ref().unwrap().running);
         assert_eq!(g.container.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn an_archive_view_lists_what_the_manifest_holds() {
+        use izba_core::bundle::manifest::{Manifest, SandboxEntry, SourceOs};
+        let entry = |name: &str, bundled: bool, locked: bool| SandboxEntry {
+            name: name.into(),
+            image_digest: "sha256:aa".into(),
+            named_volumes: vec![],
+            disk_owner: (1000, 1000),
+            workspace_bundled: bundled,
+            workspace_from: None,
+            source_workspace: format!("/home/u/{name}"),
+            source_home: Some("/home/u".into()),
+            disks: vec![],
+            workspace_bytes: 0,
+            locked,
+        };
+        let v = ArchiveView::from(Manifest {
+            format: 1,
+            izba_version: "0.1.0".into(),
+            source_os: SourceOs::Windows,
+            created_unix_ms: 42,
+            tags: Default::default(),
+            images: vec![],
+            image_sizes: Default::default(),
+            named_volumes: vec![],
+            sandboxes: vec![entry("web", true, false), entry("db", false, true)],
+        });
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["izba_version"], "0.1.0");
+        assert_eq!(j["source_os"], "windows");
+        assert_eq!(j["created_unix_ms"], 42);
+        assert_eq!(j["sandboxes"][0]["name"], "web");
+        assert_eq!(j["sandboxes"][0]["workspace_bundled"], true);
+        assert_eq!(j["sandboxes"][0]["locked"], false);
+        assert_eq!(j["sandboxes"][0]["source_workspace"], "/home/u/web");
+        assert_eq!(j["sandboxes"][1]["workspace_bundled"], false);
+        assert_eq!(j["sandboxes"][1]["locked"], true);
     }
 }

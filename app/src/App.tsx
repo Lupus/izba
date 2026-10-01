@@ -6,6 +6,8 @@ import { Detail } from "./components/Detail";
 import { NoticeBanner, appendNotice } from "./components/NoticeBanner";
 import { About } from "./components/About";
 import { NewSandbox } from "./components/NewSandbox";
+import { SaveArchive } from "./components/SaveArchive";
+import { LoadArchive } from "./components/LoadArchive";
 import { StorageView } from "./components/StorageView";
 import { UsbView } from "./components/UsbView";
 
@@ -16,6 +18,8 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [notices, setNotices] = useState<string[]>([]);
   const [view, setView] = useState<View>("sandboxes");
   const current = sandboxes.find((s) => s.name === selected) ?? null;
@@ -30,6 +34,8 @@ export default function App() {
           selected={selected}
           onSelect={setSelected}
           onNew={() => setCreating(true)}
+          onSave={() => setSaving(true)}
+          onLoad={() => setLoading(true)}
           view={view}
           onView={setView}
         />
@@ -48,6 +54,35 @@ export default function App() {
           onCreated={(name) => {
             setCreating(false);
             setSelected(name);
+            refresh();
+          }}
+        />
+      )}
+      {saving && (
+        <SaveArchive
+          sandboxes={sandboxes}
+          initial={selected}
+          onClose={() => setSaving(false)}
+          onSaved={() => {
+            setSaving(false);
+            // A save with "stop running" changed sandbox state.
+            refresh();
+          }}
+        />
+      )}
+      {loading && (
+        <LoadArchive
+          existing={sandboxes.map((s) => s.name)}
+          onClose={() => {
+            setLoading(false);
+            refresh();
+          }}
+          onLoaded={(names) => {
+            setLoading(false);
+            if (names.length > 0) {
+              setSelected(names[0]);
+              setView("sandboxes");
+            }
             refresh();
           }}
         />

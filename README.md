@@ -402,6 +402,11 @@ izba save --all --with-workspace --stop -o laptop.izba   # on the old machine
 izba load laptop.izba && izba start myproj
 ```
 
+The desktop app does the same from its sidebar: **Save…** picks the sandboxes
+(optionally with their workspace folders, stopping the running ones first) and
+**Load…** lists what an archive holds before loading it, under a new name or
+into a different workspace folder if you like.
+
 The archive is plaintext and may contain secrets from the sandbox disks and
 workspace (for example `.env` files) — treat it like a credential.
 

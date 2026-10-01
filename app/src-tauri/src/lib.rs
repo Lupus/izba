@@ -125,6 +125,45 @@ async fn create(
     .await
 }
 
+/// Save sandboxes into an archive. Minutes-long for a big sandbox, so it runs
+/// on its own connection like `create` and streams `save-progress`.
+#[tauri::command]
+async fn save_archive(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    opts: views::SaveArchiveOpts,
+) -> Result<views::SaveReportView, String> {
+    run_action(&state, move |d| {
+        commands::save_archive_core(d, opts, &mut |m| {
+            let _ = app.emit("save-progress", m.to_string());
+        })
+    })
+    .await
+}
+
+/// Load sandboxes from an archive, streaming `load-progress`.
+#[tauri::command]
+async fn load_archive(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    opts: views::LoadArchiveOpts,
+) -> Result<views::LoadReportView, String> {
+    run_action(&state, move |d| {
+        commands::load_archive_core(d, opts, &mut |m| {
+            let _ = app.emit("load-progress", m.to_string());
+        })
+    })
+    .await
+}
+
+/// List what an archive holds (reads its manifest; no daemon round trip).
+#[tauri::command]
+async fn archive_inspect(path: String) -> Result<views::ArchiveView, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::archive_inspect_core(&path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
 #[tauri::command]
 async fn read_logs(state: State<'_, AppState>, name: String) -> Result<String, String> {
     run_action(&state, move |d| commands::read_logs_core(d, &name)).await
@@ -780,6 +819,25 @@ pub fn dispatch(
             })?;
             to_json(name)
         }
+        "save_archive" => {
+            let opts: views::SaveArchiveOpts = serde_json::from_value(
+                args.get("opts").cloned().unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad save opts: {e}"))?;
+            to_json(commands::save_archive_core(d, opts, &mut |m| {
+                emit("save-progress", json!(m));
+            })?)
+        }
+        "load_archive" => {
+            let opts: views::LoadArchiveOpts = serde_json::from_value(
+                args.get("opts").cloned().unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad load opts: {e}"))?;
+            to_json(commands::load_archive_core(d, opts, &mut |m| {
+                emit("load-progress", json!(m));
+            })?)
+        }
+        "archive_inspect" => to_json(commands::archive_inspect_core(&arg_str(&args, "path")?)?),
         "shell_open" | "shell_write" | "shell_resize" | "shell_close" => {
             Err("shell not supported in dogfood headless (deferred)".to_string())
         }
@@ -899,6 +957,9 @@ pub fn run() {
             restart,
             remove,
             create,
+            save_archive,
+            load_archive,
+            archive_inspect,
             read_logs,
             read_netlog,
             policy_show,
@@ -1679,5 +1740,67 @@ mod dispatch_tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_save_archive_streams_progress_and_returns_the_report() {
+        let st = state_with(FakeDaemon::default());
+        let out = std::env::temp_dir().join("izba-app-dispatch-save-does-not-exist.izba");
+        let _ = std::fs::remove_file(&out);
+        let mut events = Vec::new();
+        let rep = dispatch(
+            &st,
+            "save_archive",
+            serde_json::json!({"opts": {
+                "names": ["web"], "out": out.to_string_lossy(),
+                "with_workspace": true, "stop": false, "overwrite": false
+            }}),
+            &mut |e: &str, p: serde_json::Value| events.push((e.to_string(), p)),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(rep["sandboxes"][0], "web");
+        assert_eq!(rep["archive_bytes"], 1024);
+        assert_eq!(events[0].0, "save-progress");
+        assert_eq!(events[0].1, "pulling image");
+    }
+
+    #[test]
+    fn dispatch_load_archive_streams_progress_and_returns_the_report() {
+        let st = state_with(FakeDaemon::default());
+        let ar = std::env::temp_dir().join("izba-app-dispatch-load.izba");
+        let root = std::env::temp_dir().join("izba-app-dispatch-root");
+        let mut events = Vec::new();
+        let rep = dispatch(
+            &st,
+            "load_archive",
+            serde_json::json!({"opts": {
+                "archive": ar.to_string_lossy(), "select": ["web", "db"],
+                "rename": null, "workspace": null,
+                "workspace_root": root.to_string_lossy()
+            }}),
+            &mut |e: &str, p: serde_json::Value| events.push((e.to_string(), p)),
+        )
+        .unwrap();
+        assert_eq!(rep["sandboxes"][1]["name"], "db");
+        assert_eq!(
+            rep["sandboxes"][1]["workspace"],
+            root.join("db").display().to_string()
+        );
+        assert_eq!(events[0].0, "load-progress");
+    }
+
+    #[test]
+    fn dispatch_archive_inspect_reports_an_unreadable_archive() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let e = dispatch(
+            &st,
+            "archive_inspect",
+            serde_json::json!({"path": "/definitely/not/here.izba"}),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert!(e.contains("here.izba"), "{e}");
     }
 }

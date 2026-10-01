@@ -1,5 +1,6 @@
 import type { Page } from "@playwright/test";
 import type { Scenario, CreateOpts } from "./mock/scenarios";
+import type { SaveArchiveOpts, LoadArchiveOpts } from "../src/lib/types";
 
 /** Node-side proxy over the in-page window.__IZBA_MOCK__ control surface. */
 export class MockHandle {
@@ -41,6 +42,27 @@ export class MockHandle {
       msg,
     );
   }
+  lastSave(): Promise<SaveArchiveOpts | undefined> {
+    return this.page.evaluate(() => (window as unknown as IzbaWindow).__IZBA_MOCK__.lastSave());
+  }
+  lastLoad(): Promise<LoadArchiveOpts | undefined> {
+    return this.page.evaluate(() => (window as unknown as IzbaWindow).__IZBA_MOCK__.lastLoad());
+  }
+  pushSaveProgress(msg: string): Promise<void> {
+    return this.page.evaluate(
+      (m) => (window as unknown as IzbaWindow).__IZBA_MOCK__.pushSaveProgress(m),
+      msg,
+    );
+  }
+  pushLoadProgress(msg: string): Promise<void> {
+    return this.page.evaluate(
+      (m) => (window as unknown as IzbaWindow).__IZBA_MOCK__.pushLoadProgress(m),
+      msg,
+    );
+  }
+  resolveSave(): Promise<void> {
+    return this.page.evaluate(() => (window as unknown as IzbaWindow).__IZBA_MOCK__.resolveSave());
+  }
   setScenario(partial: Partial<Scenario>): Promise<void> {
     return this.page.evaluate(
       (p) => (window as unknown as IzbaWindow).__IZBA_MOCK__.setScenario(p),
@@ -59,6 +81,11 @@ interface IzbaWindow {
     fireShellExit(id: string): void;
     resolveCreate(name: string): void;
     rejectCreate(msg: string): void;
+    lastSave(): SaveArchiveOpts | undefined;
+    lastLoad(): LoadArchiveOpts | undefined;
+    pushSaveProgress(msg: string): void;
+    pushLoadProgress(msg: string): void;
+    resolveSave(): void;
     setScenario(partial: Partial<Scenario>): void;
   };
 }

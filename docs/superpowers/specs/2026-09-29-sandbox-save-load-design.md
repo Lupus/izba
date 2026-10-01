@@ -18,7 +18,7 @@ assumed. The workspace can optionally travel in the same archive.
 | Archive scope | 1..N named sandboxes (or `--all`) per archive; shared images/named volumes stored once |
 | Workspace placement on load | Smart default + override (§3.2) |
 | Workspace content | Everything verbatim (`.git`, untracked, ignored, `.env`, symlinks, mode bits) |
-| Surfaces | CLI + daemon now; GUI is a follow-up issue |
+| Surfaces | CLI + daemon; desktop app Save/Load dialogs added in #301 |
 | Trust | Archives are the user's own: integrity + structural checks, no posture-review gate, no encryption |
 | Owner-uid change (non-docker) | Idmapped upper at boot, disks stay byte-identical forever (§5) |
 
@@ -27,8 +27,10 @@ verbs are **`izba save` / `izba load`**.
 
 ### Non-goals (follow-up issues)
 
-GUI Save/Load buttons; streaming to/from stdout (`-o -`, `izba load -`);
-encryption; incremental/delta archives.
+Streaming to/from stdout (`-o -`, `izba load -`); encryption;
+incremental/delta archives. (GUI Save/Load was a non-goal here too; it shipped
+afterwards as #301 — two dialogs over the same daemon requests, plus
+`bundle::load::peek_manifest` so the Load dialog can list an archive first.)
 
 ## 2. `izba save`
 

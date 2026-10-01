@@ -19,6 +19,8 @@ describe("Rail", () => {
         selected="web"
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view={defaultView}
         onView={noop}
       />,
@@ -35,6 +37,8 @@ describe("Rail", () => {
         selected="web"
         onSelect={onSelect}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view={defaultView}
         onView={noop}
       />,
@@ -50,6 +54,8 @@ describe("Rail", () => {
         selected="web"
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view={defaultView}
         onView={noop}
       />,
@@ -66,6 +72,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={onNew}
+        onSave={noop}
+        onLoad={noop}
         view={defaultView}
         onView={noop}
       />,
@@ -83,6 +91,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view="sandboxes"
         onView={noop}
       />,
@@ -98,6 +108,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view="storage"
         onView={noop}
       />,
@@ -114,6 +126,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view="sandboxes"
         onView={onView}
       />,
@@ -130,6 +144,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view="storage"
         onView={onView}
       />,
@@ -146,6 +162,8 @@ describe("Rail", () => {
         selected={null}
         onSelect={noop}
         onNew={noop}
+        onSave={noop}
+        onLoad={noop}
         view={defaultView}
         onView={noop}
       />,
@@ -160,5 +178,44 @@ describe("Rail", () => {
     expect(image).toHaveAttribute("title", longImage);
     const name = screen.getByText("docker-claude-test");
     expect(name.className).toMatch(/\btruncate\b/);
+  });
+
+  it("offers Save archive and Load archive", () => {
+    const onSave = vi.fn();
+    const onLoad = vi.fn();
+    render(
+      <Rail
+        sandboxes={sandboxes}
+        selected="web"
+        onSelect={noop}
+        onNew={noop}
+        onSave={onSave}
+        onLoad={onLoad}
+        view={defaultView}
+        onView={noop}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save archive" }));
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(onLoad).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Load archive" }));
+    expect(onLoad).toHaveBeenCalledOnce();
+  });
+
+  it("has nothing to save when there are no sandboxes", () => {
+    render(
+      <Rail
+        sandboxes={[]}
+        selected={null}
+        onSelect={noop}
+        onNew={noop}
+        onSave={noop}
+        onLoad={noop}
+        view={defaultView}
+        onView={noop}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Save archive" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Load archive" })).toBeEnabled();
   });
 });

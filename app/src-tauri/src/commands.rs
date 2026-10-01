@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use crate::daemon::DaemonApi;
+use crate::daemon::{DaemonApi, LoadArchive, SaveArchive};
 use crate::views::{
-    app_build_info, CreateOpts, DaemonStatusView, DiffView, LockdownView, PolicyView, PortRuleView,
-    PromoteView, SandboxDetailView, SandboxStatsView, SandboxView, SeedEntry, UsbDeviceView,
+    app_build_info, ArchiveView, CreateOpts, DaemonStatusView, DiffView, LoadArchiveOpts,
+    LoadReportView, LockdownView, PolicyView, PortRuleView, PromoteView, SandboxDetailView,
+    SandboxStatsView, SandboxView, SaveArchiveOpts, SaveReportView, SeedEntry, UsbDeviceView,
     UsbStatusView, UsbUpstreamView, VersionView, VolumeInfoView,
 };
 use crate::vncproxy;
@@ -587,6 +588,135 @@ pub fn vnc_embed_target(
         .vnc_url
         .ok_or_else(|| "no live VNC desktop to embed".to_string())?;
     vncproxy::parse_vnc_url(&url).map_err(|e| e.to_string())
+}
+
+/// An absolute path typed or picked in a dialog, or an error naming `what`.
+/// The daemon has no meaningful cwd, so it refuses a relative path in
+/// CLI-speak ("the CLI resolves it"); refusing here keeps the wording the
+/// GUI's own.
+fn absolute_path(raw: &str, what: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(raw.trim());
+    if !p.is_absolute() {
+        return Err(format!("the {what} must be an absolute path"));
+    }
+    Ok(p)
+}
+
+/// `Some(trimmed)` unless the field was left blank.
+fn non_blank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Where the daemon writes when the user agreed to replace `out`: a sibling
+/// in the same directory, so the final swap is a same-filesystem rename.
+fn replacement_path(out: &std::path::Path) -> PathBuf {
+    let mut name = out.as_os_str().to_os_string();
+    name.push(format!(".{}.replacing", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Save sandboxes into a `.izba` archive (`izba save`), forwarding daemon
+/// `Progress` messages via `on_progress`.
+///
+/// The daemon never replaces an existing file, and neither does this — except
+/// when `overwrite` says the user already confirmed the replacement in the
+/// native save dialog. Even then the old archive is only swapped out AFTER the
+/// new one is completely written (the daemon saves to a sibling, then one
+/// rename): a failed save must not cost the user the backup they had.
+pub fn save_archive_core(
+    d: &mut dyn DaemonApi,
+    opts: SaveArchiveOpts,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<SaveReportView, String> {
+    if opts.names.is_empty() {
+        return Err("select at least one sandbox to save".to_string());
+    }
+    if opts.out.trim().is_empty() {
+        return Err("choose where to save the archive".to_string());
+    }
+    let out = absolute_path(&opts.out, "archive file")?;
+    let replacing = out.exists();
+    if replacing && !opts.overwrite {
+        return Err(format!(
+            "{} already exists — choose another name",
+            izba_core::paths::display_path(&out)
+        ));
+    }
+    let target = if replacing {
+        replacement_path(&out)
+    } else {
+        out.clone()
+    };
+    let mut report = d
+        .save(
+            SaveArchive {
+                names: opts.names,
+                out: target.clone(),
+                with_workspace: opts.with_workspace,
+                stop: opts.stop,
+            },
+            on_progress,
+        )
+        .map_err(|e| e.to_string())?;
+    if replacing {
+        std::fs::rename(&target, &out).map_err(|e| {
+            format!(
+                "the archive was written to {}, but replacing {} failed: {e}",
+                izba_core::paths::display_path(&target),
+                izba_core::paths::display_path(&out)
+            )
+        })?;
+        report.path = out;
+    }
+    Ok(SaveReportView::from(report))
+}
+
+/// Load sandboxes from a `.izba` archive (`izba load`), forwarding daemon
+/// `Progress` messages via `on_progress`. Blank optional fields mean "not
+/// given"; the loaded sandboxes always arrive stopped.
+pub fn load_archive_core(
+    d: &mut dyn DaemonApi,
+    opts: LoadArchiveOpts,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<LoadReportView, String> {
+    if opts.archive.trim().is_empty() {
+        return Err("choose an archive to load".to_string());
+    }
+    let archive = absolute_path(&opts.archive, "archive file")?;
+    let rename = non_blank(opts.rename);
+    if let Some(n) = &rename {
+        izba_core::sandbox::validate_name(n).map_err(|e| e.to_string())?;
+    }
+    let workspace = non_blank(opts.workspace)
+        .map(|w| absolute_path(&w, "workspace folder"))
+        .transpose()?;
+    let workspace_root = non_blank(opts.workspace_root)
+        .map(|w| absolute_path(&w, "workspace parent folder"))
+        .transpose()?;
+    d.load(
+        LoadArchive {
+            archive,
+            select: opts.select,
+            rename,
+            workspace,
+            workspace_root,
+        },
+        on_progress,
+    )
+    .map(LoadReportView::from)
+    .map_err(|e| e.to_string())
+}
+
+/// What an archive holds, read from its manifest without loading anything —
+/// the Load dialog's sandbox list. A host-side file read, no daemon involved.
+pub fn archive_inspect_core(path: &str) -> Result<ArchiveView, String> {
+    if path.trim().is_empty() {
+        return Err("choose an archive to load".to_string());
+    }
+    let archive = absolute_path(path, "archive file")?;
+    izba_core::bundle::load::peek_manifest(&archive)
+        .map(ArchiveView::from)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
@@ -1544,5 +1674,221 @@ mod tests {
         if let Some(v) = original {
             std::env::set_var("IZBA_DATA_DIR", v);
         }
+    }
+
+    fn save_opts(out: &std::path::Path) -> SaveArchiveOpts {
+        SaveArchiveOpts {
+            names: vec!["web".into(), "db".into()],
+            out: out.to_string_lossy().into_owned(),
+            with_workspace: true,
+            stop: true,
+            overwrite: false,
+        }
+    }
+
+    #[test]
+    fn save_archive_core_forwards_the_selection_and_reports() {
+        let dir = scratch_dir("save");
+        let out = dir.join("both.izba");
+        let mut d = FakeDaemon::default();
+        let mut seen = Vec::new();
+        let rep =
+            save_archive_core(&mut d, save_opts(&out), &mut |m| seen.push(m.to_string())).unwrap();
+        assert_eq!(
+            d.calls,
+            vec![format!("save:web,db:{}:true:true", out.display())]
+        );
+        assert_eq!(seen, vec!["pulling image", "booting"]);
+        assert_eq!(rep.path, out.display().to_string());
+        assert_eq!(rep.sandboxes, vec!["web", "db"]);
+        assert_eq!((rep.logical_bytes, rep.archive_bytes), (2048, 1024));
+        assert_eq!(rep.warnings, vec!["skipped a socket"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_archive_core_refuses_an_empty_selection_and_a_relative_path() {
+        let dir = scratch_dir("save-bad");
+        let mut d = FakeDaemon::default();
+        let mut none = save_opts(&dir.join("a.izba"));
+        none.names.clear();
+        let e = save_archive_core(&mut d, none, &mut |_| {}).unwrap_err();
+        assert!(e.contains("at least one sandbox"), "{e}");
+
+        let mut rel = save_opts(&dir.join("a.izba"));
+        rel.out = "a.izba".into();
+        let e = save_archive_core(&mut d, rel, &mut |_| {}).unwrap_err();
+        assert!(e.contains("absolute"), "{e}");
+
+        let mut blank = save_opts(&dir.join("a.izba"));
+        blank.out = "  ".into();
+        let e = save_archive_core(&mut d, blank, &mut |_| {}).unwrap_err();
+        assert!(e.contains("where to save"), "{e}");
+        assert!(d.calls.is_empty(), "nothing reached the daemon");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_archive_core_refuses_an_existing_file_without_consent() {
+        let dir = scratch_dir("save-exists");
+        let out = dir.join("old.izba");
+        std::fs::write(&out, b"old archive").unwrap();
+        let mut d = FakeDaemon::default();
+        let e = save_archive_core(&mut d, save_opts(&out), &mut |_| {}).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert!(d.calls.is_empty());
+        assert_eq!(std::fs::read(&out).unwrap(), b"old archive");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_archive_core_replaces_an_existing_file_once_the_new_one_is_written() {
+        let dir = scratch_dir("save-replace");
+        let out = dir.join("old.izba");
+        std::fs::write(&out, b"old archive").unwrap();
+        let mut d = FakeDaemon::default();
+        let mut opts = save_opts(&out);
+        opts.overwrite = true;
+        let rep = save_archive_core(&mut d, opts, &mut |_| {}).unwrap();
+        // The daemon never saw the real target: it wrote beside it.
+        assert_eq!(d.calls.len(), 1);
+        assert!(
+            !d.calls[0].contains(&format!(":{}:", out.display())),
+            "{:?}",
+            d.calls
+        );
+        assert_eq!(rep.path, out.display().to_string());
+        assert_eq!(std::fs::read(&out).unwrap(), b"fake archive");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("old.izba")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_archive_core_keeps_the_old_archive_when_the_save_fails() {
+        let dir = scratch_dir("save-fail");
+        let out = dir.join("old.izba");
+        std::fs::write(&out, b"old archive").unwrap();
+        let mut d = FakeDaemon {
+            fail_action: true,
+            ..Default::default()
+        };
+        let mut opts = save_opts(&out);
+        opts.overwrite = true;
+        let e = save_archive_core(&mut d, opts, &mut |_| {}).unwrap_err();
+        assert!(e.contains("action failed"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"old archive");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn load_opts(archive: &std::path::Path) -> LoadArchiveOpts {
+        LoadArchiveOpts {
+            archive: archive.to_string_lossy().into_owned(),
+            select: vec!["web".into()],
+            rename: None,
+            workspace: None,
+            workspace_root: None,
+        }
+    }
+
+    #[test]
+    fn load_archive_core_forwards_options_and_reports() {
+        let dir = scratch_dir("load");
+        let ar = dir.join("a.izba");
+        let ws = dir.join("ws");
+        let mut d = FakeDaemon::default();
+        let mut opts = load_opts(&ar);
+        opts.rename = Some(" web2 ".into());
+        opts.workspace = Some(ws.to_string_lossy().into_owned());
+        let mut seen = Vec::new();
+        let rep = load_archive_core(&mut d, opts, &mut |m| seen.push(m.to_string())).unwrap();
+        assert_eq!(
+            d.calls,
+            vec![format!("load:{}:web:web2:{}:-", ar.display(), ws.display())]
+        );
+        assert_eq!(seen, vec!["pulling image", "booting"]);
+        assert_eq!(rep.sandboxes.len(), 1);
+        assert_eq!(rep.sandboxes[0].name, "web2");
+        assert_eq!(rep.sandboxes[0].workspace, ws.display().to_string());
+        assert_eq!(rep.redo, vec!["re-run: izba lockdown web2"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_archive_core_treats_blank_options_as_unset() {
+        let dir = scratch_dir("load-blank");
+        let ar = dir.join("a.izba");
+        let root = dir.join("root");
+        let mut d = FakeDaemon::default();
+        let mut opts = load_opts(&ar);
+        opts.select = vec!["web".into(), "db".into()];
+        opts.rename = Some("  ".into());
+        opts.workspace = Some(String::new());
+        opts.workspace_root = Some(root.to_string_lossy().into_owned());
+        load_archive_core(&mut d, opts, &mut |_| {}).unwrap();
+        assert_eq!(
+            d.calls,
+            vec![format!(
+                "load:{}:web,db:-:-:{}",
+                ar.display(),
+                root.display()
+            )]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_archive_core_refuses_relative_paths_and_a_bad_new_name() {
+        let dir = scratch_dir("load-bad");
+        let ar = dir.join("a.izba");
+        let mut d = FakeDaemon::default();
+
+        let mut rel = load_opts(&ar);
+        rel.archive = "a.izba".into();
+        let e = load_archive_core(&mut d, rel, &mut |_| {}).unwrap_err();
+        assert!(e.contains("archive") && e.contains("absolute"), "{e}");
+
+        let mut blank = load_opts(&ar);
+        blank.archive = String::new();
+        let e = load_archive_core(&mut d, blank, &mut |_| {}).unwrap_err();
+        assert!(e.contains("choose an archive"), "{e}");
+
+        let mut ws = load_opts(&ar);
+        ws.workspace = Some("ws".into());
+        let e = load_archive_core(&mut d, ws, &mut |_| {}).unwrap_err();
+        assert!(
+            e.contains("workspace folder") && e.contains("absolute"),
+            "{e}"
+        );
+
+        let mut root = load_opts(&ar);
+        root.workspace_root = Some("root".into());
+        let e = load_archive_core(&mut d, root, &mut |_| {}).unwrap_err();
+        assert!(
+            e.contains("workspace parent folder") && e.contains("absolute"),
+            "{e}"
+        );
+
+        let mut name = load_opts(&ar);
+        name.rename = Some("Bad Name".into());
+        let e = load_archive_core(&mut d, name, &mut |_| {}).unwrap_err();
+        assert!(e.contains("invalid sandbox name"), "{e}");
+        assert!(d.calls.is_empty(), "nothing reached the daemon");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archive_inspect_core_reports_a_file_that_is_not_an_archive() {
+        let dir = scratch_dir("inspect");
+        let p = dir.join("notes.izba");
+        std::fs::write(&p, b"just text").unwrap();
+        let e = archive_inspect_core(&p.to_string_lossy()).unwrap_err();
+        assert!(e.contains("archive"), "{e}");
+        let e = archive_inspect_core("  ").unwrap_err();
+        assert!(e.contains("choose an archive"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
