@@ -136,6 +136,26 @@ fn installed_artifacts_dir() -> PathBuf {
         .join("artifacts")
 }
 
+/// The kernel image the sandbox's VMM was actually launched with, read from
+/// the running process rather than inferred: `state.json` names the VMM pid
+/// and cloud-hypervisor's argv carries `--kernel <path>`.
+#[cfg(target_os = "linux")]
+fn booted_kernel(data: &Path, name: &str) -> PathBuf {
+    let state = std::fs::read_to_string(data.join("sandboxes").join(name).join("state.json"))
+        .expect("read state.json");
+    let state: serde_json::Value = serde_json::from_str(&state).expect("state.json parses");
+    let pid = state["vmm_pid"]["pid"]
+        .as_u64()
+        .expect("state.json records vmm_pid.pid");
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).expect("read the VMM's cmdline");
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+    let at = args
+        .iter()
+        .position(|a| *a == b"--kernel")
+        .expect("the VMM was launched with --kernel");
+    PathBuf::from(String::from_utf8_lossy(args[at + 1]).into_owned())
+}
+
 fn izba_as<S: AsRef<std::ffi::OsStr>>(how: Artifacts, data: &Path, args: &[S]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_izba"));
     cmd.env("IZBA_DATA_DIR", data).args(args);
@@ -326,6 +346,9 @@ fn a_granted_device_attaches_on_the_kernel_an_installed_build_resolves() {
     // spawned by the first one and inherits its environment; one stray call
     // with the overrides intact could hand the daemon a kernel and this would
     // prove nothing.
+    // `want()` still insists on the override variables: it gates the whole
+    // suite, and the other cases need them. This case does not use them — it
+    // strips them from every child process it spawns.
     let Some(env) = want() else { return };
     let staged = installed_artifacts_dir();
     for f in ["vmlinux-usb", "initramfs.cpio.gz"] {
@@ -374,6 +397,15 @@ fn a_granted_device_attaches_on_the_kernel_an_installed_build_resolves() {
     ok(
         &izba_as(how, data.path(), &["start", name]),
         "start on the installed-layout USB kernel",
+    );
+    // Positive proof, not just "there was nowhere else to look": in CI the
+    // override and the staged file are byte-identical, so a leaked override
+    // would boot the same kernel and every assertion below would still pass.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        std::fs::canonicalize(booted_kernel(data.path(), name)).expect("booted kernel path"),
+        std::fs::canonicalize(staged.join("vmlinux-usb")).expect("staged kernel path"),
+        "the VMM must have booted the kernel staged next to the binary, not an override"
     );
     ok(
         &izba_as(
