@@ -8,12 +8,15 @@ use serde::{Serialize, Serializer};
 use crate::args::Args;
 use crate::classify::RUNNING;
 use crate::measure::{io_cap, Kind, Sample};
+use crate::request::RequestKind;
 use crate::stats::{field_stats, fraction_of_bound, FieldStats};
 
 /// Everything about one measurement (`probe` or `direct`) across all workers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasurementSummary {
     pub kind: Kind,
+    /// Names the probe replica's round-trip key (`health_us` / `stats_us`).
+    pub request: RequestKind,
     pub iterations: usize,
     /// Iterations in which a step failed.
     pub failures: usize,
@@ -36,7 +39,7 @@ impl Serialize for MeasurementSummary {
         map.serialize_entry("iterations", &self.iterations)?;
         map.serialize_entry("failures", &self.failures)?;
         map.serialize_entry(self.kind.open_field(), &self.open)?;
-        map.serialize_entry(self.kind.rpc_field(), &self.rpc)?;
+        map.serialize_entry(self.kind.rpc_field(self.request), &self.rpc)?;
         map.serialize_entry("total_us", &self.total)?;
         map.serialize_entry("max_failed_after_us", &self.max_failed_after_us)?;
         map.serialize_entry(
@@ -51,6 +54,8 @@ impl Serialize for MeasurementSummary {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
     pub sandbox: String,
+    /// The guest RPC that was measured (`health` / `stats`).
+    pub request: RequestKind,
     pub data_root: String,
     pub iterations: u32,
     pub parallel: u32,
@@ -70,7 +75,12 @@ pub struct SummaryLine {
     pub summary: Summary,
 }
 
-pub fn summarize_kind(kind: Kind, samples: &[Sample], bound_ms: u64) -> MeasurementSummary {
+pub fn summarize_kind(
+    kind: Kind,
+    request: RequestKind,
+    samples: &[Sample],
+    bound_ms: u64,
+) -> MeasurementSummary {
     let own: Vec<&Sample> = samples.iter().filter(|s| s.kind == kind).collect();
     let field = |pick: fn(&Sample) -> Option<u64>| -> FieldStats {
         field_stats(&own.iter().map(|s| pick(s)).collect::<Vec<_>>())
@@ -84,6 +94,7 @@ pub fn summarize_kind(kind: Kind, samples: &[Sample], bound_ms: u64) -> Measurem
     }
     MeasurementSummary {
         kind,
+        request,
         iterations: own.len(),
         failures: own.iter().filter(|s| !s.m.ok()).count(),
         open: field(|s| s.m.open_us),
@@ -99,6 +110,7 @@ pub fn summarize(args: &Args, data_root: &str, samples: &[Sample]) -> SummaryLin
     SummaryLine {
         summary: Summary {
             sandbox: args.sandbox.clone(),
+            request: args.request,
             data_root: data_root.to_string(),
             iterations: args.iterations,
             parallel: args.parallel,
@@ -106,8 +118,8 @@ pub fn summarize(args: &Args, data_root: &str, samples: &[Sample]) -> SummaryLin
             bound_ms: args.bound_ms,
             io_cap_ms: u64::try_from(io_cap(args.bound_ms).as_millis()).unwrap_or(u64::MAX),
             all_running: all_running(samples),
-            probe: summarize_kind(Kind::Probe, samples, args.bound_ms),
-            direct: summarize_kind(Kind::Direct, samples, args.bound_ms),
+            probe: summarize_kind(Kind::Probe, args.request, samples, args.bound_ms),
+            direct: summarize_kind(Kind::Direct, args.request, samples, args.bound_ms),
         },
     }
 }
@@ -131,6 +143,8 @@ mod tests {
     use super::*;
     use crate::measure::{Measured, Phase};
 
+    const HEALTH: RequestKind = RequestKind::Health;
+
     fn ok(kind: Kind, open: u64, rpc: u64, inspect: &str) -> Sample {
         Sample {
             worker: 0,
@@ -138,6 +152,7 @@ mod tests {
             started_ms: 0,
             kind,
             m: Measured {
+                request: HEALTH,
                 open_us: Some(open),
                 rpc_us: Some(rpc),
                 total_us: Some(open + rpc),
@@ -157,6 +172,7 @@ mod tests {
             started_ms: 0,
             kind,
             m: Measured {
+                request: HEALTH,
                 open_us: open,
                 rpc_us: None,
                 total_us: None,
@@ -176,6 +192,7 @@ mod tests {
             interval_ms: 250,
             parallel: 1,
             bound_ms: 1,
+            request: HEALTH,
         }
     }
 
@@ -195,17 +212,17 @@ mod tests {
 
     #[test]
     fn a_measurement_only_counts_its_own_samples() {
-        let s = summarize_kind(Kind::Probe, &mixed(), 1);
+        let s = summarize_kind(Kind::Probe, HEALTH, &mixed(), 1);
         assert_eq!(s.kind, Kind::Probe);
         assert_eq!(s.iterations, 5);
         assert_eq!(s.failures, 2);
-        let d = summarize_kind(Kind::Direct, &mixed(), 1);
+        let d = summarize_kind(Kind::Direct, HEALTH, &mixed(), 1);
         assert_eq!((d.iterations, d.failures), (2, 0));
     }
 
     #[test]
     fn a_completed_open_counts_even_when_a_later_phase_failed() {
-        let s = summarize_kind(Kind::Probe, &mixed(), 1);
+        let s = summarize_kind(Kind::Probe, HEALTH, &mixed(), 1);
         // 60, 90, 120, 200 completed; one iteration never opened.
         assert_eq!((s.open.count, s.open.failures), (4, 1));
         assert_eq!((s.open.min, s.open.max), (Some(60), Some(200)));
@@ -223,27 +240,27 @@ mod tests {
     fn fraction_of_bound_uses_the_slowest_completed_total() {
         // bound 1 ms = 1000 µs; slowest completed probe total is 300 µs.
         assert_eq!(
-            summarize_kind(Kind::Probe, &mixed(), 1).max_total_as_fraction_of_bound,
+            summarize_kind(Kind::Probe, HEALTH, &mixed(), 1).max_total_as_fraction_of_bound,
             Some(0.3)
         );
         assert_eq!(
-            summarize_kind(Kind::Direct, &mixed(), 1).max_total_as_fraction_of_bound,
+            summarize_kind(Kind::Direct, HEALTH, &mixed(), 1).max_total_as_fraction_of_bound,
             Some(0.04)
         );
         let none = [failed(Kind::Probe, Phase::Control, None, 5)];
-        let s = summarize_kind(Kind::Probe, &none, 1);
+        let s = summarize_kind(Kind::Probe, HEALTH, &none, 1);
         assert_eq!(s.max_total_as_fraction_of_bound, None);
         assert_eq!(s.max_failed_after_us, Some(5));
     }
 
     #[test]
     fn tally_counts_each_distinct_value() {
-        let s = summarize_kind(Kind::Probe, &mixed(), 1);
+        let s = summarize_kind(Kind::Probe, HEALTH, &mixed(), 1);
         assert_eq!(
             s.inspect_container,
             BTreeMap::from([("none".to_string(), 2), ("some:running".to_string(), 3)])
         );
-        let d = summarize_kind(Kind::Direct, &mixed(), 1);
+        let d = summarize_kind(Kind::Direct, HEALTH, &mixed(), 1);
         assert_eq!(
             d.inspect_container,
             BTreeMap::from([
@@ -288,6 +305,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let s = &v["summary"];
         assert_eq!(s["sandbox"], "box");
+        assert_eq!(s["request"], "health");
         assert_eq!(s["data_root"], "/data/izba");
         assert_eq!(s["iterations"], 4);
         assert_eq!(s["parallel"], 1);
@@ -319,6 +337,27 @@ mod tests {
         assert_eq!(d["total_us"]["max"], 40);
         assert!(d["max_failed_after_us"].is_null());
         assert!(d.get("control_us").is_none() && d.get("health_us").is_none());
+    }
+
+    /// A stats run says so, and its probe round trip is `stats_us` — the
+    /// same key its lines use — never `health_us`.
+    #[test]
+    fn stats_summary_names_the_request_and_the_stats_round_trip() {
+        let stats_args = Args {
+            request: RequestKind::Stats,
+            ..args()
+        };
+        let line = summarize(&stats_args, "/data/izba", &mixed());
+        let v = serde_json::to_value(&line).unwrap();
+        let s = &v["summary"];
+        assert_eq!(s["request"], "stats");
+        let p = &s["probe"];
+        assert_eq!(p["stats_us"]["count"], 3);
+        assert_eq!(p["control_us"]["count"], 4);
+        assert!(p.get("health_us").is_none());
+        let d = &s["direct"];
+        assert_eq!(d["rpc_us"]["max"], 30);
+        assert!(d.get("stats_us").is_none() && d.get("health_us").is_none());
     }
 
     #[test]

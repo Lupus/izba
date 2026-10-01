@@ -1,5 +1,6 @@
-//! `probe-latency <sandbox-name> [--iterations N] [--interval-ms M]
-//! [--parallel K] [--bound-ms B]` — see the crate docs and README.
+//! `probe-latency <sandbox-name> [--request health|stats] [--iterations N]
+//! [--interval-ms M] [--parallel K] [--bound-ms B]` — see the crate docs and
+//! README.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
