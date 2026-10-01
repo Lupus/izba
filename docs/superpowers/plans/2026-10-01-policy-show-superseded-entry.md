@@ -1,5 +1,14 @@
 # `policy show` Superseded-Entry Rendering Implementation Plan
 
+> **HISTORICAL — executed 2026-10-01, then amended by review.** The exact
+> output strings and doc sentences in this plan are NOT what shipped. Review
+> replaced three things: the remedy is "merge the two into one entry", never
+> "remove the duplicate" (deleting a superseded `protocol: http` entry can stop
+> its port being inspected); a superseded `protocol: tcp` has two wordings
+> (the winning entry may carry the hatch itself); and `superseded_by` is not
+> the tree's only last-wins fold. The authority for shipped behaviour is the
+> spec, `docs/superpowers/specs/2026-10-01-policy-show-superseded-entry-design.md` §2.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `izba policy show` stops advertising a TLS-pinning passthrough (and ports/access) from an allow-list entry that a later entry for the same exact host has superseded, and says a duplicate is the cause.

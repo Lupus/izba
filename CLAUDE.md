@@ -314,8 +314,9 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   `NOT in effect`, or `declaration not read` when the winning entry declares
   `tcp` on that port itself (the winner's own line then states whether the hatch
   is live). A superseded `protocol: http` is the exception and renders as still
-  in force: `inspect_ports` unions over every entry, so the remedy `policy show`
-  names is to MERGE the duplicates, never to delete one. The renderer does not
+  read, port-wide (never as a claim that the host is inspected):
+  `inspect_ports` unions over every entry, so the remedy `policy show` names
+  is to MERGE the duplicates, never to delete one. The renderer does not
   fold duplicates itself: it asks `EgressPolicyConfig::superseded_by`, the same
   call `InspectionTable::from_config` builds its passthrough set from, pinned
   against `to_rego_data_json` by a guard test. That is NOT the tree's only
