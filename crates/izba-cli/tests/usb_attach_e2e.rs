@@ -18,6 +18,15 @@
 //! IZBA_FAKE_USBIPD=hack/fake-usbipd/target/release/fake-usbipd \
 //! cargo test -p izba-cli --test usb_attach_e2e -- --test-threads=1 --nocapture
 //! ```
+//!
+//! One case, `a_granted_device_attaches_on_the_kernel_an_installed_build_resolves`,
+//! runs with every one of those overrides REMOVED and needs the artifacts staged
+//! where an installer puts them, next to the binary:
+//!
+//! ```text
+//! mkdir -p target/artifacts
+//! cp dist/vmlinux dist/vmlinux-usb dist/initramfs.cpio.gz target/artifacts/
+//! ```
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -102,12 +111,44 @@ impl Drop for FakeUsbipd {
     }
 }
 
+/// Where a run gets its boot artifacts from.
+#[derive(Clone, Copy)]
+enum Artifacts {
+    /// Whatever the environment says — in CI, the `IZBA_KERNEL*` overrides.
+    Injected,
+    /// The way an installed build finds them: no overrides at all, so the
+    /// kernel can only come from `<exe-dir>/../artifacts`.
+    Installed,
+}
+
+/// Every environment variable that hands izba a boot artifact directly.
+const ARTIFACT_OVERRIDES: [&str; 3] = ["IZBA_KERNEL", "IZBA_KERNEL_USB", "IZBA_INITRAMFS"];
+
+/// The directory an installed build keeps its boot artifacts in, relative to
+/// the binary under test: `<exe-dir>/../artifacts` (`/usr/lib/izba/artifacts`
+/// for the .deb, `{app}\artifacts` for the Windows installer, and
+/// `target/artifacts` here).
+fn installed_artifacts_dir() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_izba"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the izba binary has a grandparent dir")
+        .join("artifacts")
+}
+
+fn izba_as<S: AsRef<std::ffi::OsStr>>(how: Artifacts, data: &Path, args: &[S]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_izba"));
+    cmd.env("IZBA_DATA_DIR", data).args(args);
+    if matches!(how, Artifacts::Installed) {
+        for var in ARTIFACT_OVERRIDES {
+            cmd.env_remove(var);
+        }
+    }
+    cmd.output().expect("run izba")
+}
+
 fn izba<S: AsRef<std::ffi::OsStr>>(data: &Path, args: &[S]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_izba"))
-        .env("IZBA_DATA_DIR", data)
-        .args(args)
-        .output()
-        .expect("run izba")
+    izba_as(Artifacts::Injected, data, args)
 }
 
 fn out(o: &Output) -> String {
@@ -260,6 +301,112 @@ fn a_granted_device_reaches_the_workload_and_carries_bytes_both_ways() {
     );
 
     teardown(data.path(), &name);
+}
+
+#[test]
+fn a_granted_device_attaches_on_the_kernel_an_installed_build_resolves() {
+    // #191. Every other case here is handed its kernel through IZBA_KERNEL_USB
+    // — precisely the path an installed user never takes, and the reason a
+    // build that shipped no USB kernel at all (#189) passed a fully green
+    // board. This case takes the overrides away: the data root is a fresh
+    // tempdir with no `artifacts/`, so the ONLY place left to find a kernel is
+    // next to the binary, where an installer puts it.
+    //
+    // EVERY izba invocation below goes through `Artifacts::Installed`. izbad is
+    // spawned by the first one and inherits its environment; one stray call
+    // with the overrides intact could hand the daemon a kernel and this would
+    // prove nothing.
+    let Some(env) = want() else { return };
+    let staged = installed_artifacts_dir();
+    for f in ["vmlinux-usb", "initramfs.cpio.gz"] {
+        assert!(
+            staged.join(f).is_file(),
+            "IZBA_INTEGRATION=1 but {} is not staged — this case boots from the \
+             installed layout, never from an override. Stage it with:\n  \
+             mkdir -p {dir} && cp dist/vmlinux dist/vmlinux-usb dist/initramfs.cpio.gz {dir}/",
+            staged.join(f).display(),
+            dir = staged.display(),
+        );
+    }
+    let fake = FakeUsbipd::start(&env);
+    let data = tempfile::tempdir().unwrap();
+    let how = Artifacts::Installed;
+    let name = "usbinstalled";
+
+    ok(
+        &izba_as(how, data.path(), &["usb", "upstream", "set", &fake.addr]),
+        "usb upstream set",
+    );
+    assert!(
+        !data.path().join("artifacts").exists(),
+        "the data root must hold no artifacts, or the lookup could be satisfied there"
+    );
+    ok(
+        &izba_as(how, data.path(), &create_args(data.path(), name)),
+        "create",
+    );
+    ok(
+        &izba_as(
+            how,
+            data.path(),
+            &[
+                "usb",
+                "allow",
+                name,
+                "--device",
+                DEVICE,
+                "--confirm",
+                DEVICE,
+            ],
+        ),
+        "usb allow",
+    );
+    ok(
+        &izba_as(how, data.path(), &["start", name]),
+        "start on the installed-layout USB kernel",
+    );
+    ok(
+        &izba_as(
+            how,
+            data.path(),
+            &["usb", "attach", name, "--device", DEVICE],
+        ),
+        "usb attach",
+    );
+
+    // Behavioural, like the central case: the node exists in the container and
+    // bytes come back, which only a kernel with vhci-hcd + cdc-acm can do.
+    let echoed = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let o = izba_as(
+                how,
+                data.path(),
+                &[
+                    "exec",
+                    name,
+                    "--",
+                    "sh",
+                    "-c",
+                    "stty -F /dev/izba/ttyACM0 raw -echo && exec 3<>/dev/izba/ttyACM0 && \
+                     printf hello >&3 && timeout 10 head -c5 <&3",
+                ],
+            );
+            if o.status.success() || Instant::now() >= deadline {
+                break o;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    ok(&echoed, "serial echo on the installed-layout kernel");
+    assert_eq!(
+        String::from_utf8_lossy(&echoed.stdout).trim(),
+        "hello",
+        "the bytes written must come back: {}",
+        out(&echoed)
+    );
+
+    let _ = izba_as(how, data.path(), &["rm", "-f", name]);
 }
 
 #[test]
