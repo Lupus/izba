@@ -316,8 +316,6 @@ impl DaemonClient {
     }
 }
 
-/// Does this error chain say "the daemon died under us mid-handshake"?
-/// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
 /// Does this connect error mean "no daemon is listening"? Beyond the
 /// portable kinds, Windows AF_UNIX surfaces raw WSA codes that std does not
 /// map: connecting to a stale socket file yields WSAENETDOWN (10050) or
@@ -330,6 +328,8 @@ fn connect_says_no_daemon(e: &std::io::Error) -> bool {
     ) || matches!(e.raw_os_error(), Some(10050) | Some(10049))
 }
 
+/// Does this error chain say "the daemon died under us mid-handshake"?
+/// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
 fn is_daemon_gone(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let kind = match c.downcast_ref::<std::io::Error>() {
@@ -372,11 +372,11 @@ impl std::fmt::Display for PeerRejected {
             f,
             "izbad closed the connection without answering: its control socket {} belongs to \
              uid {}, but this izba is running as uid {}. izbad serves only the user who \
-             started it — rerun izba as that user (for example, without sudo). Each refused \
-             connection is logged in {}",
+             started it — rerun izba as uid {}. Each refused connection is logged in {}",
             self.socket.display(),
             self.daemon_uid,
             self.client_uid,
+            self.daemon_uid,
             self.daemon_log.display()
         )
     }
@@ -409,10 +409,13 @@ fn socket_owner_uid(sock: &Path) -> Option<u32> {
 }
 
 /// Was the hello exchange cut off by the peer closing the connection?
-/// izbad's refusal closes without reading, which reaches the client as a
-/// clean EOF, `ECONNRESET` (our hello was still unread), or `EPIPE` on the
-/// hello write (it closed before we wrote). A timeout is NOT a cut-off: a
-/// refusing daemon closes at once, a wedged one does not.
+/// izbad's refusal closes without reading or replying, which reaches the
+/// client as a clean EOF before any reply byte, `ECONNRESET` (our hello was
+/// still unread), or `EPIPE` on the hello write (it closed before we wrote).
+/// A reply cut off part-way (`UnexpectedEof`) means the daemon had accepted
+/// us and then died, and a timeout means it is wedged — neither is a refusal.
+/// This inspects every error in the chain, so it is the uid evidence in
+/// `peer_rejection`, not this function alone, that makes the diagnosis safe.
 fn handshake_dropped(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let io = match c.downcast_ref::<izba_proto::FrameError>() {
@@ -424,9 +427,7 @@ fn handshake_dropped(e: &anyhow::Error) -> bool {
         io.is_some_and(|io| {
             matches!(
                 io.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
             )
         })
     })
@@ -1079,7 +1080,6 @@ mod tests {
     fn handshake_dropped_detection() {
         use std::io::ErrorKind;
         assert!(handshake_dropped(&hello_eof()));
-        assert!(handshake_dropped(&hello_io_error(ErrorKind::UnexpectedEof)));
         assert!(handshake_dropped(&hello_io_error(
             ErrorKind::ConnectionReset
         )));
@@ -1088,8 +1088,14 @@ mod tests {
         assert!(handshake_dropped(&anyhow::Error::new(
             std::io::Error::from(ErrorKind::ConnectionReset)
         )));
-        // A wedged daemon times out; that is not a refusal.
+        // Partial reply then EOF: the daemon accepted us and died — not a refusal.
+        assert!(!handshake_dropped(&hello_io_error(
+            ErrorKind::UnexpectedEof
+        )));
+        // A wedged daemon times out; that is not a refusal. A unix socket read
+        // timeout (SO_RCVTIMEO) surfaces as WouldBlock; TimedOut is Windows'.
         assert!(!handshake_dropped(&hello_io_error(ErrorKind::TimedOut)));
+        assert!(!handshake_dropped(&hello_io_error(ErrorKind::WouldBlock)));
         assert!(!handshake_dropped(&hello_io_error(
             ErrorKind::PermissionDenied
         )));
@@ -1126,7 +1132,7 @@ mod tests {
 
     /// A data root holding a plain file where the control socket lives: the
     /// diagnosis only stats the path, so no listener is needed.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn paths_with_socket_file() -> (tempfile::TempDir, crate::paths::Paths) {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
@@ -1166,6 +1172,12 @@ mod tests {
         let (_dir, paths) = paths_with_socket_file();
         let timed_out = hello_io_error(std::io::ErrorKind::TimedOut);
         assert_eq!(peer_rejection(&paths, &timed_out, Some(my_uid() + 1)), None);
+        // A unix read timeout surfaces as WouldBlock rather than TimedOut.
+        let would_block = hello_io_error(std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            peer_rejection(&paths, &would_block, Some(my_uid() + 1)),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1191,6 +1203,7 @@ mod tests {
         let msg = format!("{:#}", anyhow::Error::new(rejected));
         assert!(msg.contains("belongs to uid 1000"), "{msg}");
         assert!(msg.contains("running as uid 0"), "{msg}");
+        assert!(msg.contains("rerun izba as uid 1000"), "{msg}");
         assert!(msg.contains("/data/daemon/izbad.sock"), "{msg}");
         assert!(msg.contains("/data/daemon/daemon.log"), "{msg}");
         assert!(!msg.contains("reading hello reply"), "{msg}");
