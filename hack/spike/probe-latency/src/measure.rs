@@ -11,16 +11,18 @@
 //! * **direct**: the bare connector. One dial, one guest round trip.
 //!
 //! The daemon wraps its stream in a `DeadlineStream` bounded by
-//! `CONTAINER_PROBE_TIMEOUT` / `STATS_PROBE_TIMEOUT`; this tool deliberately
-//! does not, so a phase that would have been cut off at the bound is measured
-//! at its real length.
+//! `CONTAINER_PROBE_TIMEOUT` / `STATS_PROBE_TIMEOUT`. This tool wraps it in
+//! the same `DeadlineStream`, but with the far longer [`io_cap`] as its
+//! deadline, so a phase that the daemon would have cut off at the bound is
+//! measured at its real length — while a guest that never finishes its reply
+//! still cannot hold an iteration open indefinitely.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use izba_core::paths::Paths;
 use izba_core::sandbox::Connector;
-use izba_core::vmm::IoStream;
+use izba_core::vmm::{DeadlineStream, IoStream};
 use izba_proto::{read_frame, write_frame, Response};
 use serde::ser::SerializeMap as _;
 use serde::{Serialize, Serializer};
@@ -118,16 +120,21 @@ impl Measured {
     }
 }
 
-/// Per-syscall read/write timeout put on the stream so a wedged guest ends the
-/// iteration as a `read` failure instead of hanging the tool. It is a safety
-/// net, not the bound under test: at least 30 s and at least twice the bound,
-/// so every latency up to 2x the bound is still observed in full.
+/// Overall deadline for one exchange (the write plus the read), counted from
+/// the moment the stream is open, so a wedged OR trickling guest ends the
+/// iteration as a failure instead of hanging the tool. It is a safety net, not
+/// the bound under test: at least 30 s and at least twice the bound, so every
+/// latency up to 2x the bound is still observed in full.
 pub fn io_cap(bound_ms: u64) -> Duration {
     Duration::from_millis(bound_ms.saturating_mul(2)).max(Duration::from_secs(30))
 }
 
 /// Open a stream with `open`, then do one `request` exchange on it, timing
 /// the open and the exchange separately.
+///
+/// `io_cap` bounds the exchange as a whole — every read and write gets only
+/// what is left of it (`DeadlineStream`, as in the daemon's own probes). It
+/// starts once the stream is open and does not cover `open` itself.
 pub fn exchange(
     kind: Kind,
     request: RequestKind,
@@ -135,30 +142,25 @@ pub fn exchange(
     open: impl FnOnce() -> anyhow::Result<Box<dyn IoStream>>,
 ) -> Measured {
     let t0 = Instant::now();
-    let mut conn = match open() {
+    let conn = match open() {
         Ok(conn) => conn,
         Err(e) => return failed(request, kind.open_phase(), None, t0, e),
     };
     let t1 = Instant::now();
     let open_us = Some(micros(t0, t1));
 
-    let sent = conn
-        .set_io_timeout(Some(io_cap))
-        .context("setting the safety I/O timeout")
-        .and_then(|()| {
-            write_frame(&mut conn, &request.request())
-                .with_context(|| format!("writing the {} request", request.label()))
-        });
+    let mut conn = DeadlineStream::new(conn, deadline_after(t1, io_cap));
+
+    let sent = write_frame(&mut conn, &request.request())
+        .with_context(|| format!("writing the {} request", request.label()));
     if let Err(e) = sent {
         return failed(request, Phase::Write, open_us, t0, e);
     }
-    let response = match read_frame::<_, Response>(&mut conn) {
+    let response = match read_frame::<_, Response>(&mut conn)
+        .with_context(|| format!("reading the {} response", request.label()))
+    {
         Ok(response) => response,
-        Err(e) => {
-            let e =
-                anyhow::Error::new(e).context(format!("reading the {} response", request.label()));
-            return failed(request, Phase::Read, open_us, t0, e);
-        }
+        Err(e) => return failed(request, Phase::Read, open_us, t0, e),
     };
     let t2 = Instant::now();
 
@@ -174,6 +176,13 @@ pub fn exchange(
         inspect_container: inspect_container(request, &outcome),
         response: outcome.ok(),
     }
+}
+
+/// `from + cap`, or a year out when that is not representable (an absurd
+/// `--bound-ms`) — `Instant + Duration` panics on overflow.
+fn deadline_after(from: Instant, cap: Duration) -> Instant {
+    from.checked_add(cap)
+        .unwrap_or_else(|| from + Duration::from_secs(365 * 24 * 60 * 60))
 }
 
 fn failed(
@@ -489,6 +498,84 @@ mod tests {
         assert_eq!(m.phase_failed, Some(Phase::Read));
         assert!(m.failed_after_us.unwrap() >= 100_000);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The cap is ONE deadline for the whole exchange, not a timeout that
+    /// restarts on every read: a guest dribbling a legal frame a byte at a
+    /// time, each byte well inside the cap, must still be cut off at the cap.
+    #[test]
+    fn trickling_guest_is_cut_off_at_the_cap_not_after_the_whole_frame() {
+        const CAP: Duration = Duration::from_millis(300);
+        const GAP: Duration = Duration::from_millis(50);
+        // ~110 bytes on the wire: over 5 s at one byte per GAP.
+        let reply = Response::Error {
+            kind: ErrorKind::Internal,
+            message: "x".repeat(60),
+        };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &reply).unwrap();
+        assert!(
+            GAP * u32::try_from(frame.len()).unwrap() > Duration::from_secs(2),
+            "the frame must take far longer than the cap to arrive"
+        );
+
+        let (host, mut guest) = UdsStream::pair().expect("socketpair");
+        let trickle = std::thread::spawn(move || {
+            let _req: Request = read_frame(&mut guest).expect("guest reads the request");
+            for byte in frame {
+                std::thread::sleep(GAP);
+                // Fails once the host has given up and dropped its end.
+                if std::io::Write::write_all(&mut guest, &[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let m = exchange(Kind::Direct, HEALTH, CAP, move || {
+            Ok(Box::new(host) as Box<dyn IoStream>)
+        });
+        let took = started.elapsed();
+        trickle.join().unwrap();
+
+        assert_eq!(m.phase_failed, Some(Phase::Read), "{m:?}");
+        assert!(m
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("reading the Health response: "));
+        assert_eq!(m.inspect_container, "none");
+        assert_eq!((m.rpc_us, m.total_us), (None, None));
+        // At the cap, give or take: generous headroom for a loaded machine,
+        // and nowhere near the 5 s the whole frame would have taken.
+        assert!(took < Duration::from_millis(1500), "took {took:?}");
+        assert!(m.failed_after_us.unwrap() >= 250_000, "{m:?}");
+    }
+
+    /// The cap is counted from the moment the stream is open, so a slow open
+    /// neither eats into it nor moves the open/exchange boundary.
+    #[test]
+    fn the_deadline_starts_after_the_open() {
+        const CAP: Duration = Duration::from_millis(300);
+        let (host, guest) = fake_guest(Some(health(Some(ContainerState::Running))));
+        let m = exchange(Kind::Probe, HEALTH, CAP, move || {
+            // An open that alone takes longer than the cap.
+            std::thread::sleep(CAP + Duration::from_millis(100));
+            Ok(host)
+        });
+        guest.join().unwrap();
+        assert!(m.ok(), "{m:?}");
+        assert!(m.open_us.unwrap() >= 400_000, "{m:?}");
+        assert!(m.rpc_us.unwrap() < 300_000, "{m:?}");
+    }
+
+    /// An absurd `--bound-ms` must not overflow the deadline arithmetic.
+    #[test]
+    fn an_unrepresentable_deadline_does_not_panic() {
+        let (host, guest) = fake_guest(Some(health(Some(ContainerState::Running))));
+        let m = exchange(Kind::Direct, HEALTH, Duration::MAX, move || Ok(host));
+        guest.join().unwrap();
+        assert!(m.ok(), "{m:?}");
     }
 
     #[test]
