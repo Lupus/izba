@@ -524,7 +524,10 @@ mod tests {
     fn every_installer_build_runs_the_payload_verifier() {
         // A verifier with a test and no call site is the defect class this
         // feature keeps producing: the rule exists, nothing invokes it. Both
-        // workflows that build installers must run it in both modes.
+        // workflows that build installers must run it in both modes. The
+        // needle is the `run:` step form on purpose: release.yml's dispatch-only
+        // `smoke` job also calls the script, but from inside a `run: |` block, so
+        // it is not `run:`-prefixed and (like a comment) cannot satisfy this.
         for wf in [
             ".github/workflows/release.yml",
             ".github/workflows/devbuild.yml",
@@ -532,13 +535,30 @@ mod tests {
             let text = std::fs::read_to_string(repo_root().join(wf))
                 .unwrap_or_else(|e| panic!("{wf} must be readable from the crate: {e}"));
             for mode in ["deb", "stage"] {
-                let call = format!("packaging/verify-payload.sh {mode} ");
+                let call = format!("run: packaging/verify-payload.sh {mode} ");
                 assert!(
                     text.contains(&call),
                     "{wf} never runs `{call}…`: an installer missing a kernel \
                      would be built and uploaded unchecked"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_windows_installer_ships_exactly_what_the_stage_verifier_checked() {
+        // `verify-payload.sh stage` checks the stage DIRECTORY, not the built
+        // installer. That is only a valid proxy while izba.iss takes its boot
+        // artifacts and VMM tools from that directory wholesale; a recipe
+        // narrowed to named files would make the check prove nothing.
+        let iss = std::fs::read_to_string(repo_root().join("packaging/windows/izba.iss"))
+            .expect("packaging/windows/izba.iss must be readable from the crate");
+        for glob in [r"{#StageDir}\artifacts\*", r"{#StageDir}\bin\libexec\*"] {
+            assert!(
+                iss.contains(glob),
+                "packaging/windows/izba.iss no longer installs {glob}: the stage-dir \
+                 payload check in the packaging workflows no longer describes the installer"
+            );
         }
     }
 

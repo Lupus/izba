@@ -401,13 +401,15 @@ Assembles the Linux `.deb`. It stages a self-contained tree and runs
 | `IZBA_CH` | static `cloud-hypervisor` |
 | `IZBA_VIRTIOFSD` | static `virtiofsd` |
 | `IZBA_VMLINUX` | kernel image |
+| `IZBA_VMLINUX_USB` | USB-capable kernel image (`vmlinux-usb`) |
 | `IZBA_INITRAMFS` | `initramfs.cpio.gz` |
+| `IZBA_KASMVNC_EROFS` | KasmVNC + WM erofs bundle (`kasmvnc.erofs`) |
 | `VERSION` | deb version (e.g. `0.1.0` or `0.1.0~git<sha>`) |
 | `OUT_DIR` | output dir (default `dist/`) |
 
 Installed layout: `/usr/lib/izba/bin/izba`,
 `/usr/lib/izba/bin/libexec/{cloud-hypervisor,virtiofsd}`,
-`/usr/lib/izba/artifacts/{vmlinux,initramfs.cpio.gz}`, and a
+`/usr/lib/izba/artifacts/{vmlinux,vmlinux-usb,initramfs.cpio.gz,kasmvnc.erofs}`, and a
 `/usr/bin/izba` symlink. `mkfs.erofs` is an apt dependency (`erofs-utils`).
 
 ### `packaging/windows/izba.iss`
@@ -418,9 +420,10 @@ The Inno Setup script for the Windows installer. Build it with:
 iscc /DMyAppVersion=<ver> /DStageDir=<abs stage dir> /O<abs out dir> packaging/windows/izba.iss
 ```
 
-It expects the stage dir to contain `bin/izba.exe`, `bin/libexec/{openvmm.exe,
-mkfs.erofs.exe}`, and `artifacts/{vmlinux, initramfs.cpio.gz}`, and installs them
-under `%ProgramFiles%\izba`, adding `%ProgramFiles%\izba\bin` to the system PATH.
+It expects the stage dir to contain `bin/{izba.exe, izba-jail-helper.exe, izba-app.exe}`,
+`bin/libexec/{openvmm.exe, mkfs.erofs.exe}`, and
+`artifacts/{vmlinux, vmlinux-usb, initramfs.cpio.gz, kasmvnc.erofs}`, and installs
+them under `%ProgramFiles%\izba`, adding `%ProgramFiles%\izba\bin` to the system PATH.
 
 `packaging/verify-payload.sh` asserts that an installer payload carries every
 boot artifact and VMM tool: `verify-payload.sh deb <izba_*.deb>` reads the built
