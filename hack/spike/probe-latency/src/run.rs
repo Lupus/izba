@@ -34,6 +34,7 @@ fn run_worker(
 ) -> Vec<Sample> {
     let connector = default_connector();
     let cap = io_cap(args.bound_ms);
+    let name = args.sandbox.as_str();
     let mut samples = Vec::with_capacity(2 * args.iterations as usize);
     for iteration in 0..args.iterations {
         if iteration > 0 {
@@ -42,8 +43,8 @@ fn run_worker(
         for kind in [Kind::Probe, Kind::Direct] {
             let started_ms = u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
             let m = match kind {
-                Kind::Probe => measure_probe(paths, &args.sandbox, &connector, cap),
-                Kind::Direct => measure_direct(paths, &args.sandbox, &connector, cap),
+                Kind::Probe => measure_probe(paths, name, &connector, args.request, cap),
+                Kind::Direct => measure_direct(paths, name, &connector, args.request, cap),
             };
             let sample = Sample {
                 worker,

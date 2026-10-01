@@ -8,12 +8,18 @@
 //! Nothing in the product tells them apart or says how long each phase took.
 //! This crate does both, talking to the guest directly — no daemon involved.
 //!
+//! The desktop app's Overview takes the same line from a different probe,
+//! `probe_guest_stats` (`Request::Stats`, also bounded at 5 s, and slower: the
+//! guest samples CPU for ~250 ms inside the call). `--request stats` measures
+//! that one instead; see [`request::RequestKind`].
+//!
 //! Everything except [`run`] is pure or driven through a socketpair, so it is
 //! unit-tested without a VM.
 
 pub mod args;
 pub mod classify;
 pub mod measure;
+pub mod request;
 pub mod run;
 pub mod stats;
 pub mod summary;
