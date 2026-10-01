@@ -750,18 +750,6 @@ jobs:
           TTYSTORM_EXE: ${{ github.workspace }}\target\release\examples\ttystorm.exe
           IZBA_DATA_DIR: ${{ runner.temp }}\storm-data
         run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
-      # USB passthrough over OpenVMM's hybrid-vsock bridge (#191). The fake
-      # usbip server is an EXCLUDED crate (it links libusb, vendored by
-      # libusb1-sys on MSVC) built only here and in linux-kvm.
-      - name: Build the fake usbip server (excluded crate)
-        shell: bash
-        run: cargo build --locked --release --manifest-path hack/fake-usbipd/Cargo.toml
-      - name: USB passthrough gate (real vhci over vsock 1028, installed-layout kernel)
-        env:
-          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
-          IZBA_FAKE_USBIPD: ${{ github.workspace }}\hack\fake-usbipd\target\release\fake-usbipd.exe
-          IZBA_DATA_DIR: ${{ runner.temp }}\usb-data
-        run: pwsh -NoProfile -File hack/ci/usb-attach-gate.ps1
       # ConPTY canary: spawn a trivial child through ConPTY and require its
       # output to reach the parser (izba-ttytest's own smoke test — no izba,
       # no sockets, no VM). GitHub-hosted Windows runners historically lost ALL
@@ -795,6 +783,23 @@ jobs:
           IZBA_TTY_E2E: '1'
           IZBA_DATA_DIR: ${{ runner.temp }}\tty-data
         run: cargo test -p izba-cli --features ttytests --test tty_e2e -- --test-threads=1 --nocapture
+      # USB passthrough over OpenVMM's hybrid-vsock bridge (#191). The fake
+      # usbip server is an EXCLUDED crate (it links libusb, vendored by
+      # libusb1-sys on MSVC) built only here and in linux-kvm.
+      # Runs LAST and with `!cancelled()` on purpose: a tty failure must not
+      # hide this gate's signal, and this gate (new on hosted WHP) must not
+      # skip the tty steps when it fails.
+      - name: Build the fake usbip server (excluded crate)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo build --locked --release --manifest-path hack/fake-usbipd/Cargo.toml
+      - name: USB passthrough gate (real vhci over vsock 1028, installed-layout kernel)
+        if: ${{ !cancelled() }}
+        env:
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          IZBA_FAKE_USBIPD: ${{ github.workspace }}\hack\fake-usbipd\target\release\fake-usbipd.exe
+          IZBA_DATA_DIR: ${{ runner.temp }}\usb-data
+        run: pwsh -NoProfile -File hack/ci/usb-attach-gate.ps1
       - name: Upload sandbox logs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -804,7 +809,7 @@ jobs:
             ~\AppData\Local\izba\sandboxes\*\logs\*
             ${{ runner.temp }}\tty-data\sandboxes\*\logs\*
             ${{ runner.temp }}\storm-data\sandboxes\*\logs\*
-            ${{ runner.temp }}\usb-data\sandboxes\*\logs\*
+            ${{ runner.temp }}\usb-data\kept-logs\*
             ${{ runner.temp }}\usb-data\daemon\daemon.log
           if-no-files-found: ignore
 

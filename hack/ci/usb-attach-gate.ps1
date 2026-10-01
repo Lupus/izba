@@ -107,6 +107,7 @@ try {
     while (-not $addr -and (Get-Date) -lt $deadline) {
         $line = Get-Content $fakeOut -TotalCount 1 -ErrorAction SilentlyContinue
         if ($line -match '^\s*(127\.0\.0\.1:\d+)\s*$') { $addr = $Matches[1] }
+        elseif ($fakeProc.HasExited) { break }
         else { Start-Sleep -Milliseconds 200 }
     }
     Check 'fake usbip server announced its address' ($null -ne $addr)
@@ -164,21 +165,34 @@ try {
 
     & $exe usb detach $name --device $device | Out-Null
     Check 'usb detach exits 0' ($LASTEXITCODE -eq 0)
+    # Absence has to be OBSERVED: the probe itself must succeed. A dead VM or
+    # a broken exec also makes a plain `ls` fail, and must not read as "gone".
     $gone = $false
     $deadline = (Get-Date).AddSeconds(15)
     do {
-        & $exe exec $name -- sh -c 'ls /dev/izba/ttyACM0' 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { $gone = $true; break }
+        & $exe exec $name -- sh -c 'test ! -e /dev/izba/ttyACM0' 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $gone = $true; break }
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
-    Check 'the device node is gone after detach' $gone
+    Check 'the device node is gone after detach (observed by a successful probe)' $gone
 }
 catch {
     [Console]::Error.WriteLine("usb gate aborted: $($_.Exception.Message)")
-    $fails++
+    # An abort after a failed Check is already counted; an exception with no
+    # failed Check before it must still fail the gate.
+    if ($fails -eq 0) { $fails++ }
 }
 finally {
-    if ($fails -gt 0) { Show-Diagnostics }
+    if ($fails -gt 0) {
+        Show-Diagnostics
+        # `izba rm` deletes the sandbox dir, logs included. Set them aside
+        # first: on a failure they are the evidence, and the workflow uploads
+        # this directory.
+        $logs = Join-Path $data "sandboxes\$name\logs"
+        if (Test-Path $logs) {
+            Copy-Item $logs (Join-Path $data 'kept-logs') -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     & $exe rm --force $name 2>$null | Out-Null
     & $exe daemon stop 2>$null | Out-Null
     if ($null -ne $fakeProc -and -not $fakeProc.HasExited) {
@@ -186,7 +200,7 @@ finally {
     }
     Remove-Item $fakeOut -Force -ErrorAction SilentlyContinue
     Remove-Item $ws -Recurse -Force -ErrorAction SilentlyContinue
-    # Keep the data root on failure: its logs are the evidence.
+    # Keep the data root on failure: kept-logs\ and daemon\daemon.log are the evidence.
     if ($fails -eq 0) { Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
