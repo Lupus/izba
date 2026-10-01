@@ -253,8 +253,18 @@ fn run_dirs(data: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Remove the sandbox and stop the per-data-root daemon the CLI auto-started.
+///
+/// The removal is ASSERTED: this used to pass `-f`, a flag `izba rm` does not
+/// have, and discard the result — so every case, green or not, left its VM and
+/// daemon running. The daemon stop is best-effort (it may already be gone).
+fn teardown_as(how: Artifacts, data: &Path, name: &str) {
+    ok(&izba_as(how, data, &["rm", "--force", name]), "rm --force");
+    let _ = izba_as(how, data, &["daemon", "stop"]);
+}
+
 fn teardown(data: &Path, name: &str) {
-    let _ = izba(data, &["rm", "-f", name]);
+    teardown_as(Artifacts::Injected, data, name);
 }
 
 #[test]
@@ -406,7 +416,7 @@ fn a_granted_device_attaches_on_the_kernel_an_installed_build_resolves() {
         out(&echoed)
     );
 
-    let _ = izba_as(how, data.path(), &["rm", "-f", name]);
+    teardown_as(how, data.path(), name);
 }
 
 #[test]
