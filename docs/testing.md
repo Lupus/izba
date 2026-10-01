@@ -479,6 +479,21 @@ consomme. The interactive `exec -it` checklist (PTY, VT rendering, resize,
 Ctrl-C, mode restore) is in the
 [Plan 2 doc](superpowers/plans/2026-06-10-izba-windows-port-p2.md), Task 5.
 
+**USB passthrough gate.** `hack/ci/usb-attach-gate.ps1` is a separate script
+(its own step in the `windows-whp` job) and uses its own data root, so it never
+touches `%LOCALAPPDATA%\izba`. It needs an installer-shaped layout —
+`<root>\bin\izba.exe`, `<root>\bin\libexec\{openvmm.exe,mkfs.erofs.exe}`,
+`<root>\artifacts\{vmlinux-usb,initramfs.cpio.gz}` — plus a Windows build of the
+fake server:
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu --manifest-path hack/fake-usbipd/Cargo.toml
+# Windows side:
+#   $env:IZBA_EXE = '<root>\bin\izba.exe'
+#   $env:IZBA_FAKE_USBIPD = '<path>\fake-usbipd.exe'
+#   pwsh -NoProfile -File hack/ci/usb-attach-gate.ps1     # expect: ALL PASS
+```
+
 **Historical (pre-M1, no longer applies).** Guest egress on Windows used to
 ride OpenVMM's consomme NAT, which advertised IPv6 (SLAAC) to the guest
 whenever the host had *any* non-link-local IPv6 address — a Tailscale/VPN ULA

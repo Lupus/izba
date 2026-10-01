@@ -543,6 +543,34 @@ mod tests {
     }
 
     #[test]
+    fn e2e_ci_attaches_a_usb_device_on_both_platforms() {
+        // #191: Windows is the platform USB passthrough exists for (usbipd-win
+        // lives there) and was the one platform with no e2e of it. Pin that the
+        // real-VM workflow drives an attach on each: the Rust suite on KVM, the
+        // PowerShell gate on WHP — fed the fake server it needs.
+        let e2e = std::fs::read_to_string(repo_root().join(".github/workflows/e2e.yml"))
+            .expect(".github/workflows/e2e.yml must be readable from the crate");
+        assert!(
+            e2e.contains("--test usb_attach_e2e"),
+            "e2e.yml no longer runs the Linux/KVM USB attach suite"
+        );
+        assert!(
+            e2e.contains("hack/ci/usb-attach-gate.ps1"),
+            "e2e.yml runs no Windows/OpenVMM USB attach: the vsock-1028 plane \
+             over OpenVMM's hybrid-vsock bridge would be taken on trust"
+        );
+        assert!(
+            e2e.contains("fake-usbipd.exe"),
+            "e2e.yml never hands the Windows gate a fake usbip server \
+             (IZBA_FAKE_USBIPD=…\\fake-usbipd.exe)"
+        );
+        assert!(
+            repo_root().join("hack/ci/usb-attach-gate.ps1").is_file(),
+            "hack/ci/usb-attach-gate.ps1 is referenced by e2e.yml but missing"
+        );
+    }
+
+    #[test]
     fn e2e_ci_builds_and_stages_the_kasmvnc_bundle() {
         // The defect this pins (Task 13): `crates/izba-cli/tests/daemon_e2e.rs`'s
         // vnc_desktop_e2e requires kasmvnc.erofs staged at the PRODUCTION

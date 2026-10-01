@@ -192,6 +192,18 @@ throwaway sandbox, runs `ttystorm floodfast 20 2048` + `chop 30 256` through
 izbad, and asserts the VM is still alive afterwards. Env: `IZBA_EXE`,
 `TTYSTORM_EXE` (paths to the binaries), `IZBA_IMAGE` (default `alpine:3.20`).
 
+### `ci/usb-attach-gate.ps1`
+
+The Windows/OpenVMM USB passthrough gate used by the `windows-whp` job: starts
+`hack/fake-usbipd`, grants its device to a fresh sandbox, boots it, attaches,
+and asserts `/dev/izba/ttyACM0` appears in the container and echoes bytes — the
+vhci → vsock 1028 → OpenVMM hybrid-vsock → izbad → TCP path end to end. It
+clears `IZBA_KERNEL` / `IZBA_KERNEL_USB` / `IZBA_INITRAMFS` and uses a fresh
+data root, so the kernel is resolved from `<exe-dir>\..\artifacts` exactly as
+an installed build does. Env: `IZBA_EXE`, `IZBA_FAKE_USBIPD` (required),
+`IZBA_IMAGE` (default `alpine:3.20`), `IZBA_DATA_DIR` (default: a per-run dir
+under `%TEMP%`).
+
 ### `fetch-artifacts.sh`
 
 Idempotent dependency checker / downloader.  Manages:
