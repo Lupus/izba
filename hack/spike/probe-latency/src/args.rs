@@ -1,12 +1,19 @@
-//! Command-line parsing. Hand-rolled: five options do not justify a clap
+//! Command-line parsing. Hand-rolled: six options do not justify a clap
 //! dependency in a throwaway tool.
 
+use crate::request::RequestKind;
+
 pub const USAGE: &str = "\
-usage: probe-latency <sandbox-name> [--iterations N] [--interval-ms M] [--parallel K] [--bound-ms B]
+usage: probe-latency <sandbox-name> [--request health|stats] [--iterations N]
+                     [--interval-ms M] [--parallel K] [--bound-ms B]
 
 Times the phases of izbad's container-state probe against a RUNNING sandbox,
 talking to the guest directly (no daemon). One JSON line per measurement on
 stdout, then one {\"summary\": ...} line.
+
+  --request R       which guest RPC to send                    (default health)
+                      health  what `izba status` / Inspect is built from
+                      stats   what the desktop app's Overview is built from
 
   --iterations N    iterations per worker                      (default 20, >= 1)
   --interval-ms M   pause between iterations                   (default 250)
@@ -23,6 +30,7 @@ pub struct Args {
     pub interval_ms: u64,
     pub parallel: u32,
     pub bound_ms: u64,
+    pub request: RequestKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +55,7 @@ where
     let mut interval_ms: u64 = 250;
     let mut parallel: u32 = 1;
     let mut bound_ms: u64 = 5000;
+    let mut request = RequestKind::default();
 
     let mut rest = argv.into_iter();
     while let Some(arg) = rest.next() {
@@ -63,7 +72,7 @@ where
         };
         if !matches!(
             flag.as_str(),
-            "--iterations" | "--interval-ms" | "--parallel" | "--bound-ms"
+            "--iterations" | "--interval-ms" | "--parallel" | "--bound-ms" | "--request"
         ) {
             return Err(format!("unknown option '{flag}'"));
         }
@@ -75,7 +84,11 @@ where
             "--iterations" => iterations = number(&flag, &value, 1)?,
             "--interval-ms" => interval_ms = number(&flag, &value, 0)?,
             "--parallel" => parallel = number(&flag, &value, 1)?,
-            _ => bound_ms = number(&flag, &value, 1)?,
+            "--bound-ms" => bound_ms = number(&flag, &value, 1)?,
+            _ => {
+                request = RequestKind::parse(&value)
+                    .ok_or_else(|| format!("{flag} must be 'health' or 'stats', got '{value}'"))?
+            }
         }
     }
 
@@ -86,6 +99,7 @@ where
         interval_ms,
         parallel,
         bound_ms,
+        request,
     }))
 }
 
@@ -131,6 +145,7 @@ mod tests {
                 interval_ms: 250,
                 parallel: 1,
                 bound_ms: 5000,
+                request: RequestKind::Health,
             }
         );
     }
@@ -176,6 +191,7 @@ mod tests {
             interval_ms: 10,
             parallel: 4,
             bound_ms: 900,
+            request: RequestKind::Stats,
         };
         assert_eq!(
             run(&[
@@ -186,6 +202,8 @@ mod tests {
                 "--parallel",
                 "4",
                 "--bound-ms=900",
+                "--request",
+                "stats",
             ]),
             want
         );
@@ -209,6 +227,32 @@ mod tests {
             let e = err(&["box", &format!("{flag}=1.5")]);
             assert!(e.contains(flag), "{e}");
         }
+    }
+
+    #[test]
+    fn request_selects_the_rpc_and_touches_nothing_else() {
+        let d = run(&["box"]);
+        assert_eq!(
+            run(&["box", "--request", "stats"]),
+            Args {
+                request: RequestKind::Stats,
+                ..d.clone()
+            }
+        );
+        assert_eq!(run(&["box", "--request=stats"]).request, RequestKind::Stats);
+        // Spelling the default out is the same as omitting it.
+        assert_eq!(run(&["box", "--request", "health"]), d);
+    }
+
+    #[test]
+    fn bad_request_value_is_a_usage_error() {
+        for bad in ["inspect", "Stats", "", "1"] {
+            let e = err(&["box", "--request", bad]);
+            assert!(e.contains("--request"), "{e}");
+            assert!(e.contains("health") && e.contains("stats"), "{e}");
+            assert!(e.contains(&format!("'{bad}'")), "{e}");
+        }
+        assert!(err(&["box", "--request"]).contains("--request"));
     }
 
     #[test]
