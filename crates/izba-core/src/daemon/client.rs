@@ -460,6 +460,11 @@ fn peer_rejection(
 /// held, a daemon is starting/running and we leave everything alone (the
 /// concurrent-spawn loser exits "daemon already running" and both clients
 /// connect to the winner).
+///
+/// INVARIANT (#231): the unlink is conditional on WINNING the flock. A client
+/// that misreads a live daemon as gone reaches this function, and must not be
+/// able to unlink that daemon's socket. Pinned by
+/// `clear_stale_socket_spares_the_socket_while_a_daemon_holds_the_lock`.
 fn clear_stale_socket(paths: &Paths) -> anyhow::Result<()> {
     crate::paths::create_dir_700(&paths.daemon_dir(), paths.root())?;
     let f = std::fs::File::options()
@@ -1003,10 +1008,7 @@ mod tests {
     }
 
     /// Take the daemon flock the way a live izbad does, so the client's
-    /// `clear_stale_socket` sees "a daemon is alive". (`cfg(unix)` only
-    /// because its users in this task are; Task 2 adds platform-neutral
-    /// users and drops the attribute.)
-    #[cfg(unix)]
+    /// `clear_stale_socket` sees "a daemon is alive".
     fn hold_daemon_lock(paths: &crate::paths::Paths) -> std::fs::File {
         std::fs::create_dir_all(paths.daemon_dir()).unwrap();
         let f = std::fs::File::options()
@@ -1032,6 +1034,34 @@ mod tests {
         Err::<(), _>(izba_proto::FrameError::Eof)
             .context("reading hello reply")
             .unwrap_err()
+    }
+
+    /// #231 invariant: while a daemon holds the flock, a client's pre-spawn
+    /// cleanup must not unlink the live daemon's socket.
+    #[test]
+    fn clear_stale_socket_spares_the_socket_while_a_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        let _lock = hold_daemon_lock(&paths);
+        // A plain file stands in for the socket: the cleanup is an unlink.
+        std::fs::write(paths.daemon_socket(), b"").unwrap();
+        clear_stale_socket(&paths).unwrap();
+        assert!(
+            paths.daemon_socket().exists(),
+            "live daemon's socket unlinked"
+        );
+    }
+
+    /// …and with no daemon alive, the leftover socket is cleared so a fresh
+    /// daemon can bind.
+    #[test]
+    fn clear_stale_socket_unlinks_a_leftover_socket_when_no_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        std::fs::create_dir_all(paths.daemon_dir()).unwrap();
+        std::fs::write(paths.daemon_socket(), b"").unwrap();
+        clear_stale_socket(&paths).unwrap();
+        assert!(!paths.daemon_socket().exists(), "stale socket left behind");
     }
 
     #[test]

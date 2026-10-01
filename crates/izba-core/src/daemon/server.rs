@@ -2309,6 +2309,11 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
     // appends, so truncate now that the flock proves we are the only daemon.
     // (When auto-started detached, our own stderr IS this file in append mode:
     // truncating sets length 0 and appends continue at the new end — correct.)
+    //
+    // ORDERING IS LOAD-BEARING (#231): this must stay AFTER the flock above. A
+    // client's stray `izba daemon run` loses the flock and bails before it
+    // gets here, so it can never truncate the running daemon's log. Pinned by
+    // `run_daemon_with_loses_the_flock_before_it_can_truncate_the_owners_log`.
     let _ = std::fs::File::create(paths.daemon_log());
 
     let listener = transport::bind_socket(paths)?;
@@ -6492,6 +6497,35 @@ mod tests {
         assert!(
             !egress::listener_path(&d.paths.legacy_run_dir("web")).exists(),
             "no vsock.sock_1027 in the legacy run dir"
+        );
+    }
+
+    /// #231 invariant: a second `izba daemon run` (a client's stray spawn)
+    /// must lose the flock BEFORE it can truncate the running daemon's log.
+    /// No listener is bound: the refusal happens before `bind_socket`.
+    #[test]
+    fn run_daemon_with_loses_the_flock_before_it_can_truncate_the_owners_log() {
+        let (_dir, paths) = test_paths();
+        std::fs::create_dir_all(paths.daemon_dir()).unwrap();
+        let held = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.daemon_lock())
+            .unwrap();
+        held.try_lock().expect("the test holds the daemon lock");
+        std::fs::write(paths.daemon_log(), "owner daemon line\n").unwrap();
+
+        let err = run_daemon_with(&paths, test_deps()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("daemon already running"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.daemon_log()).unwrap(),
+            "owner daemon line\n",
+            "a daemon that lost the flock truncated the owner's log"
         );
     }
 
