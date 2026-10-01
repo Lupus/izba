@@ -61,11 +61,15 @@ every superseded entry as such.
   Both outrank the existing enforce-off and narrow-access branches: their
   remedies ("turn enforcement on", "widen to read-write") would be false for
   an entry that is never read.
-- A `protocol: http` port on a superseded entry is the exception — it IS
-  still read, because `inspect_ports` unions over every entry, superseded
-  ones included. It prints `:<port> protocol: http (inspected) — still in
-  force: a port's inspection is the union over every entry, superseded ones
-  included; keep this declaration when merging`.
+- A `protocol: http` port on a superseded entry is the exception — its
+  declaration IS still read, because `inspect_ports` unions over every entry,
+  superseded ones included. That is a port-wide fact, not a statement about
+  this host (the winner may splice the host on that very port, and nothing
+  is inspected with enforcement off), so the line says only that: `:<port>
+  protocol: http — declaration still read, port-wide: :<port> stays in the
+  inspected-port set (a union over every entry, superseded ones included;
+  applied only while enforcing). Not a claim about this host, which the
+  later entry decides — keep this declaration when merging`.
 - A policy without duplicate exact hosts renders byte-identically to today.
 
 **The renderer does not fold.** The supersession fact comes from a new core

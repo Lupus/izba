@@ -475,19 +475,27 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     for s in specs.iter().filter(|s| s.protocol.is_some()) {
                         let line = match s.protocol {
                             None => unreachable!("filtered to declared ports"),
-                            // A superseded `http` is STILL in force:
+                            // A superseded `http` declaration is STILL READ:
                             // `InspectionTable`'s `inspect_ports` unions over
                             // every entry, superseded ones included. Deleting
                             // a superseded entry that carries the only `http`
                             // declaration for a port would silently stop that
                             // port being inspected — and a hand edit passes
-                            // no weakening gate — so say it is live and name
-                            // the remedy as merging.
+                            // no weakening gate — so name the remedy as
+                            // merging. But that is a PORT-WIDE fact, so the
+                            // line must not say "(inspected)" about this
+                            // host: the winning entry may declare `tcp` on the
+                            // same port (the host is spliced opaquely), and
+                            // with enforcement off nothing is inspected at
+                            // all. Deliberately consults neither the winner
+                            // nor `cfg.enforce`.
                             Some(Protocol::Http) if winner.is_some() => format!(
-                                ":{} protocol: http (inspected) — still in force: a port's \
-                                 inspection is the union over every entry, superseded ones \
-                                 included; keep this declaration when merging",
-                                s.port
+                                ":{port} protocol: http \u{2014} declaration still read, \
+                                 port-wide: :{port} stays in the inspected-port set (a union \
+                                 over every entry, superseded ones included; applied only \
+                                 while enforcing). Not a claim about this host, which the \
+                                 later entry decides \u{2014} keep this declaration when merging",
+                                port = s.port
                             ),
                             Some(Protocol::Http) => {
                                 format!(":{} protocol: http (inspected)", s.port)
@@ -2404,12 +2412,25 @@ mod tests {
         assert!(!out.contains("widen to read-write to pin"), "{out}");
     }
 
-    /// A superseded entry's `protocol: http` stays IN FORCE: `inspect_ports`
-    /// unions over EVERY entry, superseded ones included. So the line says so
-    /// and the remedy is to merge — deleting this entry would silently stop
-    /// :8000 being inspected, and a hand edit passes no weakening gate.
+    /// The new line a superseded entry's `protocol: http` prints. A port-wide
+    /// fact (`inspect_ports` unions over EVERY entry, superseded ones
+    /// included), never a claim about this host.
+    fn http_declaration_still_read(port: u16) -> String {
+        format!(
+            "        :{port} protocol: http \u{2014} declaration still read, port-wide: :{port} \
+             stays in the inspected-port set (a union over every entry, superseded ones \
+             included; applied only while enforcing). Not a claim about this host, which \
+             the later entry decides \u{2014} keep this declaration when merging\n"
+        )
+    }
+
+    /// A superseded entry's `protocol: http` declaration IS still read:
+    /// `inspect_ports` unions over EVERY entry, superseded ones included. So
+    /// the remedy is to merge — deleting this entry would silently stop :8000
+    /// being inspected, and a hand edit passes no weakening gate. But that is
+    /// a port-wide fact, so the line must not call this host "inspected".
     #[test]
-    fn show_keeps_the_inspected_line_on_a_superseded_entry() {
+    fn show_says_a_superseded_http_declaration_is_still_read_port_wide() {
         let cfg = EgressPolicyConfig::from_yaml(
             "enforce: true\n\
              allow:\n\
@@ -2426,11 +2447,10 @@ mod tests {
                  \x20 http allow-list:\n\
                  \x20   internal.example.com  [8000] (read-write)\n\
                  {}\
-                 \x20       :8000 protocol: http (inspected) — still in force: a port's \
-                 inspection is the union over every entry, superseded ones included; keep \
-                 this declaration when merging\n\
+                 {}\
                  \x20   internal.example.com  [80, 443] (read-write)\n",
-                superseded_marker("internal.example.com  [80, 443] (read-write)")
+                superseded_marker("internal.example.com  [80, 443] (read-write)"),
+                http_declaration_still_read(8000)
             )
         );
         assert!(
@@ -2449,6 +2469,77 @@ mod tests {
                 .inspects(8000),
             "deleting the superseded entry stops :8000 being inspected"
         );
+    }
+
+    /// The winner splices this host on the very port the superseded entry
+    /// declared `http` on, so "(inspected)" under the earlier entry would be
+    /// false for the host it is printed under.
+    #[test]
+    fn show_does_not_claim_inspection_for_a_host_the_winner_splices() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports: [8443]\n\
+             \x20   protocol: http\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports: [8443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert_eq!(
+            out,
+            format!(
+                "'web' egress policy (enforce: on):\n\
+                 \x20 http allow-list:\n\
+                 \x20   h.example.com  [8443] (read-write)\n\
+                 {}\
+                 {}\
+                 \x20   h.example.com  [8443] (read-write)\n\
+                 \x20       \u{26A0} :8443 protocol: tcp \u{2014} pinning passthrough: spliced opaquely; \
+                 no L7 rules, no request audit, no upstream certificate verification\n",
+                superseded_marker("h.example.com  [8443] (read-write)"),
+                http_declaration_still_read(8443)
+            )
+        );
+        assert!(!out.contains("(inspected)"), "{out}");
+        assert!(
+            izba_core::daemon::egress::inspect::InspectionTable::from_config(&cfg)
+                .passthrough_host("h.example.com", 8443),
+            "the rendering agrees with the table: the host IS spliced"
+        );
+    }
+
+    /// With enforcement off nothing is inspected at all, so a superseded
+    /// `http` declaration must not read as "(inspected)" under that header.
+    #[test]
+    fn show_does_not_claim_inspection_with_enforcement_off() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: false\n\
+             allow:\n\
+             \x20 - host: internal.example.com\n\
+             \x20   ports: [8000]\n\
+             \x20   protocol: http\n\
+             \x20 - internal.example.com\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert_eq!(
+            out,
+            format!(
+                "'web' egress policy (enforce: off):\n\
+                 \x20 http: all egress allowed (enforce off) \u{2014} the allow-list below is not in force\n\
+                 \x20 http allow-list:\n\
+                 \x20   internal.example.com  [8000] (read-write)\n\
+                 {}\
+                 {}\
+                 \x20   internal.example.com  [80, 443] (read-write)\n",
+                superseded_marker("internal.example.com  [80, 443] (read-write)"),
+                http_declaration_still_read(8000)
+            )
+        );
+        assert!(!out.contains("(inspected)"), "{out}");
     }
 
     /// Dogfooding, passthrough run (CORE-1): with `enforce: false` the
