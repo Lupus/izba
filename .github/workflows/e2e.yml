@@ -648,7 +648,7 @@ jobs:
 
   windows-whp:
     name: WHP e2e (validate + tty + ttystorm)
-    needs: [kernel, initramfs, erofs-exe, kasmvnc-erofs]
+    needs: [kernel, kernel-usb, initramfs, erofs-exe, kasmvnc-erofs]
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -662,6 +662,10 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: vmlinux
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vmlinux-usb
           path: dist/
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -711,6 +715,19 @@ jobs:
             echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; the VNC validation section would silently skip instead of proving the feature" >&2
             exit 1
           }
+      - name: Stage boot artifacts at the production exe-relative discovery path
+        # #191: the USB gate boots with every IZBA_KERNEL*/IZBA_INITRAMFS
+        # override removed, so it must find the kernels where the installer
+        # puts them: <exe-dir>\..\artifacts (target\artifacts for
+        # target\release\izba.exe). Installer-shaped: both kernels + initramfs.
+        # ORDER IS LOAD-BEARING: after Swatinem/rust-cache (see above).
+        shell: bash
+        run: |
+          mkdir -p target/artifacts
+          cp dist/vmlinux dist/vmlinux-usb dist/initramfs.cpio.gz target/artifacts/
+          for f in vmlinux vmlinux-usb initramfs.cpio.gz; do
+            test -s "target/artifacts/$f" || { echo "target/artifacts/$f missing or empty" >&2; exit 1; }
+          done
       # bash, not pwsh: fail-fast between the two builds (pwsh only gates the
       # step on the LAST native command's exit code).
       - name: Build izba.exe + ttystorm.exe + confine_probe.exe (native MSVC)
@@ -733,6 +750,18 @@ jobs:
           TTYSTORM_EXE: ${{ github.workspace }}\target\release\examples\ttystorm.exe
           IZBA_DATA_DIR: ${{ runner.temp }}\storm-data
         run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
+      # USB passthrough over OpenVMM's hybrid-vsock bridge (#191). The fake
+      # usbip server is an EXCLUDED crate (it links libusb, vendored by
+      # libusb1-sys on MSVC) built only here and in linux-kvm.
+      - name: Build the fake usbip server (excluded crate)
+        shell: bash
+        run: cargo build --locked --release --manifest-path hack/fake-usbipd/Cargo.toml
+      - name: USB passthrough gate (real vhci over vsock 1028, installed-layout kernel)
+        env:
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          IZBA_FAKE_USBIPD: ${{ github.workspace }}\hack\fake-usbipd\target\release\fake-usbipd.exe
+          IZBA_DATA_DIR: ${{ runner.temp }}\usb-data
+        run: pwsh -NoProfile -File hack/ci/usb-attach-gate.ps1
       # ConPTY canary: spawn a trivial child through ConPTY and require its
       # output to reach the parser (izba-ttytest's own smoke test — no izba,
       # no sockets, no VM). GitHub-hosted Windows runners historically lost ALL
@@ -775,6 +804,8 @@ jobs:
             ~\AppData\Local\izba\sandboxes\*\logs\*
             ${{ runner.temp }}\tty-data\sandboxes\*\logs\*
             ${{ runner.temp }}\storm-data\sandboxes\*\logs\*
+            ${{ runner.temp }}\usb-data\sandboxes\*\logs\*
+            ${{ runner.temp }}\usb-data\daemon\daemon.log
           if-no-files-found: ignore
 
   # Real-VM host-side coverage on Windows/WHP (Phase 2). Same posture as
