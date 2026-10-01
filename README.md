@@ -40,6 +40,10 @@ Key properties:
   `~/.local/share/izba/daemon/izbad.sock`) — no install or service step
   required. The daemon rebuilds all state from disk at startup, so you can kill
   or upgrade it at any time without harming running sandboxes.
+  It logs to `~/.local/share/izba/daemon/daemon.log` (a fresh file per daemon
+  instance). On Linux the daemon serves only the user who started it: a
+  command run as another user — `sudo izba …` against your own daemon — is
+  refused with an error naming both uids, and the daemon logs the refusal.
 - **Disk-state as source of truth.** `state.json` records every PID with its
   `starttime` field from `/proc/<pid>/stat` to defeat PID reuse.
 - **Three vsock ports.** Port 1025 carries length-prefixed JSON control RPCs
