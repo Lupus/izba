@@ -1,0 +1,21 @@
+[package]
+name = "probe-latency"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# EXCLUDED from the izba workspace on purpose (its own [workspace] table below).
+# This is a throwaway measurement tool for spike #249, not product code: as a
+# workspace member it would be compiled, linted and mutation-tested by every
+# workspace gate (`cargo {test,clippy} --workspace`, the windows-gnu cross
+# check, coverage), and could end up in an installer. It embeds izba-core and
+# izba-proto by path so it measures the exact code the daemon runs.
+[workspace]
+
+[dependencies]
+izba-core = { path = "../../../crates/izba-core" }
+izba-proto = { path = "../../../crates/izba-proto" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
