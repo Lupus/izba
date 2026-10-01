@@ -40,16 +40,20 @@ The request is `Health` by default and `Stats` with `--request stats`; a run
 measures one or the other. The probe's round-trip key is named after it
 (`health_us` / `stats_us`).
 
-`probe` is the daemon's sequence without its `DeadlineStream`, so a slow phase
-is measured at its real length instead of being cut off at the bound. `direct`
+`probe` is the daemon's sequence with its `DeadlineStream` set to a far longer
+safety cap (below) instead of the 5 s bound, so a slow phase is measured at
+its real length instead of being cut off at the bound. `direct`
 isolates one dial and one guest round trip (which includes the guest's
 `crun state`); `control_us - dial_us` is roughly what the liveness assessment
 costs. That assessment always does a `Health` exchange, whichever request is
 being measured.
 
-The only timeout the tool adds is a per-syscall safety cap of
-`max(30 s, 2 × bound)` on the stream (`io_cap_ms` in the summary), so a wedged
-guest ends an iteration as a `read` failure instead of hanging the run.
+The only timeout the tool adds is a safety cap of `max(30 s, 2 × bound)`
+(`io_cap_ms` in the summary). It is one overall deadline for the exchange —
+the write plus the read, counted from the moment the stream is open — not a
+per-read timeout, so a guest that is wedged, or that trickles its reply a byte
+at a time, ends the iteration as a failure at the cap instead of hanging the
+run. It does not cover the open (`control_us` / `dial_us`).
 
 ## Build and run
 
