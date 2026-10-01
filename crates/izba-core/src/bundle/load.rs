@@ -102,6 +102,19 @@ pub fn load(paths: &Paths, opts: &LoadOpts, progress: Progress) -> anyhow::Resul
     )
 }
 
+/// The archive's manifest, format-checked and validated like a load's
+/// preflight but writing nothing: lets a caller show what an archive holds
+/// (the desktop app's Load dialog) before committing to a load.
+pub fn peek_manifest(archive: &Path) -> anyhow::Result<Manifest> {
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let dec = zstd::Decoder::new(file).context("reading archive (not zstd?)")?;
+    let mut ar = tar::Archive::new(dec);
+    let manifest = read_manifest(&mut ar.entries().context("reading archive")?)?;
+    check_format(&manifest)?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
 // reason: thin environment reader; the workspace translation it feeds is
 // tested through the `LoadHooks::target_home` seam (tests never touch the
 // process environment, which other threads share).
@@ -3448,5 +3461,43 @@ mod tests {
                 .to_string();
             assert!(e.contains("invalid volume guest path"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn peek_lists_the_archived_sandboxes_without_loading_anything() {
+        let src = Src::new();
+        add_sandbox(&src.paths, "b", "sha256:bb", &[]);
+        let ar = src.save(&["a", "b"], false);
+        let m = peek_manifest(&ar).unwrap();
+        let names: Vec<&str> = m.sandboxes.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(m.sandboxes[0].locked);
+        assert!(!m.sandboxes[1].locked);
+        assert!(!m.sandboxes[0].workspace_bundled);
+    }
+
+    #[test]
+    fn peek_refuses_a_file_that_is_not_an_archive() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("notes.izba");
+        std::fs::write(&p, b"just some text").unwrap();
+        let e = format!("{:#}", peek_manifest(&p).unwrap_err());
+        assert!(e.contains("archive"), "{e}");
+        let missing = t.path().join("absent.izba");
+        let e = format!("{:#}", peek_manifest(&missing).unwrap_err());
+        assert!(e.contains("absent.izba"), "{e}");
+    }
+
+    #[test]
+    fn peek_refuses_a_newer_format_and_a_malformed_manifest() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        edit_manifest(&ar, |m| m.format = crate::bundle::FORMAT_VERSION + 1);
+        let e = format!("{:#}", peek_manifest(&ar).unwrap_err());
+        assert!(e.contains("newer izba"), "{e}");
+
+        let ar = src.save(&["a"], true);
+        edit_manifest(&ar, |m| m.sandboxes[0].name = "../evil".into());
+        assert!(peek_manifest(&ar).is_err());
     }
 }
