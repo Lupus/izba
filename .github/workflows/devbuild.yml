@@ -150,6 +150,8 @@ jobs:
         run: |
           chmod +x dl/bin/izba dl/vmm/cloud-hypervisor dl/vmm/virtiofsd
           packaging/build-deb.sh
+      - name: Verify the .deb payload (both kernels, initramfs, VNC bundle, VMM tools)
+        run: packaging/verify-payload.sh deb dist/izba_*_amd64.deb
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: izba-deb
@@ -209,6 +211,11 @@ jobs:
         run: |
           mkdir -p stage/bin/libexec
           cp dist/openvmm.exe stage/bin/libexec/openvmm.exe
+      - name: Verify the installer stage (both kernels, initramfs, VNC bundle, VMM tools)
+        # izba.iss installs artifacts\* and bin\libexec\* by GLOB, so a file
+        # missing here is silently omitted from the installer, not an error.
+        shell: bash
+        run: packaging/verify-payload.sh stage stage
       - name: Build installer with Inno Setup
         shell: pwsh
         run: |

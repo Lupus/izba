@@ -463,7 +463,10 @@ mod tests {
         let script = std::fs::read_to_string(root.join("packaging/build-deb.sh"))
             .expect("packaging/build-deb.sh must be readable from the crate");
         for v in KernelVariant::ALL {
-            let dest = format!("usr/lib/izba/artifacts/{}", v.image());
+            // The closing quote is part of the needle: `vmlinux` is a prefix of
+            // `vmlinux-usb`, so a bare substring match on the base kernel would
+            // be satisfied by the USB kernel's line and prove nothing.
+            let dest = format!("usr/lib/izba/artifacts/{}\"", v.image());
             assert!(
                 script.contains(&dest),
                 "packaging/build-deb.sh installs no {dest}: a sandbox needing the \
@@ -476,6 +479,67 @@ mod tests {
             "packaging/build-deb.sh installs no usr/lib/izba/artifacts/kasmvnc.erofs: \
              a VNC-enabled sandbox cannot start from an installed build"
         );
+    }
+
+    /// The repo root, from this crate's manifest dir.
+    fn repo_root() -> &'static std::path::Path {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+    }
+
+    #[test]
+    fn every_kernel_variant_is_checked_by_the_payload_verifier() {
+        // #191: the packaging manifests and the check over them are separate
+        // files, so the verifier's list is pinned to the enum the same way the
+        // .deb manifest is — the next variant fails here until the verifier
+        // (and therefore every installer build) demands it.
+        let script = std::fs::read_to_string(repo_root().join("packaging/verify-payload.sh"))
+            .expect("packaging/verify-payload.sh must be readable from the crate");
+        let list = script
+            .lines()
+            .find_map(|l| l.strip_prefix("ARTIFACTS=(")?.strip_suffix(')'))
+            .expect("packaging/verify-payload.sh must define ARTIFACTS=(...) on one line");
+        // Whole tokens, not substrings: `vmlinux` must not be satisfied by
+        // `vmlinux-usb`.
+        let names: Vec<&str> = list.split_whitespace().collect();
+        for v in KernelVariant::ALL {
+            assert!(
+                names.contains(&v.image()),
+                "packaging/verify-payload.sh does not require {}: an installer \
+                 missing the {:?} kernel would pass verification",
+                v.image(),
+                v
+            );
+        }
+        assert!(
+            names.contains(&"initramfs.cpio.gz"),
+            "packaging/verify-payload.sh does not require initramfs.cpio.gz"
+        );
+    }
+
+    #[test]
+    fn every_installer_build_runs_the_payload_verifier() {
+        // A verifier with a test and no call site is the defect class this
+        // feature keeps producing: the rule exists, nothing invokes it. Both
+        // workflows that build installers must run it in both modes.
+        for wf in [
+            ".github/workflows/release.yml",
+            ".github/workflows/devbuild.yml",
+        ] {
+            let text = std::fs::read_to_string(repo_root().join(wf))
+                .unwrap_or_else(|e| panic!("{wf} must be readable from the crate: {e}"));
+            for mode in ["deb", "stage"] {
+                let call = format!("packaging/verify-payload.sh {mode} ");
+                assert!(
+                    text.contains(&call),
+                    "{wf} never runs `{call}…`: an installer missing a kernel \
+                     would be built and uploaded unchecked"
+                );
+            }
+        }
     }
 
     #[test]
