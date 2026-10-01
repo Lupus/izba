@@ -23,7 +23,11 @@
 #                 IZBA_PROBE_LATENCY   built hack/spike/probe-latency
 #                 IZBA_FAKE_USBIPD     built hack/fake-usbipd
 # Env (optional): IZBA_IMAGE           default ubuntu:24.04
-#                 IZBA_DATA_DIR        default: a per-run dir under %TEMP%
+#                 IZBA_DATA_DIR        default: a per-run dir under %TEMP%. Must
+#                                      not exist yet (or be empty): this run
+#                                      owns its data root -- it sets the usbip
+#                                      upstream there, restarts that root's
+#                                      daemon and removes the sandbox it made
 #                 IZBA_OUT_DIR         where the JSONL evidence lands
 #                 IZBA_MEM_MB          guest RAM, default 1024
 #                 IZBA_STATUS_SOAK     sequential `izba status` calls, default 300
@@ -170,6 +174,12 @@ foreach ($req in @(@('IZBA_EXE', $exe), @('IZBA_PROBE_LATENCY', $probe), @('IZBA
         Fail-Preflight "$($req[0]) must point at an existing file (got '$($req[1])')"
     }
 }
+# The data root must be this run's own. Pointed at a root that already holds
+# sandboxes, the teardown below would stop that root's daemon and could remove
+# a sandbox this run never created.
+if ((Test-Path $data) -and @(Get-ChildItem -LiteralPath $data -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+    Fail-Preflight "data root $data already exists and is not empty -- give this run a fresh IZBA_DATA_DIR"
+}
 New-Item -ItemType Directory -Path $data, $out, $ws -Force | Out-Null
 $env:IZBA_DATA_DIR = $data
 
@@ -214,6 +224,7 @@ Invoke-Izba 'version' @('version')
 $fakeProc = $null
 $vmmBefore = Get-VmmProcesses
 $vmmOurs = @()
+$created = $false
 try {
     $fakeOut = Join-Path $out 'fake-usbipd.out'
     $fakeProc = Start-Process -FilePath $fake -ArgumentList '127.0.0.1:0' -RedirectStandardOutput $fakeOut -NoNewWindow -PassThru
@@ -228,6 +239,9 @@ try {
 
     Invoke-Izba 'usb upstream set' @('usb', 'upstream', 'set', $addr)
     Invoke-Izba 'create' @('create', $ws, '--name', $name, '--image', $image, '--mem', $memMb)
+    $created = ($LASTEXITCODE -eq 0)
+    Check 'create exits 0' $created
+    if (-not $created) { throw 'the sandbox was not created' }
     Invoke-Izba 'usb allow' @('usb', 'allow', $name, '--device', $device, '--confirm', $device)
 
     # --- 1. the boot window: poll status as fast as it answers while `start` runs
@@ -323,21 +337,24 @@ try {
         Where-Object { $_ -match '\[OCI\]|Linux version|Kernel command line' } |
         Select-Object -Last 5 | ForEach-Object { Write-Output ("    " + $_) }
 } finally {
-    # --- 8. teardown, and whether every VMM process really went away
-    Invoke-Izba 'usb detach' @('usb', 'detach', $name, '--device', $device)
-    Invoke-Izba 'stop' @('stop', $name)
-    $after = Read-Status
-    Say "after stop: status='$($after.Status)' container='$($after.Container)' (unknown is the expected answer for a stopped sandbox)"
-    $poweredDown = [bool](Get-Content (Join-Path $data "sandboxes\$name\logs\console.log") -Tail 5 -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match 'Power down' })
-    Say "guest console ends with 'Power down': $poweredDown"
-    $vmmAfter = Get-VmmProcesses
-    $ghosts = @($vmmOurs | Where-Object { $vmmAfter.ContainsKey($_) })
-    $ghosts | ForEach-Object { Say "openvmm.exe still present after stop: $($vmmAfter[$_])" }
-    Check ("all {0} openvmm.exe process(es) this run started are gone after 'izba stop'" -f $vmmOurs.Count) `
-        ($vmmOurs.Count -gt 0 -and $ghosts.Count -eq 0)
-    Invoke-Izba 'rm' @('rm', $name, '--force')
-    Check 'rm exits 0' ($LASTEXITCODE -eq 0)
+    # --- 8. teardown, and whether every VMM process really went away. Only a
+    # sandbox this run created is stopped and removed.
+    if ($created) {
+        Invoke-Izba 'usb detach' @('usb', 'detach', $name, '--device', $device)
+        Invoke-Izba 'stop' @('stop', $name)
+        $after = Read-Status
+        Say "after stop: status='$($after.Status)' container='$($after.Container)' (unknown is the expected answer for a stopped sandbox)"
+        $poweredDown = [bool](Get-Content (Join-Path $data "sandboxes\$name\logs\console.log") -Tail 5 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match 'Power down' })
+        Say "guest console ends with 'Power down': $poweredDown"
+        $vmmAfter = Get-VmmProcesses
+        $ghosts = @($vmmOurs | Where-Object { $vmmAfter.ContainsKey($_) })
+        $ghosts | ForEach-Object { Say "openvmm.exe still present after stop: $($vmmAfter[$_])" }
+        Check ("all {0} openvmm.exe process(es) this run started are gone after 'izba stop'" -f $vmmOurs.Count) `
+            ($vmmOurs.Count -gt 0 -and $ghosts.Count -eq 0)
+        Invoke-Izba 'rm' @('rm', $name, '--force')
+        Check 'rm exits 0' ($LASTEXITCODE -eq 0)
+    }
     Invoke-Izba 'daemon stop' @('daemon', 'stop')
     if ($fakeProc -and -not $fakeProc.HasExited) { Stop-Process -Id $fakeProc.Id -Force -ErrorAction SilentlyContinue }
 }
