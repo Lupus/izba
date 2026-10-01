@@ -39,28 +39,45 @@ every superseded entry as such.
 
 - Each superseded entry gets one extra line directly under its host line:
   `⚠ superseded — NOT in force: a later entry for this host (<winner>)
-  replaces this one wholesale; the last entry for an exact host wins — remove
-  the duplicate`, where `<winner>` is the winning entry rendered exactly like a
-  host line (`host  [ports] (access)`).
-- A `protocol: tcp` port on a superseded entry prints
-  `⚠ :<port> protocol: tcp — pinning passthrough NOT in effect: this entry is
-  superseded by a later entry for the same host, so its declaration is never
-  read; declare it on the later entry (or remove that entry) to pin`.
-  This branch outranks the existing enforce-off and narrow-access branches:
-  their remedies ("turn enforcement on", "widen to read-write") would be false
-  for an entry that is never read.
-- A `protocol: http` port on a superseded entry keeps its `(inspected)` line:
-  `inspect_ports` unions over every entry, superseded ones included, so the
-  statement stays true.
+  replaces this entry's ports and access; the last entry for an exact host
+  wins — merge the two into one entry`, where `<winner>` is the winning entry
+  rendered exactly like a host line (`host  [ports] (access)`). The remedy is
+  "merge", not "remove": removing a superseded entry that carries a
+  `protocol: http` declaration would drop that port's inspection (below).
+- A `protocol: tcp` port on a superseded entry prints one of two lines,
+  chosen by whether the WINNING entry declares `tcp` on that same port
+  (`declared_protocol_for`, the per-entry primitive `InspectionTable` reads):
+  - it does not: `⚠ :<port> protocol: tcp — pinning passthrough NOT in
+    effect: this entry is superseded by a later entry for the same host, so
+    its declaration is never read; declare it on the later entry (or remove
+    that entry) for it to be read`;
+  - it does: `⚠ :<port> protocol: tcp — declaration not read: this entry is
+    superseded by a later entry for the same host, which declares
+    protocol: tcp on :<port> itself; whether the passthrough is in effect is
+    stated on that entry's line below`. The hatch may be live through the
+    winner, so this line must not say `NOT in effect`; and whether it IS live
+    depends on the winner's access and the enforce posture, which the
+    winner's own line already reports — the renderer does not re-derive it.
+  Both outrank the existing enforce-off and narrow-access branches: their
+  remedies ("turn enforcement on", "widen to read-write") would be false for
+  an entry that is never read.
+- A `protocol: http` port on a superseded entry is the exception — it IS
+  still read, because `inspect_ports` unions over every entry, superseded
+  ones included. It prints `:<port> protocol: http (inspected) — still in
+  force: a port's inspection is the union over every entry, superseded ones
+  included; keep this declaration when merging`.
 - A policy without duplicate exact hosts renders byte-identically to today.
 
-**One fold, not two.** The supersession fact comes from a new core primitive,
-`EgressPolicyConfig::superseded_by() -> Vec<Option<usize>>`, and
+**The renderer does not fold.** The supersession fact comes from a new core
+primitive, `EgressPolicyConfig::superseded_by() -> Vec<Option<usize>>`, and
 `InspectionTable::from_config` is refactored to build its passthrough set from
-that same primitive. The renderer never folds on its own — a second,
-independent fold of this axis is what produced the live
-no-certificate-verification bypass during M5 P1. A guard test pins the
-primitive against `to_rego_data_json`'s compiled `sandbox_host_rules`.
+that same primitive, so the reveal surface and the passthrough set cannot
+disagree about which duplicate wins — a second, independent reading of this
+axis is what produced the live no-certificate-verification bypass during M5
+P1. A guard test pins the primitive against `to_rego_data_json`'s compiled
+`sandbox_host_rules`. It is not the only last-wins fold in the tree:
+`collapse_duplicate_hosts` and `manifest::diff::allow_index` keep their own
+(unchanged here), each mirroring the same compile.
 
 Wildcard entries are never superseded: they compile into a list where every
 rule grants independently.
