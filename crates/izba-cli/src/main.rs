@@ -329,6 +329,13 @@ enum Cmd {
     #[command(subcommand)]
     Vnc(commands::vnc::VncCmd),
     /// Manage the izba daemon (auto-started by other commands)
+    ///
+    /// The daemon logs to daemon/daemon.log under the izba data directory
+    /// (~/.local/share/izba on Linux, %LOCALAPPDATA%\izba on Windows, or
+    /// $IZBA_DATA_DIR); each daemon instance starts a fresh file. Look there
+    /// when a command cannot reach the daemon. On Linux the daemon serves
+    /// only the user who started it and logs every connection it refuses
+    /// from another user — for example `sudo izba` against your own daemon.
     #[command(subcommand)]
     Daemon(DaemonCmd),
     /// Show detailed build info for the CLI and (if running) the daemon
@@ -1361,5 +1368,21 @@ mod tests {
             !flat.contains("same as `izba policy allow`"),
             "must not equate a replace with an add: {flat}"
         );
+    }
+
+    /// #231: a user whose command cannot reach the daemon needs to know
+    /// where the daemon logs. `izba daemon --help` is the documented surface
+    /// that names it.
+    #[test]
+    fn daemon_help_names_the_daemon_log() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let daemon = cmd
+            .find_subcommand_mut("daemon")
+            .expect("daemon subcommand");
+        let help = daemon.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("daemon/daemon.log"), "{flat}");
+        assert!(flat.contains("only the user who started it"), "{flat}");
     }
 }
