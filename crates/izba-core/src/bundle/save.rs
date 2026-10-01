@@ -320,7 +320,14 @@ fn rename_failed(e: std::io::Error, partial: &Path, out: &Path) -> anyhow::Error
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => unsupported(partial, out),
         _ => {
             let _ = std::fs::remove_file(partial);
-            anyhow::Error::new(e).context(format!("renaming to {}", out.display()))
+            // Already the failure path; `with_context` keeps the message lazy
+            // like every other site (and the io error as the source).
+            match Err::<std::convert::Infallible, _>(e)
+                .with_context(|| format!("renaming to {}", out.display()))
+            {
+                Err(err) => err,
+                Ok(never) => match never {},
+            }
         }
     }
 }
