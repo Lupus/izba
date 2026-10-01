@@ -3504,3 +3504,106 @@ fn parse_listeners_reads_only_listeners_and_keeps_the_address() {
     );
     assert!(parse_listeners("").is_empty());
 }
+
+/// Can this process become root without a prompt? CI's hosted runners can.
+#[cfg(target_os = "linux")]
+fn passwordless_sudo() -> bool {
+    std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// #231: `sudo izba` against a user-owned daemon is refused by the daemon's
+/// peer-uid check (F-09). The client must say why, and must not fork a second
+/// `izba daemon run`.
+///
+/// Needs a real second uid, so it runs as root via `sudo -n`. It boots no VM,
+/// but lives behind `IZBA_INTEGRATION=1` because a test that escalates should
+/// be an explicit opt-in. In GitHub Actions a missing `sudo -n` is a FAILURE,
+/// not a skip — otherwise the gate could pass without ever running this.
+#[cfg(target_os = "linux")]
+#[test]
+fn foreign_uid_client_is_refused_without_spawning_a_daemon() {
+    use std::os::unix::fs::MetadataExt;
+
+    if !want() {
+        return;
+    }
+    if !passwordless_sudo() {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must run this test: `sudo -n true` failed on a GitHub runner"
+        );
+        eprintln!("SKIP: needs passwordless sudo for a real second uid");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("izba");
+    let my_uid = std::fs::metadata(dir.path()).unwrap().uid();
+    if my_uid == 0 {
+        eprintln!("SKIP: needs a non-root owner for the daemon (the suite is running as root)");
+        return;
+    }
+
+    // Auto-start the user's daemon.
+    assert_ok(&izba(&data, &[], &["ls"]), "ls (starts the daemon)");
+    let pid = daemon_pid(&data, &[]).expect("daemon running");
+    let log = data.join("daemon").join("daemon.log");
+
+    let as_root = |args: &[&str]| {
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n")
+            .arg("env")
+            .arg(format!("IZBA_DATA_DIR={}", data.display()));
+        // sudo resets the environment: forward the coverage profile so the
+        // instrumented root `izba` neither loses its data nor litters a
+        // root-owned `default_*.profraw` in the crate directory.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            let mut arg = std::ffi::OsString::from("LLVM_PROFILE_FILE=");
+            arg.push(profile);
+            cmd.arg(arg);
+        }
+        cmd.arg(env!("CARGO_BIN_EXE_izba"))
+            .args(args)
+            .output()
+            .expect("run izba as root")
+    };
+    let refused = |o: &Output, what: &str| {
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(!o.status.success(), "{what} must fail as root: {stderr}");
+        assert!(
+            stderr.contains(&format!("belongs to uid {my_uid}")),
+            "{what}: {stderr}"
+        );
+        assert!(stderr.contains("running as uid 0"), "{what}: {stderr}");
+        assert!(stderr.contains("daemon.log"), "{what}: {stderr}");
+        assert!(!stderr.contains("reading hello reply"), "{what}: {stderr}");
+    };
+
+    // The spawning entry point (`DaemonClient::connect`).
+    refused(&as_root(&["ls"]), "sudo izba ls");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches("rejected (daemon runs as uid").count(),
+        1,
+        "exactly one connection attempt — a client that respawns retries: {text}"
+    );
+    assert!(
+        !text.contains("daemon already running"),
+        "a stray `izba daemon run` was spawned: {text}"
+    );
+
+    // The strict entry point (`connect_existing`: status never spawns).
+    refused(&as_root(&["daemon", "status"]), "sudo izba daemon status");
+
+    // The owner's daemon is untouched and still serves its owner.
+    assert_eq!(daemon_pid(&data, &[]), Some(pid), "daemon was replaced");
+    assert_ok(&izba(&data, &[], &["ls"]), "ls as the owner afterwards");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("daemon already running"), "{text}");
+
+    assert_ok(&izba(&data, &[], &["daemon", "stop"]), "daemon stop");
+}

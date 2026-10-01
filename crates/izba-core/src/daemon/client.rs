@@ -5,11 +5,13 @@
 //! blocking RPCs (e.g. exec's Wait alongside Resize).
 
 use anyhow::{bail, Context};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use izba_proto::{read_frame, write_frame, Request, Response};
 
 use crate::build_info::BuildInfoOwned;
+use crate::daemon::peercred;
 use crate::daemon::proto::{DaemonHello, DaemonRequest, DaemonResponse, DAEMON_PROTO_VERSION};
 use crate::daemon::transport;
 use crate::paths::Paths;
@@ -34,6 +36,15 @@ impl DaemonClient {
     /// Connect to a running daemon. `Ok(None)` when there is none (missing
     /// socket or nothing accepting). Never auto-starts.
     pub fn connect_existing(paths: &Paths) -> anyhow::Result<Option<DaemonClient>> {
+        Self::connect_existing_as(paths, peercred::owner_uid())
+    }
+
+    /// [`Self::connect_existing`] with this process's uid injected, so the
+    /// refused-client diagnosis (#231) is testable without a second uid.
+    fn connect_existing_as(
+        paths: &Paths,
+        client_uid: Option<u32>,
+    ) -> anyhow::Result<Option<DaemonClient>> {
         // Check the socket file first: it is the cross-platform "is there a
         // daemon" signal (the daemon unlinks it on exit), and it sidesteps
         // WinSock's unhelpful errno mapping for dead AF_UNIX paths.
@@ -41,7 +52,18 @@ impl DaemonClient {
             return Ok(None);
         }
         match transport::connect_socket(paths) {
-            Ok(s) => Ok(Some(Self::handshake(s, &transport::daemon_version())?)),
+            Ok(s) => match Self::handshake(s, &transport::daemon_version()) {
+                Ok(client) => Ok(Some(client)),
+                // A daemon that refuses our uid closes without answering.
+                // Say so, instead of the bare "reading hello reply" — and as
+                // a typed error `is_daemon_gone` does not match, so
+                // `connect_with` cannot mistake it for a dead daemon and
+                // spawn another one.
+                Err(e) => Err(match peer_rejection(paths, &e, client_uid) {
+                    Some(rejected) => anyhow::Error::new(rejected),
+                    None => e,
+                }),
+            },
             Err(e) if connect_says_no_daemon(&e) => Ok(None),
             Err(e) => Err(e).context("connecting to the izbad socket"),
         }
@@ -53,8 +75,13 @@ impl DaemonClient {
     /// hello. The spec contract is auto-restart — worst case one retry — so
     /// `connect_with` treats that as absent and takes the spawn path.
     /// `connect_existing` itself stays strict (status/stop must not spawn).
-    fn connect_existing_tolerant(paths: &Paths) -> anyhow::Result<Option<DaemonClient>> {
-        match Self::connect_existing(paths) {
+    /// A peer-uid refusal is NOT "no daemon": it arrives as `PeerRejected`,
+    /// which `is_daemon_gone` does not match, and propagates (#231).
+    fn connect_existing_tolerant(
+        paths: &Paths,
+        client_uid: Option<u32>,
+    ) -> anyhow::Result<Option<DaemonClient>> {
+        match Self::connect_existing_as(paths, client_uid) {
             Ok(c) => Ok(c),
             Err(e) if is_daemon_gone(&e) => Ok(None),
             Err(e) => Err(e),
@@ -64,7 +91,12 @@ impl DaemonClient {
     /// Daemon-first connect: auto-start when absent, auto-upgrade (shutdown +
     /// respawn) on wire-protocol mismatch.
     pub fn connect(paths: &Paths) -> anyhow::Result<DaemonClient> {
-        Self::connect_with(paths, &spawn_daemon, &transport::daemon_version())
+        Self::connect_with(
+            paths,
+            &spawn_daemon,
+            &transport::daemon_version(),
+            peercred::owner_uid(),
+        )
     }
 
     /// Connect for embedders (the GUI) whose own `current_exe` is NOT `izba`:
@@ -74,17 +106,23 @@ impl DaemonClient {
     /// the current executable first, then fall back to bare `izba` for the OS
     /// to resolve via PATH.
     pub fn connect_spawning_izba(paths: &Paths) -> anyhow::Result<DaemonClient> {
-        Self::connect_with(paths, &spawn_sibling_izba, &transport::daemon_version())
+        Self::connect_with(
+            paths,
+            &spawn_sibling_izba,
+            &transport::daemon_version(),
+            peercred::owner_uid(),
+        )
     }
 
-    /// Seam for tests: injectable spawner + client version.
+    /// Seam for tests: injectable spawner + client version + client uid.
     fn connect_with(
         paths: &Paths,
         spawner: &dyn Fn(&Paths) -> anyhow::Result<()>,
         my_version: &str,
+        client_uid: Option<u32>,
     ) -> anyhow::Result<DaemonClient> {
         for attempt in 0..2 {
-            let client = match Self::connect_existing_tolerant(paths)? {
+            let client = match Self::connect_existing_tolerant(paths, client_uid)? {
                 Some(c) => c,
                 None => {
                     clear_stale_socket(paths)?;
@@ -278,8 +316,6 @@ impl DaemonClient {
     }
 }
 
-/// Does this error chain say "the daemon died under us mid-handshake"?
-/// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
 /// Does this connect error mean "no daemon is listening"? Beyond the
 /// portable kinds, Windows AF_UNIX surfaces raw WSA codes that std does not
 /// map: connecting to a stale socket file yields WSAENETDOWN (10050) or
@@ -292,6 +328,8 @@ fn connect_says_no_daemon(e: &std::io::Error) -> bool {
     ) || matches!(e.raw_os_error(), Some(10050) | Some(10049))
 }
 
+/// Does this error chain say "the daemon died under us mid-handshake"?
+/// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
 fn is_daemon_gone(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let kind = match c.downcast_ref::<std::io::Error>() {
@@ -313,11 +351,121 @@ fn is_daemon_gone(e: &anyhow::Error) -> bool {
     })
 }
 
+/// izbad will not serve this client: the hello exchange was cut off AND the
+/// control socket belongs to another uid (#231). izbad's accept-time peer
+/// check (F-09, `server::accept_and_dispatch`) refuses every uid but its
+/// owner's by closing the connection before it reads a frame, which the
+/// client can only see as a dead connection. This carries measured facts —
+/// the socket file's owner and this process's euid — so the message never
+/// asserts a mismatch that may not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerRejected {
+    socket: PathBuf,
+    daemon_log: PathBuf,
+    daemon_uid: u32,
+    client_uid: u32,
+}
+
+impl std::fmt::Display for PeerRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "izbad closed the connection without answering: its control socket {} belongs to \
+             uid {}, but this izba is running as uid {}. izbad serves only the user who \
+             started it — rerun izba as uid {}. Each refused connection is logged in {}",
+            self.socket.display(),
+            self.daemon_uid,
+            self.client_uid,
+            self.daemon_uid,
+            self.daemon_log.display()
+        )
+    }
+}
+
+impl std::error::Error for PeerRejected {}
+
+/// `(daemon uid, client uid)` when both are known and differ.
+fn uid_mismatch(socket_owner: Option<u32>, client: Option<u32>) -> Option<(u32, u32)> {
+    match (socket_owner, client) {
+        (Some(daemon), Some(client)) if daemon != client => Some((daemon, client)),
+        _ => None,
+    }
+}
+
+/// The uid that owns the control socket file. izbad binds it itself
+/// (`transport::bind_socket`), so on unix that is the daemon's own uid.
+/// `None` where there is no uid concept or the file cannot be stat'ed.
+fn socket_owner_uid(sock: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(sock).ok().map(|m| m.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sock;
+        None
+    }
+}
+
+/// Was the hello exchange cut off by the peer closing the connection?
+/// izbad's refusal closes without reading or replying, which reaches the
+/// client as a clean EOF before any reply byte, `ECONNRESET` (our hello was
+/// still unread), or `EPIPE` on the hello write (it closed before we wrote).
+/// A reply cut off part-way (`UnexpectedEof`) means the daemon had accepted
+/// us and then died, and a timeout means it is wedged — neither is a refusal.
+/// This inspects every error in the chain, so it is the uid evidence in
+/// `peer_rejection`, not this function alone, that makes the diagnosis safe.
+fn handshake_dropped(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let io = match c.downcast_ref::<izba_proto::FrameError>() {
+            Some(izba_proto::FrameError::Eof) => return true,
+            Some(izba_proto::FrameError::Io(io)) => Some(io),
+            Some(_) => None,
+            None => c.downcast_ref::<std::io::Error>(),
+        };
+        io.is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
+/// Diagnose a failed hello exchange as izbad's peer-uid refusal, or `None`
+/// when the evidence does not support that. Gated on
+/// `peercred::enforcement_mode()` — the same predicate the daemon's accept
+/// loop uses — so the client never reports a refusal on a platform whose
+/// daemon cannot perform one.
+fn peer_rejection(
+    paths: &Paths,
+    e: &anyhow::Error,
+    client_uid: Option<u32>,
+) -> Option<PeerRejected> {
+    if peercred::enforcement_mode() != peercred::PeerAuth::Enforced || !handshake_dropped(e) {
+        return None;
+    }
+    let socket = paths.daemon_socket();
+    let (daemon_uid, client_uid) = uid_mismatch(socket_owner_uid(&socket), client_uid)?;
+    Some(PeerRejected {
+        socket,
+        daemon_log: paths.daemon_log(),
+        daemon_uid,
+        client_uid,
+    })
+}
+
 /// Pre-spawn cleanup: if we can take the daemon flock, no daemon is alive —
 /// unlink any stale socket so the fresh daemon binds cleanly. If the lock is
 /// held, a daemon is starting/running and we leave everything alone (the
 /// concurrent-spawn loser exits "daemon already running" and both clients
 /// connect to the winner).
+///
+/// INVARIANT (#231): the unlink is conditional on WINNING the flock. A client
+/// that misreads a live daemon as gone reaches this function, and must not be
+/// able to unlink that daemon's socket. Pinned by
+/// `clear_stale_socket_spares_the_socket_while_a_daemon_holds_the_lock`.
 fn clear_stale_socket(paths: &Paths) -> anyhow::Result<()> {
     crate::paths::create_dir_700(&paths.daemon_dir(), paths.root())?;
     let f = std::fs::File::options()
@@ -644,10 +792,131 @@ mod tests {
                 serve_fake_daemon(p, "v1", DAEMON_PROTO_VERSION)
             },
             "v1",
+            crate::daemon::peercred::owner_uid(),
         )
         .unwrap();
         assert_eq!(spawned.load(Ordering::SeqCst), 1, "spawner ran");
         assert_eq!(client.server_proto, DAEMON_PROTO_VERSION);
+        assert_eq!(client.server_version, "v1");
+    }
+
+    /// An izbad stand-in that accepts and closes every connection without
+    /// answering. It waits for the hello first, so the client's failure is
+    /// deterministically a clean EOF on its reply read (the real izbad closes
+    /// without reading, which can also surface as ECONNRESET or EPIPE — the
+    /// classifier's unit tests cover those).
+    #[cfg(unix)]
+    fn serve_dropping_daemon(paths: &crate::paths::Paths) -> anyhow::Result<()> {
+        let listener = crate::daemon::transport::bind_socket(paths)?;
+        std::thread::spawn(move || loop {
+            let Ok((mut s, _peer)) = listener.accept() else {
+                return;
+            };
+            let _ = read_frame::<_, DaemonHello>(&mut s);
+        });
+        Ok(())
+    }
+
+    /// #231: a client the daemon refuses for its uid must NOT spawn a daemon,
+    /// and must get the uid diagnosis — through both the spawning and the
+    /// strict (`daemon status`/`stop`) entry points.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connect_with_does_not_spawn_when_the_daemon_refuses_this_uid() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        if bind_denied(&paths) {
+            return;
+        }
+        let _lock = hold_daemon_lock(&paths);
+        serve_dropping_daemon(&paths).unwrap();
+        let stranger = Some(my_uid() + 1);
+
+        let spawned = AtomicUsize::new(0);
+        let err = match DaemonClient::connect_with(
+            &paths,
+            &|_p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            "v",
+            stranger,
+        ) {
+            Ok(_) => panic!("a refused client cannot connect"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            0,
+            "no stray daemon: {err:#}"
+        );
+        let rejected = err.downcast_ref::<PeerRejected>().expect("uid diagnosis");
+        assert_eq!(rejected.daemon_uid, my_uid());
+        assert_eq!(Some(rejected.client_uid), stranger);
+
+        let strict = match DaemonClient::connect_existing_as(&paths, stranger) {
+            Ok(_) => panic!("a refused client cannot connect"),
+            Err(e) => e,
+        };
+        assert!(
+            strict.downcast_ref::<PeerRejected>().is_some(),
+            "{strict:#}"
+        );
+    }
+
+    /// The ambiguous case keeps today's behaviour: the SAME uid seeing a
+    /// cut-off handshake is the idle-exit race, so the client respawns once
+    /// and, when that does not help, reports the plain handshake error.
+    #[cfg(unix)]
+    #[test]
+    fn connect_with_still_respawns_on_a_dropped_handshake_from_its_own_uid() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        if bind_denied(&paths) {
+            return;
+        }
+        // A live daemon holds the flock, so the client's pre-spawn cleanup
+        // leaves the socket alone and the retry reaches the same listener.
+        let _lock = hold_daemon_lock(&paths);
+        serve_dropping_daemon(&paths).unwrap();
+
+        let spawned = AtomicUsize::new(0);
+        let err = match DaemonClient::connect_with(
+            &paths,
+            &|_p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            "v",
+            Some(my_uid()),
+        ) {
+            Ok(_) => panic!("the stand-in never answers the hello"),
+            Err(e) => e,
+        };
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "respawn attempted once");
+        assert!(err.downcast_ref::<PeerRejected>().is_none(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("reading hello reply"),
+            "{err:#}"
+        );
+    }
+
+    /// The public strict entry point: absent daemon is `None`, a serving one
+    /// is `Some` (it now delegates, so pin the wrapper itself).
+    #[test]
+    fn connect_existing_reports_absence_and_finds_a_serving_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        assert!(DaemonClient::connect_existing(&paths).unwrap().is_none());
+        if bind_denied(&paths) {
+            return;
+        }
+        serve_fake_daemon(&paths, "v1", DAEMON_PROTO_VERSION).unwrap();
+        let client = DaemonClient::connect_existing(&paths)
+            .unwrap()
+            .expect("daemon found");
         assert_eq!(client.server_version, "v1");
     }
 
@@ -671,6 +940,7 @@ mod tests {
                 serve_fake_daemon(p, "new", DAEMON_PROTO_VERSION)
             },
             "new",
+            crate::daemon::peercred::owner_uid(),
         )
         .unwrap();
         assert_eq!(
@@ -702,6 +972,7 @@ mod tests {
                 serve_fake_daemon(p, "unused", DAEMON_PROTO_VERSION)
             },
             "0.1.0 (bbbbbbb)",
+            crate::daemon::peercred::owner_uid(),
         )
         .unwrap();
         assert_eq!(
@@ -729,6 +1000,226 @@ mod tests {
             .context("connecting to the izbad socket")
             .unwrap_err();
         assert!(!is_daemon_gone(&denied));
+    }
+
+    /// This process's uid — the uid that owns every file these tests create.
+    #[cfg(unix)]
+    fn my_uid() -> u32 {
+        crate::daemon::peercred::owner_uid().expect("unix has a uid")
+    }
+
+    /// Take the daemon flock the way a live izbad does, so the client's
+    /// `clear_stale_socket` sees "a daemon is alive".
+    fn hold_daemon_lock(paths: &crate::paths::Paths) -> std::fs::File {
+        std::fs::create_dir_all(paths.daemon_dir()).unwrap();
+        let f = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.daemon_lock())
+            .unwrap();
+        f.try_lock().expect("the test holds the daemon lock");
+        f
+    }
+
+    /// An error shaped like the real hello-exchange failure of that io kind.
+    fn hello_io_error(kind: std::io::ErrorKind) -> anyhow::Error {
+        use anyhow::Context as _;
+        Err::<(), _>(izba_proto::FrameError::Io(std::io::Error::from(kind)))
+            .context("reading hello reply")
+            .unwrap_err()
+    }
+
+    fn hello_eof() -> anyhow::Error {
+        use anyhow::Context as _;
+        Err::<(), _>(izba_proto::FrameError::Eof)
+            .context("reading hello reply")
+            .unwrap_err()
+    }
+
+    /// #231 invariant: while a daemon holds the flock, a client's pre-spawn
+    /// cleanup must not unlink the live daemon's socket.
+    #[test]
+    fn clear_stale_socket_spares_the_socket_while_a_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        let _lock = hold_daemon_lock(&paths);
+        // A plain file stands in for the socket: the cleanup is an unlink.
+        std::fs::write(paths.daemon_socket(), b"").unwrap();
+        clear_stale_socket(&paths).unwrap();
+        assert!(
+            paths.daemon_socket().exists(),
+            "live daemon's socket unlinked"
+        );
+    }
+
+    /// …and with no daemon alive, the leftover socket is cleared so a fresh
+    /// daemon can bind.
+    #[test]
+    fn clear_stale_socket_unlinks_a_leftover_socket_when_no_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        std::fs::create_dir_all(paths.daemon_dir()).unwrap();
+        std::fs::write(paths.daemon_socket(), b"").unwrap();
+        clear_stale_socket(&paths).unwrap();
+        assert!(!paths.daemon_socket().exists(), "stale socket left behind");
+    }
+
+    #[test]
+    fn uid_mismatch_needs_two_known_and_different_uids() {
+        assert_eq!(uid_mismatch(Some(1000), Some(0)), Some((1000, 0)));
+        assert_eq!(uid_mismatch(Some(0), Some(1000)), Some((0, 1000)));
+        assert_eq!(uid_mismatch(Some(1000), Some(1000)), None);
+        assert_eq!(uid_mismatch(None, Some(0)), None);
+        assert_eq!(uid_mismatch(Some(1000), None), None);
+    }
+
+    /// Every way izbad's close-without-reading can surface on the client —
+    /// and the two that are NOT a cut-off connection.
+    #[test]
+    fn handshake_dropped_detection() {
+        use std::io::ErrorKind;
+        assert!(handshake_dropped(&hello_eof()));
+        assert!(handshake_dropped(&hello_io_error(
+            ErrorKind::ConnectionReset
+        )));
+        assert!(handshake_dropped(&hello_io_error(ErrorKind::BrokenPipe)));
+        // A raw io error (no FrameError wrapper) counts too.
+        assert!(handshake_dropped(&anyhow::Error::new(
+            std::io::Error::from(ErrorKind::ConnectionReset)
+        )));
+        // Partial reply then EOF: the daemon accepted us and died — not a refusal.
+        assert!(!handshake_dropped(&hello_io_error(
+            ErrorKind::UnexpectedEof
+        )));
+        // A wedged daemon times out; that is not a refusal. A unix socket read
+        // timeout (SO_RCVTIMEO) surfaces as WouldBlock; TimedOut is Windows'.
+        assert!(!handshake_dropped(&hello_io_error(ErrorKind::TimedOut)));
+        assert!(!handshake_dropped(&hello_io_error(ErrorKind::WouldBlock)));
+        assert!(!handshake_dropped(&hello_io_error(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!handshake_dropped(&anyhow::anyhow!(
+            "unexpected hello reply"
+        )));
+    }
+
+    /// The real signal, not a synthesized one: a peer that is already closed
+    /// fails the client's hello exchange in a way `handshake_dropped` matches.
+    /// Unix only: the refusal exists only where izbad enforces peer uids, and
+    /// WinSock reports a closed peer with different error kinds.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_peer_fails_the_handshake_as_dropped() {
+        let (client, server) = UdsStream::pair().unwrap();
+        drop(server);
+        let err = match DaemonClient::handshake(client, "v") {
+            Ok(_) => panic!("a closed peer cannot complete the hello"),
+            Err(e) => e,
+        };
+        assert!(handshake_dropped(&err), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_owner_uid_reads_the_file_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("izbad.sock");
+        assert_eq!(socket_owner_uid(&f), None, "absent file has no owner");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(socket_owner_uid(&f), Some(my_uid()));
+    }
+
+    /// A data root holding a plain file where the control socket lives: the
+    /// diagnosis only stats the path, so no listener is needed.
+    #[cfg(target_os = "linux")]
+    fn paths_with_socket_file() -> (tempfile::TempDir, crate::paths::Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        std::fs::create_dir_all(paths.daemon_dir()).unwrap();
+        std::fs::write(paths.daemon_socket(), b"").unwrap();
+        (dir, paths)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_rejection_names_both_uids_when_the_socket_belongs_to_someone_else() {
+        let (_dir, paths) = paths_with_socket_file();
+        let stranger = my_uid() + 1;
+        assert_eq!(
+            peer_rejection(&paths, &hello_eof(), Some(stranger)),
+            Some(PeerRejected {
+                socket: paths.daemon_socket(),
+                daemon_log: paths.daemon_log(),
+                daemon_uid: my_uid(),
+                client_uid: stranger,
+            })
+        );
+    }
+
+    /// Same uid on both sides: the cut-off is the ambiguous idle-exit race,
+    /// which must keep today's behaviour — never a uid message.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_rejection_is_none_for_the_sockets_own_uid() {
+        let (_dir, paths) = paths_with_socket_file();
+        assert_eq!(peer_rejection(&paths, &hello_eof(), Some(my_uid())), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_rejection_is_none_when_the_handshake_was_not_cut_off() {
+        let (_dir, paths) = paths_with_socket_file();
+        let timed_out = hello_io_error(std::io::ErrorKind::TimedOut);
+        assert_eq!(peer_rejection(&paths, &timed_out, Some(my_uid() + 1)), None);
+        // A unix read timeout surfaces as WouldBlock rather than TimedOut.
+        let would_block = hello_io_error(std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            peer_rejection(&paths, &would_block, Some(my_uid() + 1)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_rejection_is_none_without_a_socket_or_a_client_uid() {
+        let (_dir, paths) = paths_with_socket_file();
+        assert_eq!(peer_rejection(&paths, &hello_eof(), None), None);
+        std::fs::remove_file(paths.daemon_socket()).unwrap();
+        assert_eq!(
+            peer_rejection(&paths, &hello_eof(), Some(my_uid() + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn peer_rejected_message_names_both_uids_the_socket_and_the_log() {
+        let rejected = PeerRejected {
+            socket: "/data/daemon/izbad.sock".into(),
+            daemon_log: "/data/daemon/daemon.log".into(),
+            daemon_uid: 1000,
+            client_uid: 0,
+        };
+        let msg = format!("{:#}", anyhow::Error::new(rejected));
+        assert!(msg.contains("belongs to uid 1000"), "{msg}");
+        assert!(msg.contains("running as uid 0"), "{msg}");
+        assert!(msg.contains("rerun izba as uid 1000"), "{msg}");
+        assert!(msg.contains("/data/daemon/izbad.sock"), "{msg}");
+        assert!(msg.contains("/data/daemon/daemon.log"), "{msg}");
+        assert!(!msg.contains("reading hello reply"), "{msg}");
+    }
+
+    /// The whole point: a refusal must not look like a dead daemon, or
+    /// `connect_with` would spawn a new one.
+    #[test]
+    fn peer_rejected_is_not_daemon_gone() {
+        let rejected = anyhow::Error::new(PeerRejected {
+            socket: "/s".into(),
+            daemon_log: "/l".into(),
+            daemon_uid: 1000,
+            client_uid: 0,
+        });
+        assert!(!is_daemon_gone(&rejected));
     }
 
     #[test]
