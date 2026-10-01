@@ -82,8 +82,10 @@ is byte-for-byte what ran on 2026-08-07 is not recorded anywhere.
 
 The committed script covers boot window, idle, overlapping probes, attached
 device, daemon restart, busy guest and a 300-probe soak, through both probes,
-and exits non-zero if any reading of the live sandbox is not `running`. It was
-run in full twice in the form committed here (main; installed + Aug-6 guest).
+and exits non-zero if any reading of the live sandbox is not `running`. It
+refuses a data root that is not empty, and stops and removes only the sandbox
+it created. It was run in full twice in the form committed here (main;
+installed + Aug-6 guest).
 The sandbox copy, the held-open exec, the 1,500-probe soak and the USB write
 loop were one-off runs of its ad hoc predecessors; the script's opt-in
 `IZBA_USB_TRAFFIC` branch reproduces that last one but has not itself been run.
@@ -99,29 +101,29 @@ one dial + one `Health` exchange, which includes the guest forking
 
 | Condition | Build / guest | n | probe p50 | probe p95 | probe max | round trip p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| idle | main / bundle | 300 | 5.3 | 6.0 | 8.9 | 2.3 |
+| idle | main / bundle | 300 | 5.1 | 5.8 | 10.1 | 2.3 |
 | idle | installed / bundle (alpine) | 300 | 5.8 | 7.4 | 21.3 | 2.6 |
-| idle | installed / Aug-6 guest | 300 | 5.0 | 6.0 | 18.4 | 2.2 |
-| 8 overlapping workers | main | 800 | 14.5 | 21.7 | 49.7 | 6.7 |
-| USB device attached | main | 100 | 5.2 | 5.7 | 10.5 | 2.3 |
+| idle | installed / Aug-6 guest | 300 | 5.3 | 6.3 | 8.7 | 2.4 |
+| 8 overlapping workers | main | 800 | 13.7 | 19.1 | 28.2 | 6.4 |
+| USB device attached | main | 100 | 5.5 | 6.6 | 9.2 | 2.5 |
 | write loop through the USB device (3,828 writes in 40 s) | main | 300 | 7.0 | 10.5 | 16.9 | 3.1 |
-| busy loops on both vCPUs (load 3.7) | main | 300 | 7.5 | 10.0 | 11.6 | 3.5 |
-| busy loops on both vCPUs | installed / Aug-6 guest | 300 | 7.6 | 10.0 | 15.8 | 3.5 |
-| continuous 1 GiB fsync'd writes | main | 300 | 5.4 | 39.4 | **89.5** | 2.5 |
-| continuous 1 GiB fsync'd writes | installed / Aug-6 guest | 300 | 6.3 | 43.9 | 67.0 | 2.7 |
+| busy loops on both vCPUs (load 4.0) | main | 300 | 8.0 | 10.5 | 14.6 | 3.7 |
+| busy loops on both vCPUs | installed / Aug-6 guest | 300 | 7.5 | 9.8 | 17.5 | 3.0 |
+| continuous 1 GiB fsync'd writes | main | 300 | 6.0 | 37.6 | 83.5 | 2.7 |
+| continuous 1 GiB fsync'd writes | installed / Aug-6 guest | 300 | 5.6 | 41.9 | **85.3** | 2.5 |
 | copy of the `izba-test` sandbox | installed / bundle | 60 | 5.6 | 9.0 | 13.4 | 2.6 |
 
-**7,120 Health probe replicas, zero failures; the slowest took 89.5 ms —
-1.8 % of the 5,000 ms bound** (56× headroom), and that was under continuous
-disk writeback. Idle, the time goes about 3.7 ms to `sandbox::control` (the
-liveness check's own `Health` round trip plus a second dial) and about 1.6 ms
+**7,120 Health probe replicas, zero failures; the slowest took 85.3 ms —
+1.7 % of the 5,000 ms bound** (59× headroom), and that was under continuous
+disk writeback. Idle, the time goes about 3.6 ms to `sandbox::control` (the
+liveness check's own `Health` round trip plus a second dial) and about 1.5 ms
 to the probe's `Health` exchange; a bare dial through OpenVMM's hybrid-vsock
-bridge is about 0.8 ms.
+bridge is about 0.7 ms.
 
 The Stats probe (`probe_guest_stats`, which feeds the desktop app's container
 line today) is dominated by the guest's deliberate ~250 ms CPU sample: **80
 probes on main, p50 257 ms idle and 260 ms with both vCPUs saturated, max
-266.3 ms — 5.3 % of its 5,000 ms bound** (19× headroom).
+264.6 ms — 5.3 % of its 5,000 ms bound** (19× headroom).
 
 `izba status` as a whole takes about 200 ms wall on this host (it lands on
 100/200/300 ms steps; one call in 1,500 took 1,386 ms). That is not the probe:
@@ -166,7 +168,7 @@ More than 2,000 `izba status` readings of live sandboxes, every one
 | 4 overlapping pollers | installed | bundle | running ×60 |
 | `izba exec … sleep` held open (no PTY) | installed | bundle | running |
 | 1,500 probes of one sandbox | installed | bundle | running ×1,500; exec still works afterwards |
-| boot window | main, installed | bundle, Aug-6 | `stopped`/`unknown` → `running`/`running`; none of 62 readings showed a non-stopped sandbox without `running` |
+| boot window | main, installed | bundle, Aug-6 | `stopped`/`unknown` → `running`/`running`; none of 52 readings showed a non-stopped sandbox without `running` |
 | daemon stopped and respawned (adoption from disk) | main, installed | bundle, Aug-6 | running ×20; exec works |
 | saturated vCPUs; continuous fsync'd writes | main, installed | bundle, Aug-6 | running |
 | USB write loop | main | bundle | running |
