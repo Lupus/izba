@@ -29,6 +29,16 @@
 - **`izba daemon status` / `stop` as the wrong uid** (strict `connect_existing`, never spawns): must show the same diagnosis instead of the opaque text. Pinned by the `connect_existing_as` assertion inside `connect_with_does_not_spawn_when_the_daemon_refuses_this_uid` (Task 1) and the `daemon status` step of the e2e (Task 4).
 - **A stray spawn in the ambiguous case must stay harmless**: it loses the flock before it can unlink the socket or truncate the owner's log. Pinned by the three invariant tests in Task 2.
 
+## Amendments from review
+
+The whole-branch review changed five things after the tasks below were first written. The code blocks in this plan have been updated to match what shipped; this list records what moved and why.
+
+- **`UnexpectedEof` is NOT a refusal signal.** It only arises when a reply was cut off after some bytes arrived, i.e. the daemon had accepted the client and then died. `handshake_dropped` matches a clean EOF, `ConnectionReset` and `BrokenPipe` only, and its test asserts `UnexpectedEof` is rejected.
+- **A unix read timeout is `WouldBlock`**, not `TimedOut` (that is the Windows kind). The tests pin both as "not a refusal".
+- **The remedy hint is direction-neutral** — `rerun izba as uid {daemon_uid}` instead of `(for example, without sudo)`, which is wrong advice when the daemon's owner is root.
+- **The README names who actually reaches the peer check** — root pointed at the user's data directory. An unprivileged other user is stopped earlier by the 0700 data directory and never gets this error.
+- **The e2e forwards `LLVM_PROFILE_FILE` through `sudo`** and skips (rather than panics) when the suite itself runs as root. The test helper `paths_with_socket_file` is `cfg(target_os = "linux")`, matching its only users.
+
 ---
 
 ### Task 1: Diagnose a refused client and skip the spawn
@@ -98,15 +108,18 @@ Add inside `mod tests` in `crates/izba-core/src/daemon/client.rs`:
     fn handshake_dropped_detection() {
         use std::io::ErrorKind;
         assert!(handshake_dropped(&hello_eof()));
-        assert!(handshake_dropped(&hello_io_error(ErrorKind::UnexpectedEof)));
         assert!(handshake_dropped(&hello_io_error(ErrorKind::ConnectionReset)));
         assert!(handshake_dropped(&hello_io_error(ErrorKind::BrokenPipe)));
         // A raw io error (no FrameError wrapper) counts too.
         assert!(handshake_dropped(&anyhow::Error::new(std::io::Error::from(
             ErrorKind::ConnectionReset
         ))));
-        // A wedged daemon times out; that is not a refusal.
+        // Partial reply then EOF: the daemon accepted us and died — not a refusal.
+        assert!(!handshake_dropped(&hello_io_error(ErrorKind::UnexpectedEof)));
+        // A wedged daemon times out; that is not a refusal. A unix socket read
+        // timeout (SO_RCVTIMEO) surfaces as WouldBlock; TimedOut is Windows'.
         assert!(!handshake_dropped(&hello_io_error(ErrorKind::TimedOut)));
+        assert!(!handshake_dropped(&hello_io_error(ErrorKind::WouldBlock)));
         assert!(!handshake_dropped(&hello_io_error(ErrorKind::PermissionDenied)));
         assert!(!handshake_dropped(&anyhow::anyhow!("unexpected hello reply")));
     }
@@ -139,7 +152,7 @@ Add inside `mod tests` in `crates/izba-core/src/daemon/client.rs`:
 
     /// A data root holding a plain file where the control socket lives: the
     /// diagnosis only stats the path, so no listener is needed.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn paths_with_socket_file() -> (tempfile::TempDir, crate::paths::Paths) {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
@@ -179,6 +192,9 @@ Add inside `mod tests` in `crates/izba-core/src/daemon/client.rs`:
         let (_dir, paths) = paths_with_socket_file();
         let timed_out = hello_io_error(std::io::ErrorKind::TimedOut);
         assert_eq!(peer_rejection(&paths, &timed_out, Some(my_uid() + 1)), None);
+        // What a unix read timeout actually reports.
+        let would_block = hello_io_error(std::io::ErrorKind::WouldBlock);
+        assert_eq!(peer_rejection(&paths, &would_block, Some(my_uid() + 1)), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -201,6 +217,7 @@ Add inside `mod tests` in `crates/izba-core/src/daemon/client.rs`:
         let msg = format!("{:#}", anyhow::Error::new(rejected));
         assert!(msg.contains("belongs to uid 1000"), "{msg}");
         assert!(msg.contains("running as uid 0"), "{msg}");
+        assert!(msg.contains("rerun izba as uid 1000"), "{msg}");
         assert!(msg.contains("/data/daemon/izbad.sock"), "{msg}");
         assert!(msg.contains("/data/daemon/daemon.log"), "{msg}");
         assert!(!msg.contains("reading hello reply"), "{msg}");
@@ -259,11 +276,11 @@ impl std::fmt::Display for PeerRejected {
             f,
             "izbad closed the connection without answering: its control socket {} belongs to \
              uid {}, but this izba is running as uid {}. izbad serves only the user who \
-             started it — rerun izba as that user (for example, without sudo). Each refused \
-             connection is logged in {}",
+             started it — rerun izba as uid {}. Each refused connection is logged in {}",
             self.socket.display(),
             self.daemon_uid,
             self.client_uid,
+            self.daemon_uid,
             self.daemon_log.display()
         )
     }
@@ -296,10 +313,13 @@ fn socket_owner_uid(sock: &Path) -> Option<u32> {
 }
 
 /// Was the hello exchange cut off by the peer closing the connection?
-/// izbad's refusal closes without reading, which reaches the client as a
-/// clean EOF, `ECONNRESET` (our hello was still unread), or `EPIPE` on the
-/// hello write (it closed before we wrote). A timeout is NOT a cut-off: a
-/// refusing daemon closes at once, a wedged one does not.
+/// izbad's refusal closes without reading or replying, which reaches the
+/// client as a clean EOF before any reply byte, `ECONNRESET` (our hello was
+/// still unread), or `EPIPE` on the hello write (it closed before we wrote).
+/// A reply cut off part-way (`UnexpectedEof`) means the daemon had accepted
+/// us and then died, and a timeout means it is wedged — neither is a refusal.
+/// This inspects every error in the chain, so it is the uid evidence in
+/// `peer_rejection`, not this function alone, that makes the diagnosis safe.
 fn handshake_dropped(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let io = match c.downcast_ref::<izba_proto::FrameError>() {
@@ -311,9 +331,7 @@ fn handshake_dropped(e: &anyhow::Error) -> bool {
         io.is_some_and(|io| {
             matches!(
                 io.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
             )
         })
     })
@@ -788,7 +806,8 @@ In `main.rs`, replace the one-line doc comment on the `Daemon(DaemonCmd)` varian
     /// $IZBA_DATA_DIR); each daemon instance starts a fresh file. Look there
     /// when a command cannot reach the daemon. On Linux the daemon serves
     /// only the user who started it and logs every connection it refuses
-    /// from another user — for example `sudo izba` against your own daemon.
+    /// from another user — for example root pointed at your data directory
+    /// (`sudo -E izba ...`).
 ```
 
 Before committing, confirm the three data-dir spellings against `crates/izba-core/src/paths.rs` (`Paths::default`-style resolution near :14 and :213) and correct the text if the code says otherwise.
@@ -806,9 +825,9 @@ In `README.md`, extend the "Daemon-first, daemonless soul" bullet — after the 
 
 ```markdown
   It logs to `~/.local/share/izba/daemon/daemon.log` (a fresh file per daemon
-  instance). On Linux the daemon serves only the user who started it: a
-  command run as another user — `sudo izba …` against your own daemon — is
-  refused with an error naming both uids, and the daemon logs the refusal.
+  instance). On Linux the daemon serves only the user who started it: root
+  pointed at your data directory (for example `sudo -E izba …`) is refused
+  with an error naming both uids, and the daemon logs the refusal.
 ```
 
 - [ ] **Step 6: Lint and commit**
@@ -881,7 +900,10 @@ fn foreign_uid_client_is_refused_without_spawning_a_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("izba");
     let my_uid = std::fs::metadata(dir.path()).unwrap().uid();
-    assert_ne!(my_uid, 0, "the test itself must not run as root");
+    if my_uid == 0 {
+        eprintln!("SKIP: needs a non-root owner for the daemon (the suite is running as root)");
+        return;
+    }
 
     // Auto-start the user's daemon.
     assert_ok(&izba(&data, &[], &["ls"]), "ls (starts the daemon)");
@@ -889,11 +911,19 @@ fn foreign_uid_client_is_refused_without_spawning_a_daemon() {
     let log = data.join("daemon").join("daemon.log");
 
     let as_root = |args: &[&str]| {
-        std::process::Command::new("sudo")
-            .arg("-n")
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n")
             .arg("env")
-            .arg(format!("IZBA_DATA_DIR={}", data.display()))
-            .arg(env!("CARGO_BIN_EXE_izba"))
+            .arg(format!("IZBA_DATA_DIR={}", data.display()));
+        // sudo resets the environment: forward the coverage profile so the
+        // instrumented root `izba` neither loses its data nor litters a
+        // root-owned `default_*.profraw` in the crate directory.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            let mut arg = std::ffi::OsString::from("LLVM_PROFILE_FILE=");
+            arg.push(profile);
+            cmd.arg(arg);
+        }
+        cmd.arg(env!("CARGO_BIN_EXE_izba"))
             .args(args)
             .output()
             .expect("run izba as root")
