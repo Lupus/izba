@@ -4,7 +4,7 @@ const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
-import { api, onCreateProgress, b64ToBytes } from "../lib/ipc";
+import { api, onCreateProgress, onSaveProgress, onLoadProgress, b64ToBytes } from "../lib/ipc";
 
 describe("ipc action wrappers", () => {
   beforeEach(() => {
@@ -41,6 +41,41 @@ describe("ipc action wrappers", () => {
     };
     await api.create(opts);
     expect(invoke).toHaveBeenCalledWith("create", { opts });
+  });
+
+  it("save/load archive wrappers pass their opts and path", async () => {
+    const saveOpts = {
+      names: ["web"],
+      out: "/b/web.izba",
+      with_workspace: true,
+      stop: false,
+      overwrite: false,
+    };
+    await api.saveArchive(saveOpts);
+    expect(invoke).toHaveBeenCalledWith("save_archive", { opts: saveOpts });
+    const loadOpts = {
+      archive: "/b/web.izba",
+      select: ["web"],
+      rename: null,
+      workspace: null,
+      workspace_root: null,
+    };
+    await api.loadArchive(loadOpts);
+    expect(invoke).toHaveBeenCalledWith("load_archive", { opts: loadOpts });
+    await api.archiveInspect("/b/web.izba");
+    expect(invoke).toHaveBeenCalledWith("archive_inspect", { path: "/b/web.izba" });
+  });
+
+  it("save/load progress subscribe to their own events", async () => {
+    const seen: string[] = [];
+    listen.mockImplementation((_event: string, cb: (e: { payload: string }) => void) => {
+      cb({ payload: "tick" });
+      return Promise.resolve(() => {});
+    });
+    await onSaveProgress((m) => seen.push("save:" + m));
+    await onLoadProgress((m) => seen.push("load:" + m));
+    expect(listen.mock.calls.map((c) => c[0])).toEqual(["save-progress", "load-progress"]);
+    expect(seen).toEqual(["save:tick", "load:tick"]);
   });
 
   it("usb wrappers use the camelCase arg names the bridge expects", async () => {

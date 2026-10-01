@@ -13,6 +13,7 @@ import type {
   UsbUpstream,
   UsbDevice,
   UsbStatus,
+  ArchiveInfo,
 } from "../../src/lib/types";
 
 export interface Scenario {
@@ -50,6 +51,19 @@ export interface Scenario {
   createName?: string;
   createError?: string;
   createDeferred?: boolean;
+  /** `archive_inspect` response (default: one bundled sandbox, `api`). */
+  archive?: ArchiveInfo;
+  /** Makes `archive_inspect` reject with this message. */
+  archiveError?: string;
+  /** Makes `save_archive` reject with this message. */
+  saveError?: string;
+  /** Holds `save_archive` open until `mock.resolveSave()`. */
+  saveDeferred?: boolean;
+  saveWarnings?: string[];
+  /** Makes `load_archive` reject with this message. */
+  loadError?: string;
+  loadWarnings?: string[];
+  loadRedo?: string[];
   /** `lockdown` outcome: "locked" (default) or "cancelled" (UAC declined). */
   lockdownOutcome?: "locked" | "cancelled";
   /** Makes `lockdown` reject with this message. */

@@ -165,3 +165,75 @@ describe("tauri-mock: fall-through", () => {
     await expect(m.invoke("no_such_cmd")).rejects.toThrow("unmocked command: no_such_cmd");
   });
 });
+
+describe("tauri-mock: save/load archive", () => {
+  const saveOpts = {
+    names: ["web", "db"],
+    out: "/b/all.izba",
+    with_workspace: true,
+    stop: true,
+    overwrite: false,
+  };
+
+  it("save_archive logs the selection and reports the path it was given", async () => {
+    const { invoke, calls } = loadMock({});
+    const rep = (await invoke("save_archive", { opts: saveOpts })) as {
+      path: string;
+      sandboxes: string[];
+    };
+    expect(rep.path).toBe("/b/all.izba");
+    expect(rep.sandboxes).toEqual(["web", "db"]);
+    expect(calls()).toEqual(["save_archive:web,db:/b/all.izba:true:true"]);
+  });
+
+  it("save_archive rejects with the scenario's error", async () => {
+    const { invoke } = loadMock({ saveError: "sandbox 'web' is running" });
+    await expect(invoke("save_archive", { opts: saveOpts })).rejects.toThrow(/is running/);
+  });
+
+  it("archive_inspect answers the scenario's archive, or its error", async () => {
+    const archive = {
+      izba_version: "0.1.0",
+      source_os: "linux",
+      created_unix_ms: 1,
+      sandboxes: [
+        { name: "api", workspace_bundled: true, source_workspace: "/src/api", locked: false },
+      ],
+    };
+    const ok = loadMock({ archive });
+    expect(await ok.invoke("archive_inspect", { path: "/in/a.izba" })).toEqual(archive);
+    expect(ok.calls()).toEqual(["archive_inspect:/in/a.izba"]);
+    const bad = loadMock({ archiveError: "not an izba archive" });
+    await expect(bad.invoke("archive_inspect", { path: "/x" })).rejects.toThrow(/not an izba/);
+  });
+
+  it("load_archive registers what it loaded, stopped, under the new name", async () => {
+    const { invoke, calls } = loadMock({ sandboxes: [] });
+    const rep = (await invoke("load_archive", {
+      opts: {
+        archive: "/in/a.izba",
+        select: ["api"],
+        rename: "api2",
+        workspace: "/home/u/api2",
+        workspace_root: null,
+      },
+    })) as { sandboxes: { name: string; workspace: string }[] };
+    expect(rep.sandboxes).toEqual([
+      { name: "api2", image: "ubuntu:24.04", workspace: "/home/u/api2" },
+    ]);
+    expect(calls()).toEqual(["load_archive:/in/a.izba:api:api2:/home/u/api2:"]);
+    expect(await invoke("list")).toEqual([
+      { name: "api2", image: "ubuntu:24.04", state: { kind: "stopped" } },
+    ]);
+  });
+
+  it("load_archive rejects with the scenario's error and registers nothing", async () => {
+    const { invoke } = loadMock({ sandboxes: [], loadError: "not enough free space" });
+    await expect(
+      invoke("load_archive", {
+        opts: { archive: "/a", select: ["api"], rename: null, workspace: null, workspace_root: null },
+      }),
+    ).rejects.toThrow(/free space/);
+    expect(await invoke("list")).toEqual([]);
+  });
+});

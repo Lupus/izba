@@ -23,6 +23,25 @@ pub trait ShellSession: Send {
     fn close(&mut self) -> anyhow::Result<()>;
 }
 
+/// A save request as the daemon takes it (absolute `out`).
+#[derive(Debug, Clone)]
+pub struct SaveArchive {
+    pub names: Vec<String>,
+    pub out: std::path::PathBuf,
+    pub with_workspace: bool,
+    pub stop: bool,
+}
+
+/// A load request as the daemon takes it (absolute paths).
+#[derive(Debug, Clone)]
+pub struct LoadArchive {
+    pub archive: std::path::PathBuf,
+    pub select: Vec<String>,
+    pub rename: Option<String>,
+    pub workspace: Option<std::path::PathBuf>,
+    pub workspace_root: Option<std::path::PathBuf>,
+}
+
 /// Seam over izbad access so commands are unit-testable without a real daemon.
 pub trait DaemonApi: Send {
     fn list(&mut self) -> anyhow::Result<Vec<SandboxView>>;
@@ -40,6 +59,18 @@ pub trait DaemonApi: Send {
     ) -> anyhow::Result<String>;
     /// Read the sandbox's captured console output (`logs/console.log`).
     /// Returns an empty string if the file does not exist yet.
+    /// `izba save`: archive sandboxes into `req.out`, streaming `Progress`.
+    fn save(
+        &mut self,
+        req: SaveArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::save::SaveReport>;
+    /// `izba load`: restore sandboxes from `req.archive`, streaming `Progress`.
+    fn load(
+        &mut self,
+        req: LoadArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::load::LoadReport>;
     fn read_logs(&mut self, name: &str) -> anyhow::Result<String>;
     /// Open an interactive shell into `name`. `on_output` is invoked from a
     /// reader thread with raw PTY output; `on_exit` fires once when the shell
@@ -282,6 +313,44 @@ impl DaemonApi for RealDaemon {
                 other => anyhow::bail!("unexpected Create reply: {other:?}"),
             },
         )
+    }
+
+    fn save(
+        &mut self,
+        req: SaveArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::save::SaveReport> {
+        let req = DaemonRequest::Save {
+            names: req.names,
+            all: false,
+            out: req.out,
+            with_workspace: req.with_workspace,
+            stop: req.stop,
+        };
+        self.with_client(|c| match c.request(&req, on_progress)? {
+            DaemonResponse::Saved(r) => Ok(r),
+            DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("unexpected Save reply: {other:?}"),
+        })
+    }
+
+    fn load(
+        &mut self,
+        req: LoadArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::load::LoadReport> {
+        let req = DaemonRequest::Load {
+            archive: req.archive,
+            select: req.select,
+            rename: req.rename,
+            workspace: req.workspace,
+            workspace_root: req.workspace_root,
+        };
+        self.with_client(|c| match c.request(&req, on_progress)? {
+            DaemonResponse::Loaded(r) => Ok(r),
+            DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("unexpected Load reply: {other:?}"),
+        })
     }
 
     fn read_logs(&mut self, name: &str) -> anyhow::Result<String> {

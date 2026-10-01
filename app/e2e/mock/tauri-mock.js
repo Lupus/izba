@@ -27,6 +27,7 @@
   const calls = [];
   const listeners = new Map(); // event name -> Set<handler id>
   let deferredCreate = null;
+  let deferredSave = null;
 
   // Canned manifest_diff/manifest_export/manifest_promote responses, overridable
   // per-test via window.__MOCK_MANIFEST__ = { diff, export, promote, promoteError }.
@@ -143,6 +144,90 @@
           });
         if (scenario.createError) return err(scenario.createError);
         return Promise.resolve(scenario.createName || (args.opts && args.opts.name));
+      }
+
+      case "save_archive": {
+        const o = args.opts || {};
+        calls.push(
+          "save_archive:" +
+            (o.names || []).join(",") +
+            ":" +
+            o.out +
+            ":" +
+            o.with_workspace +
+            ":" +
+            o.stop
+        );
+        window.__IZBA_LAST_SAVE__ = o;
+        if (scenario.saveError) return err(scenario.saveError);
+        const report = {
+          path: o.out,
+          sandboxes: o.names || [],
+          logical_bytes: 8 * 1024 * 1024 * 1024,
+          archive_bytes: 1536 * 1024 * 1024,
+          warnings: scenario.saveWarnings || [],
+        };
+        if (scenario.saveDeferred)
+          return new Promise(function (resolve, reject) {
+            deferredSave = { resolve: resolve, reject: reject, report: report };
+          });
+        return Promise.resolve(report);
+      }
+      case "archive_inspect":
+        calls.push("archive_inspect:" + args.path);
+        return scenario.archiveError
+          ? err(scenario.archiveError)
+          : Promise.resolve(
+              scenario.archive || {
+                izba_version: "0.1.0",
+                source_os: "linux",
+                created_unix_ms: 1700000000000,
+                sandboxes: [
+                  {
+                    name: "api",
+                    workspace_bundled: true,
+                    source_workspace: "/home/src/api",
+                    locked: false,
+                  },
+                ],
+              }
+            );
+      case "load_archive": {
+        const o = args.opts || {};
+        calls.push(
+          "load_archive:" +
+            o.archive +
+            ":" +
+            (o.select || []).join(",") +
+            ":" +
+            (o.rename || "") +
+            ":" +
+            (o.workspace || "") +
+            ":" +
+            (o.workspace_root || "")
+        );
+        window.__IZBA_LAST_LOAD__ = o;
+        if (scenario.loadError) return err(scenario.loadError);
+        const loaded = (o.select || []).map(function (n) {
+          const name = o.rename || n;
+          return {
+            name: name,
+            image: "ubuntu:24.04",
+            workspace:
+              o.workspace || (o.workspace_root ? o.workspace_root + "/" + n : "/home/u/" + n),
+          };
+        });
+        // Loaded sandboxes exist from here on — always stopped.
+        scenario.sandboxes = (scenario.sandboxes || []).concat(
+          loaded.map(function (l) {
+            return { name: l.name, image: l.image, state: { kind: "stopped" } };
+          })
+        );
+        return Promise.resolve({
+          sandboxes: loaded,
+          warnings: scenario.loadWarnings || [],
+          redo: scenario.loadRedo || [],
+        });
       }
 
       case "read_logs":
@@ -385,6 +470,21 @@
     },
     fireShellExit: function (id) {
       void fireEvent("shell-exit", { id: id });
+    },
+    lastSave: function () {
+      return window.__IZBA_LAST_SAVE__;
+    },
+    lastLoad: function () {
+      return window.__IZBA_LAST_LOAD__;
+    },
+    pushSaveProgress: function (msg) {
+      void fireEvent("save-progress", msg);
+    },
+    pushLoadProgress: function (msg) {
+      void fireEvent("load-progress", msg);
+    },
+    resolveSave: function () {
+      if (deferredSave) deferredSave.resolve(deferredSave.report);
     },
     resolveCreate: function (name) {
       if (deferredCreate) deferredCreate.resolve(name);

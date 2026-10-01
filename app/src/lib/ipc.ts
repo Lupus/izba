@@ -21,6 +21,11 @@ import type {
   UsbDevice,
   UsbStatus,
   SandboxStats,
+  SaveArchiveOpts,
+  SaveReport,
+  LoadArchiveOpts,
+  LoadReport,
+  ArchiveInfo,
 } from "./types";
 
 export const api = {
@@ -32,6 +37,9 @@ export const api = {
   restart: (name: string) => invoke<void>("restart", { name }),
   remove: (name: string, force: boolean) => invoke<void>("remove", { name, force }),
   create: (opts: CreateOpts) => invoke<string>("create", { opts }),
+  saveArchive: (opts: SaveArchiveOpts) => invoke<SaveReport>("save_archive", { opts }),
+  loadArchive: (opts: LoadArchiveOpts) => invoke<LoadReport>("load_archive", { opts }),
+  archiveInspect: (path: string) => invoke<ArchiveInfo>("archive_inspect", { path }),
   readLogs: (name: string) => invoke<string>("read_logs", { name }),
   shellOpen: (name: string, id: string) => invoke<void>("shell_open", { name, id }),
   shellWrite: (id: string, data: string) => invoke<void>("shell_write", { id, data }),
@@ -105,6 +113,16 @@ export function b64ToBytes(b64: string): Uint8Array {
 /** Subscribe to streamed create-progress messages. Returns an unlisten fn. */
 export function onCreateProgress(cb: (msg: string) => void): Promise<UnlistenFn> {
   return listen<string>("create-progress", (e) => cb(e.payload));
+}
+
+/** Subscribe to streamed save-archive progress messages. */
+export function onSaveProgress(cb: (msg: string) => void): Promise<UnlistenFn> {
+  return listen<string>("save-progress", (e) => cb(e.payload));
+}
+
+/** Subscribe to streamed load-archive progress messages. */
+export function onLoadProgress(cb: (msg: string) => void): Promise<UnlistenFn> {
+  return listen<string>("load-progress", (e) => cb(e.payload));
 }
 
 /** Subscribe to a shell session's output (decoded to bytes), filtered by id. */

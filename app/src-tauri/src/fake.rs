@@ -215,6 +215,86 @@ impl DaemonApi for FakeDaemon {
         self.calls.push(format!("create:{}", req.name));
         Ok(req.name)
     }
+    fn save(
+        &mut self,
+        req: crate::daemon::SaveArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::save::SaveReport> {
+        self.calls.push(format!(
+            "save:{}:{}:{}:{}",
+            req.names.join(","),
+            req.out.display(),
+            req.with_workspace,
+            req.stop
+        ));
+        if self.fail_action {
+            anyhow::bail!("action failed");
+        }
+        for m in &self.progress {
+            on_progress(m);
+        }
+        // Like the real daemon, leave a file at `out` (best-effort: most
+        // tests name a path whose parent does not exist).
+        let _ = std::fs::write(&req.out, b"fake archive");
+        Ok(izba_core::bundle::save::SaveReport {
+            path: req.out,
+            sandboxes: req.names,
+            logical_bytes: 2048,
+            archive_bytes: 1024,
+            warnings: vec!["skipped a socket".into()],
+        })
+    }
+    fn load(
+        &mut self,
+        req: crate::daemon::LoadArchive,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<izba_core::bundle::load::LoadReport> {
+        let path = |p: &Option<std::path::PathBuf>| {
+            p.as_ref()
+                .map_or("-".to_string(), |p| p.display().to_string())
+        };
+        self.calls.push(format!(
+            "load:{}:{}:{}:{}:{}",
+            req.archive.display(),
+            req.select.join(","),
+            req.rename.as_deref().unwrap_or("-"),
+            path(&req.workspace),
+            path(&req.workspace_root),
+        ));
+        if self.fail_action {
+            anyhow::bail!("action failed");
+        }
+        for m in &self.progress {
+            on_progress(m);
+        }
+        let sandboxes: Vec<_> = req
+            .select
+            .iter()
+            .map(|n| {
+                let name = req.rename.clone().unwrap_or_else(|| n.clone());
+                let workspace = match (&req.workspace, &req.workspace_root) {
+                    (Some(w), _) => w.clone(),
+                    (None, Some(root)) => root.join(n),
+                    (None, None) => std::path::PathBuf::from(format!("/ws/{n}")),
+                };
+                izba_core::bundle::load::LoadedSandbox {
+                    name,
+                    image_ref: "ubuntu:24.04".into(),
+                    workspace,
+                }
+            })
+            .collect();
+        let redo = sandboxes
+            .iter()
+            .take(1)
+            .map(|s| format!("re-run: izba lockdown {}", s.name))
+            .collect();
+        Ok(izba_core::bundle::load::LoadReport {
+            sandboxes,
+            warnings: vec![],
+            redo,
+        })
+    }
     fn read_logs(&mut self, _name: &str) -> anyhow::Result<String> {
         if self.fail_action {
             anyhow::bail!("action failed");

@@ -343,3 +343,63 @@ export interface UsbStatus {
    *  is chosen at boot, so this one needs a restart before it can attach. */
   restart_required: boolean;
 }
+
+/** Save-dialog options (mirrors views::SaveArchiveOpts / `izba save`). */
+export interface SaveArchiveOpts {
+  names: string[];
+  out: string;
+  with_workspace: boolean;
+  /** Stop the selected sandboxes that are still running first (--stop). */
+  stop: boolean;
+  /** The user confirmed replacing `out` in the native save dialog. */
+  overwrite: boolean;
+}
+
+export interface SaveReport {
+  path: string;
+  sandboxes: string[];
+  logical_bytes: number;
+  archive_bytes: number;
+  warnings: string[];
+}
+
+/** Load-dialog options (mirrors views::LoadArchiveOpts / `izba load`). */
+export interface LoadArchiveOpts {
+  archive: string;
+  /** Archived names to load. */
+  select: string[];
+  /** New name (--as); only with exactly one selected sandbox. */
+  rename: string | null;
+  /** Explicit workspace folder (--workspace); only with exactly one. */
+  workspace: string | null;
+  /** Parent folder for every workspace (--workspace-root). */
+  workspace_root: string | null;
+}
+
+export interface LoadedSandbox {
+  name: string;
+  image: string;
+  workspace: string;
+}
+
+export interface LoadReport {
+  sandboxes: LoadedSandbox[];
+  warnings: string[];
+  /** What must be redone on this host (re-plug USB, re-run lock-down). */
+  redo: string[];
+}
+
+export interface ArchiveSandbox {
+  name: string;
+  workspace_bundled: boolean;
+  source_workspace: string;
+  locked: boolean;
+}
+
+/** What an archive holds, read from its manifest before loading. */
+export interface ArchiveInfo {
+  izba_version: string;
+  source_os: string;
+  created_unix_ms: number;
+  sandboxes: ArchiveSandbox[];
+}

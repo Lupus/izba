@@ -9,21 +9,59 @@ interface Props {
   selected: string | null;
   onSelect: (name: string) => void;
   onNew: () => void;
+  /** Open the Save-archive dialog (`izba save`). */
+  onSave: () => void;
+  /** Open the Load-archive dialog (`izba load`). */
+  onLoad: () => void;
   view: View;
   onView: (v: View) => void;
 }
 
-export function Rail({ sandboxes, selected, onSelect, onNew, view, onView }: Props) {
+export function Rail({
+  sandboxes,
+  selected,
+  onSelect,
+  onNew,
+  onSave,
+  onLoad,
+  view,
+  onView,
+}: Props) {
   return (
     <nav className="flex h-full w-56 shrink-0 flex-col gap-1 overflow-y-auto border-r border-border bg-sidebar p-3">
       <Button
         type="button"
         onClick={onNew}
         aria-label="New sandbox"
-        className="mb-2 w-full"
+        className="mb-1 w-full"
       >
         ＋ New sandbox
       </Button>
+      <div className="mb-2 flex gap-1">
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={onSave}
+          disabled={sandboxes.length === 0}
+          aria-label="Save archive"
+          title="Save sandboxes to an archive you can move to another machine"
+          className="flex-1"
+        >
+          Save…
+        </Button>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={onLoad}
+          aria-label="Load archive"
+          title="Load sandboxes from an archive"
+          className="flex-1"
+        >
+          Load…
+        </Button>
+      </div>
       <Button
         type="button"
         variant="ghost"
