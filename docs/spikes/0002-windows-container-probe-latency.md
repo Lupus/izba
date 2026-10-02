@@ -310,16 +310,19 @@ route to "`unknown` while running" that was reproduced here.
 
 ## Follow-on Work
 
-Proposed; none filed yet (awaiting sign-off):
+- [#251](https://github.com/Lupus/izba/issues/251) — re-scoped from "fix the
+  root cause" to **Windows regression coverage for the container-state line,
+  and make `unknown` say why**.
+- [#320](https://github.com/Lupus/izba/issues/320) — Windows: `izba stop`
+  always waits out the full 10 s graceful timeout; OpenVMM does not exit when
+  the guest powers off (`type:performance`, P3, S).
+- [#319](https://github.com/Lupus/izba/issues/319) — Windows: a killed OpenVMM
+  worker stuck in process teardown goes unnoticed; `stop` reports success
+  while the disks stay locked (`type:reliability`, P2, M). Includes finding
+  out why the guest did not power off after sustained usbip traffic.
+- [#194](https://github.com/Lupus/izba/issues/194) (existing, unchanged) —
+  artifact provenance; this spike adds a reproduced case for it (finding 6).
 
-- **Re-scope #251** as described above (coverage + "say why it is unknown"),
-  instead of a new item.
-- **New — Windows: `izba stop` always waits out the full 10 s graceful
-  timeout** because OpenVMM does not exit when the guest powers off, which
-  happens within 0.3 s (`type:performance`, P3, S).
-- **New — Windows: a terminated VMM worker stuck in process teardown goes
-  unnoticed**; `stop` reports success, `state.json` is removed, the disks stay
-  locked and `rm` fails (`type:reliability`, P2, M). Includes finding out why
-  the guest did not power off after sustained usbip traffic.
-- **Existing #194** — no change in scope; this spike adds a reproduced case
-  for it (finding 6).
+\#319 and #320 are filed as standalone items rather than sub-issues of #193:
+they are unrelated to the container-state line, and as children they would
+keep #193 from closing.
