@@ -7,6 +7,8 @@
 # It never creates or starts anything. It runs `izba status`, `izba stop` and
 # `izba rm --force` against the given sandbox, which is what a user would do,
 # and reports PASS/FAIL per #319 acceptance criterion.
+# If `izba stop` is NOT refused, `rm --force` is skipped (it would really delete
+# the sandbox).
 #
 # Exit code: number of failed checks; 100 when a prerequisite is missing.
 Set-StrictMode -Version Latest
@@ -35,7 +37,7 @@ if (-not (Test-Path $sandboxDir)) { [Console]::Error.WriteLine("no such sandbox 
 # Run izba with the data root under test; return rc + combined output.
 function Invoke-Izba([string[]] $izbaArgs) {
     $env:IZBA_DATA_DIR = $data
-    $out = & $exe @izbaArgs 2>&1 | Out-String
+    $out = & $exe @izbaArgs 2>&1 | ForEach-Object { "$_" } | Out-String -Width 4096
     return @{ rc = $LASTEXITCODE; out = $out.Trim() }
 }
 
@@ -44,7 +46,10 @@ Say 'openvmm.exe processes on the host:'
 $vmms = @(Get-CimInstance Win32_Process -Filter "Name='openvmm.exe'" -ErrorAction SilentlyContinue)
 foreach ($p in $vmms) {
     $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
-    $exited = if ($null -ne $proc) { $proc.HasExited } else { 'n/a' }
+    $exited = 'n/a'
+    if ($null -ne $proc) {
+        try { $exited = $proc.HasExited } catch { $exited = 'n/a' }
+    }
     Say ("  pid={0} ppid={1} exited={2} threads={3} handles={4} working_set_mb={5}" -f `
         $p.ProcessId, $p.ParentProcessId, $exited, $p.ThreadCount, $p.HandleCount, [int]($p.WorkingSetSize / 1MB))
 }
@@ -78,12 +83,20 @@ Check 'stop names a pid and says the disks are still held' ($stop.out -match 'VM
 Check 'stop says what to do (retry / host reboot)' ($stop.out -match 'Retry `izba stop' -and $stop.out -match 'host reboot')
 Check 'state.json is preserved after the refused stop' (Test-Path (Join-Path $sandboxDir 'state.json'))
 
-$rm = Invoke-Izba @('rm', $name, '--force')
-Say "izba rm --force: rc=$($rm.rc)"
-Say ("  " + ($rm.out -replace "`r?`n", "`n  "))
-Check 'rm --force exits non-zero' ($rm.rc -ne 0)
-Check 'rm --force gives the same explanation, not a raw Access is denied' ($rm.out -match 'still holds the sandbox''s disks' -and $rm.out -notmatch 'Access is denied')
-Check 'sandbox dir still exists after the refused rm' (Test-Path $sandboxDir)
+if ($stop.rc -ne 0) {
+    $rm = Invoke-Izba @('rm', $name, '--force')
+    Say "izba rm --force: rc=$($rm.rc)"
+    Say ("  " + ($rm.out -replace "`r?`n", "`n  "))
+    Check 'rm --force exits non-zero' ($rm.rc -ne 0)
+    Check 'rm --force gives the same explanation, not a raw Access is denied' ($rm.out -match 'still holds the sandbox''s disks' -and $rm.out -notmatch 'Access is denied')
+    Check 'sandbox dir still exists after the refused rm' (Test-Path $sandboxDir)
+}
+else {
+    Say 'izba rm --force: skipped, because stop did not refuse (rm --force would really delete the sandbox)'
+    Check 'rm --force exits non-zero' $false
+    Check 'rm --force gives the same explanation, not a raw Access is denied' $false
+    Check 'sandbox dir still exists after the refused rm' $false
+}
 
 if ($fails -eq 0) { Say 'VERDICT: izba reports the stuck teardown honestly on every surface' }
 else { Say "VERDICT: $fails check(s) failed" }
