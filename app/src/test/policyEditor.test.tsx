@@ -205,7 +205,7 @@ describe("PolicyEditor", () => {
     render(<PolicyEditor name="web" />);
     // add a git repo row, type a target, pick read-write
     fireEvent.click(await screen.findByRole("button", { name: /Add repo/ }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Repo for git rule 1 (empty)" }), { target: { value: "github.com/o/a" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Repo for git rule 1" }), { target: { value: "github.com/o/a" } });
     fireEvent.click(screen.getByRole("button", { name: /Save/ }));
     await waitFor(() => expect(setFull).toHaveBeenCalledWith("web",
       [{ host: "a.com", ports: [443], access: "read-write" }],
@@ -216,7 +216,7 @@ describe("PolicyEditor", () => {
     (api.policyShow as Mock).mockResolvedValue({ enforcing: false, allow: [], git: [] });
     render(<PolicyEditor name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /Add repo/ }));
-    const input = screen.getByRole("textbox", { name: "Repo for git rule 1 (empty)" }) as HTMLInputElement;
+    const input = screen.getByRole("textbox", { name: "Repo for git rule 1" }) as HTMLInputElement;
     expect(input.disabled).toBe(false);
   });
 
@@ -432,7 +432,7 @@ describe("PolicyEditor", () => {
     (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
     render(<PolicyEditor name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1 (empty)" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1" }), {
       target: { value: "*.example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
@@ -459,7 +459,7 @@ describe("PolicyEditor", () => {
     (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
     render(<PolicyEditor name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1 (empty)" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1" }), {
       target: { value: "foo.*.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
@@ -475,7 +475,7 @@ describe("PolicyEditor", () => {
     (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
     render(<PolicyEditor name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1 (empty)" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Host for host rule 1" }), {
       target: { value: "*.git{hub.com,evil.com}" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
@@ -1109,8 +1109,8 @@ describe("PolicyEditor accessible names (#244)", () => {
       git: [],
     });
     render(<PolicyEditor name="web" />);
-    const host1 = await screen.findByRole("textbox", { name: "Host for host rule 1 (api.x.com)" });
-    const host2 = screen.getByRole("textbox", { name: "Host for host rule 2 (db.internal)" });
+    const host1 = await screen.findByRole("textbox", { name: "Host for host rule 1" });
+    const host2 = screen.getByRole("textbox", { name: "Host for host rule 2" });
     expect(host1).toHaveValue("api.x.com");
     expect(host2).toHaveValue("db.internal");
     const row1 = screen.getByRole("group", { name: "host rule 1 (api.x.com)" });
@@ -1129,7 +1129,7 @@ describe("PolicyEditor accessible names (#244)", () => {
 
   it("associates the visible Host label with its input, and the name starts with that text", async () => {
     render(<PolicyEditor name="web" />); // default mock: api.x.com + db.internal
-    const input = await screen.findByRole("textbox", { name: "Host for host rule 1 (api.x.com)" });
+    const input = await screen.findByRole("textbox", { name: "Host for host rule 1" });
     const labels = screen.getAllByText("Host").filter((el) => el.tagName === "LABEL") as HTMLLabelElement[];
     const label = labels.find((l) => l.control === input);
     expect(label).toBeDefined();
@@ -1141,13 +1141,24 @@ describe("PolicyEditor accessible names (#244)", () => {
     const portsLabelIds = (ports.getAttribute("aria-labelledby") ?? "").split(" ");
     expect(portsLabelIds.map((id) => document.getElementById(id)?.textContent)).toEqual([
       "Ports",
-      "for host rule 1 (api.x.com)",
+      "for host rule 1",
+      "(api.x.com)",
     ]);
+    // The visible "Ports" text is a <label> for the add-port field, so
+    // activating it focuses that field.
+    const portsLabel = screen
+      .getAllByText("Ports")
+      .find((el) => el.tagName === "LABEL" && row1.contains(el)) as HTMLLabelElement | undefined;
+    expect(portsLabel).toBeDefined();
+    expect(portsLabel?.control).toBe(
+      within(row1).getByRole("textbox", { name: "Add port to host rule 1 (api.x.com)" }),
+    );
     const access = within(row1).getByRole("radiogroup", { name: "Access for host rule 1 (api.x.com)" });
     const accessLabelIds = (access.getAttribute("aria-labelledby") ?? "").split(" ");
     expect(accessLabelIds.map((id) => document.getElementById(id)?.textContent)).toEqual([
       "Access",
-      "for host rule 1 (api.x.com)",
+      "for host rule 1",
+      "(api.x.com)",
     ]);
   });
 
@@ -1161,9 +1172,9 @@ describe("PolicyEditor accessible names (#244)", () => {
       ],
     });
     render(<PolicyEditor name="web" />);
-    const repo1 = await screen.findByRole("textbox", { name: "Repo for git rule 1 (github.com/o/a)" });
+    const repo1 = await screen.findByRole("textbox", { name: "Repo for git rule 1" });
     expect(repo1).toHaveValue("github.com/o/a");
-    expect(screen.getByRole("textbox", { name: "Repo for git rule 2 (gitlab.com)" })).toHaveValue("gitlab.com");
+    expect(screen.getByRole("textbox", { name: "Repo for git rule 2" })).toHaveValue("gitlab.com");
     expect(screen.queryByRole("textbox", { name: "github.com/owner/repo" })).not.toBeInTheDocument();
     const row2 = screen.getByRole("group", { name: "git rule 2 (gitlab.com)" });
     expect(within(row2).getByRole("radiogroup", { name: "Access for git rule 2 (gitlab.com)" })).toBeInTheDocument();
@@ -1171,7 +1182,7 @@ describe("PolicyEditor accessible names (#244)", () => {
     expect(screen.getByRole("button", { name: "Remove git rule 2 (gitlab.com)" })).toBeInTheDocument();
     // A freshly added git row reads as empty, with its own ordinal.
     fireEvent.click(screen.getByRole("button", { name: /Add repo/ }));
-    expect(screen.getByRole("textbox", { name: "Repo for git rule 3 (empty)" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "Repo for git rule 3" })).toHaveValue("");
   });
 
   it("names remove buttons by the rule, and port chips by rule even when ports collide", async () => {
@@ -1214,33 +1225,67 @@ describe("PolicyEditor accessible names (#244)", () => {
       git: [],
     });
     render(<PolicyEditor name="web" />);
-    await screen.findByRole("textbox", { name: "Host for host rule 2 (api.x.com)" });
+    await screen.findByRole("textbox", { name: "Host for host rule 2" });
     // Duplicate values: the ordinal keeps them apart (getByRole throws on >1 match).
-    screen.getByRole("textbox", { name: "Host for host rule 1 (api.x.com)" });
-    screen.getByRole("textbox", { name: "Host for host rule 2 (api.x.com)" });
+    screen.getByRole("textbox", { name: "Host for host rule 1" });
+    screen.getByRole("textbox", { name: "Host for host rule 2" });
     screen.getByRole("button", { name: "Remove port 443 from host rule 1 (api.x.com)" });
     screen.getByRole("button", { name: "Remove port 443 from host rule 2 (api.x.com)" });
     // Two new empty rows: distinct too.
     fireEvent.click(screen.getByRole("button", { name: /Add host/ }));
     fireEvent.click(screen.getByRole("button", { name: /Add host/ }));
-    const row3 = screen.getByRole("textbox", { name: "Host for host rule 3 (empty)" });
-    screen.getByRole("textbox", { name: "Host for host rule 4 (empty)" });
+    const row3 = screen.getByRole("textbox", { name: "Host for host rule 3" });
+    screen.getByRole("textbox", { name: "Host for host rule 4" });
     screen.getByRole("group", { name: "host rule 3 (empty)" });
     screen.getByRole("button", { name: "Remove host rule 4 (empty)" });
     // The name is live: typing renames that row only, trimmed; whitespace-only stays empty.
     fireEvent.change(row3, { target: { value: "  new.example.com  " } });
-    expect(screen.getByRole("textbox", { name: "Host for host rule 3 (new.example.com)" })).toBe(row3);
-    screen.getByRole("textbox", { name: "Host for host rule 4 (empty)" });
+    // The focused input's OWN name never changes while typing (no re-announce
+    // per keystroke) ...
+    expect(screen.getByRole("textbox", { name: "Host for host rule 3" })).toBe(row3);
+    screen.getByRole("textbox", { name: "Host for host rule 4" });
+    // ... while everything else about the rule follows the value.
+    screen.getByRole("group", { name: "host rule 3 (new.example.com)" });
+    screen.getByRole("group", { name: "Ports for host rule 3 (new.example.com)" });
+    screen.getByRole("button", { name: "Remove host rule 3 (new.example.com)" });
     fireEvent.change(row3, { target: { value: "   " } });
-    expect(screen.getByRole("textbox", { name: "Host for host rule 3 (empty)" })).toBe(row3);
+    expect(screen.getByRole("textbox", { name: "Host for host rule 3" })).toBe(row3);
+    screen.getByRole("group", { name: "host rule 3 (empty)" });
+    screen.getByRole("button", { name: "Remove host rule 3 (empty)" });
+  });
+
+  it("keeps git-row names distinct when two rows share a target or are empty", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [
+        { repo: "github.com/o/a", access: "read" },
+        { repo: "github.com/o/a", access: "read" },
+      ],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByRole("textbox", { name: "Repo for git rule 2" });
+    fireEvent.click(screen.getByRole("button", { name: /Add repo/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Add repo/ }));
+    // getByRole throws on duplicates: each lookup below is a uniqueness proof.
+    for (const n of [1, 2, 3, 4]) screen.getByRole("textbox", { name: `Repo for git rule ${n}` });
+    for (const n of [1, 2]) {
+      screen.getByRole("group", { name: `git rule ${n} (github.com/o/a)` });
+      screen.getByRole("button", { name: `Remove git rule ${n} (github.com/o/a)` });
+    }
+    for (const n of [3, 4]) {
+      screen.getByRole("group", { name: `git rule ${n} (empty)` });
+      screen.getByRole("button", { name: `Remove git rule ${n} (empty)` });
+      screen.getByRole("radiogroup", { name: `Access for git rule ${n} (empty)` });
+    }
   });
 
   it("renumbers the remaining rows after a removal", async () => {
     render(<PolicyEditor name="web" />); // default mock: api.x.com + db.internal
-    await screen.findByRole("textbox", { name: "Host for host rule 2 (db.internal)" });
+    await screen.findByRole("textbox", { name: "Host for host rule 2" });
     fireEvent.click(screen.getByRole("button", { name: "Remove host rule 1 (api.x.com)" }));
-    expect(screen.getByRole("textbox", { name: "Host for host rule 1 (db.internal)" })).toHaveValue("db.internal");
-    expect(screen.queryByRole("textbox", { name: "Host for host rule 2 (db.internal)" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Host for host rule 1" })).toHaveValue("db.internal");
+    expect(screen.queryByRole("textbox", { name: "Host for host rule 2" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove host rule 1 (db.internal)" })).toBeInTheDocument();
   });
 
@@ -1251,7 +1296,7 @@ describe("PolicyEditor accessible names (#244)", () => {
       git: [],
     });
     render(<PolicyEditor name="web" />);
-    const input = await screen.findByRole("textbox", { name: "Host for host rule 1 (pinned.vendor.com)" });
+    const input = await screen.findByRole("textbox", { name: "Host for host rule 1" });
     expect(input).toHaveAttribute("readonly");
     const noticeId = input.getAttribute("aria-describedby");
     expect(noticeId).toBeTruthy();

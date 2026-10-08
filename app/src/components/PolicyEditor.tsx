@@ -48,8 +48,21 @@ function gitRuleTarget(rule: GitRule): string {
  *  row reads `(empty)`. The name is live — it follows edits and renumbers
  *  on removal — which is the point: it describes the rule as it is now. */
 function ruleName(kind: "host" | "git", value: string, index: number): string {
+  return `${ruleOrdinal(kind, index)} ${ruleValue(value)}`;
+}
+
+/** The ordinal half of `ruleName` (`host rule 3`). The two inputs that carry
+ *  the rule's value — Host and Repo — are named by this half ONLY: their name
+ *  must not change as the user types, or a screen reader re-announces the
+ *  focused field on every keystroke and cuts off the typing echo. */
+function ruleOrdinal(kind: "host" | "git", index: number): string {
+  return `${kind} rule ${index + 1}`;
+}
+
+/** The value half of `ruleName` (`(api.x.com)`, or `(empty)` when blank). */
+function ruleValue(value: string): string {
   const v = value.trim();
-  return `${kind} rule ${index + 1} (${v === "" ? "empty" : v})`;
+  return `(${v === "" ? "empty" : v})`;
 }
 
 function toGitRow(rule: GitRule): GitRow {
@@ -217,6 +230,7 @@ function PortEditor({
   enforcing,
   rule,
   labelledBy,
+  addInputId,
   onAdd,
   onRemove,
 }: {
@@ -236,6 +250,9 @@ function PortEditor({
   /** Space-separated ids for this group's `aria-labelledby`: the visible
    *  "Ports" label, then the row's hidden `for <rule>` span. */
   labelledBy: string;
+  /** DOM id for the add-port field, so the visible "Ports" `<label htmlFor>`
+   *  focuses it when activated. */
+  addInputId: string;
   onAdd: (port: number) => void;
   onRemove: (port: number) => void;
 }) {
@@ -296,6 +313,7 @@ function PortEditor({
           );
         })}
         <Input
+          id={addInputId}
           value={draft}
           onChange={(e) => {
             setDraft(e.target.value);
@@ -632,15 +650,31 @@ export function PolicyEditor({ name }: { name: string }) {
                   // is the visible text followed by the rule — "Host for
                   // host rule 1 (api.x.com)" — and a label edit can never
                   // drift from the name.
+                  //
+                  // Two hidden spans, so the value-bearing Host input can be
+                  // named by the ordinal alone (its name must not change as
+                  // it is typed into) while every other control keeps
+                  // ordinal + value, from the same `ruleName` pieces.
                   const rule = ruleName("host", r.host, i);
-                  const ruleId = `${rowId}-rule`;
+                  const ordinalId = `${rowId}-ordinal`;
+                  const valueId = `${rowId}-value`;
                   const hostLabelId = `${rowId}-host-label`;
                   const hostInputId = `${rowId}-host`;
                   const portsLabelId = `${rowId}-ports-label`;
                   const accessLabelId = `${rowId}-access-label`;
                   return (
                     <>
-                      <span id={ruleId} className="sr-only">for {rule}</span>
+                      {/* `hidden`, NOT `sr-only`: sr-only is position:absolute,
+                          and with no positioned ancestor inside the scroll pane
+                          it extends the document's scroll height. A `hidden`
+                          element still contributes its text to the name of
+                          whatever references it via aria-labelledby. */}
+                      <span id={ordinalId} hidden>
+                        for {ruleOrdinal("host", i)}
+                      </span>
+                      <span id={valueId} hidden>
+                        {ruleValue(r.host)}
+                      </span>
                       <div className="flex w-full items-center gap-2">
                         <label
                           id={hostLabelId}
@@ -651,7 +685,7 @@ export function PolicyEditor({ name }: { name: string }) {
                         </label>
                         <Input
                           id={hostInputId}
-                          aria-labelledby={`${hostLabelId} ${ruleId}`}
+                          aria-labelledby={`${hostLabelId} ${ordinalId}`}
                           value={r.host}
                           onChange={(e) => setHost(i, e.target.value)}
                           placeholder="api.example.com or *.example.com"
@@ -674,28 +708,35 @@ export function PolicyEditor({ name }: { name: string }) {
                         </p>
                       )}
                       <div className="flex w-full items-center gap-2">
-                        {/* A span, not a <label>: a label can only target a
-                            labelable element, and the ports control is a
-                            group — it is named through aria-labelledby. */}
-                        <span id={portsLabelId} className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">
+                        {/* A <label> for the add-port field, so activating it
+                            focuses that field; the group is still named
+                            through aria-labelledby. */}
+                        <label
+                          id={portsLabelId}
+                          htmlFor={`${rowId}-add-port`}
+                          className="w-12 shrink-0 text-xs font-semibold text-muted-foreground"
+                        >
                           Ports
-                        </span>
+                        </label>
                         <PortEditor
                           ports={r.ports}
                           access={r.access}
                           enforcing={enforcing}
                           rule={rule}
-                          labelledBy={`${portsLabelId} ${ruleId}`}
+                          labelledBy={`${portsLabelId} ${ordinalId} ${valueId}`}
+                          addInputId={`${rowId}-add-port`}
                           onAdd={(p) => addPort(i, p)}
                           onRemove={(p) => removePort(i, p)}
                         />
                       </div>
                       <div className="flex w-full items-center gap-2">
+                        {/* A span, not a <label>: a label would rename a Radix
+                            radio item to "Access". */}
                         <span id={accessLabelId} className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">
                           Access
                         </span>
                         <AccessPicker
-                          aria-labelledby={`${accessLabelId} ${ruleId}`}
+                          aria-labelledby={`${accessLabelId} ${ordinalId} ${valueId}`}
                           value={r.access}
                           onChange={(v) => setHostAccess(i, v)}
                         />
@@ -728,7 +769,7 @@ export function PolicyEditor({ name }: { name: string }) {
                   return (
                     <div className="flex w-full items-center gap-2">
                       <Input
-                        aria-label={`Repo for ${rule}`}
+                        aria-label={`Repo for ${ruleOrdinal("git", i)}`}
                         value={gr.target}
                         onChange={(e) => setGitTarget(i, e.target.value)}
                         placeholder="github.com/owner/repo"
