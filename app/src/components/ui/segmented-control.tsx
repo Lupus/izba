@@ -6,17 +6,21 @@ export interface SegmentedOption<T extends string> {
   label: string;
 }
 
-export interface SegmentedControlProps<T extends string> {
+/** The group's accessible name — exactly one path, enforced by the type: a
+ *  literal `aria-label`, or `aria-labelledby` (space-separated element ids;
+ *  the name is the referenced elements' text, concatenated in order). A
+ *  caller that passes neither no longer compiles, so a shared control can
+ *  never render an unnamed radiogroup. */
+export type SegmentedControlName =
+  | { "aria-label": string; "aria-labelledby"?: never }
+  | { "aria-labelledby": string; "aria-label"?: never };
+
+export type SegmentedControlProps<T extends string> = {
   value: T;
   onChange: (value: T) => void;
   options: SegmentedOption<T>[];
-  /** Accessible name of the group. Pass exactly one of these: a literal
-   *  `aria-label`, or `aria-labelledby` (space-separated element ids —
-   *  the name is the referenced elements' text, concatenated in order). */
-  "aria-label"?: string;
-  "aria-labelledby"?: string;
   className?: string;
-}
+} & SegmentedControlName;
 
 export function SegmentedControl<T extends string>({
   value,
