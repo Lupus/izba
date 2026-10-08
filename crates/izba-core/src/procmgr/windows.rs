@@ -362,6 +362,13 @@ const SYSTEM_PID: u32 = 4;
 /// Caveat: a Fast-Startup shutdown hibernates the kernel session instead of
 /// ending it, so the `System` process (and this time) survives it; a tree
 /// recorded before such a power cycle is then left to the pid-holder guard.
+///
+/// Clock assumption: process creation times are wall-clock stamps and are NOT
+/// adjusted when the clock changes. If the clock is stepped BACK by Δ after
+/// boot, launchers started within Δ of boot read as pre-boot and their
+/// survivors are dropped — the unsafe direction (a live tree reported as
+/// stopped). The robust form (recording the boot identity in `state.json` at
+/// start and comparing by equality) is tracked as a follow-up issue.
 fn boot_time() -> Option<u64> {
     open_query(SYSTEM_PID).and_then(|h| creation_time(h.0))
 }
@@ -724,7 +731,7 @@ mod tests {
             tree_survivors(&root).contains(&worker),
             "control: the orphan IS a survivor of the real, post-boot record"
         );
-        kill_pid(&root).expect("sweep orphans");
+        sweep_tree_survivors(&root).expect("sweep orphans");
     }
 
     /// #319 Fix 2: `stop`'s re-sweep for a launcher that is already gone

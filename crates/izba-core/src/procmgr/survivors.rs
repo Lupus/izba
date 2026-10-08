@@ -27,6 +27,12 @@ pub(crate) struct Candidate {
 ///   holds the disks — the double-boot hole #319 closes. Disabling the guard
 ///   can only over-report, which is a loud, retryable refusal. (A record with
 ///   `starttime: 0` is pre-boot by construction and so reads as no tree.)
+///   Clock assumption: process creation times are wall-clock stamps and are
+///   not adjusted when the clock changes. If the clock is stepped BACK by Δ
+///   after boot, launchers started within Δ of boot read as pre-boot and their
+///   survivors are dropped — the unsafe direction. The robust form (recording
+///   the boot identity in `state.json` at start and comparing by equality) is
+///   tracked as a follow-up issue.
 /// - (b) **Pid-holder guard** — `pid_holder_created` is `Some(t)` when a
 ///   DIFFERENT process (creation time `t`) now holds the launcher's pid. Our
 ///   workers were created while our launcher was alive, i.e. before it died

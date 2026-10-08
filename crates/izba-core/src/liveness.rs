@@ -18,6 +18,14 @@ pub trait Probes {
             Vec::new()
         }
     }
+    /// Terminate every process of the VMM tree that `tree_survivors` would
+    /// report — the re-sweep `stop` runs when the launcher is already gone but a
+    /// worker it spawned is still there (#319). Default: the real
+    /// `procmgr::sweep_tree_survivors`; fakes record the call and shrink their
+    /// survivors so the gate after the poll sees the effect.
+    fn sweep_tree_survivors(&self, id: &PidIdentity) -> anyhow::Result<()> {
+        crate::procmgr::sweep_tree_survivors(id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

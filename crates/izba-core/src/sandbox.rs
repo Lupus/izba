@@ -1730,7 +1730,7 @@ fn stop_locked_with(
         // re-sweep the tree. The sweep goes through `tree_survivors`'
         // recycled-pid guards, never a bare PPID walk, so the children of
         // whatever process now holds the launcher pid are left alone.
-        procmgr::sweep_tree_survivors(&state.vmm_pid)?;
+        probes.sweep_tree_survivors(&state.vmm_pid)?;
     }
 
     // Kills are asynchronous: wait briefly for the WHOLE tree — the recorded
@@ -4314,9 +4314,7 @@ mod tests {
         write_state(&paths, "web", dead_identity());
 
         let conn = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
-        let probes = StuckTeardownProbes {
-            survivors: vec![30620],
-        };
+        let probes = ResweepProbes::new(vec![30620], false);
         let err = format!(
             "{:#}",
             stop_locked_with(
@@ -4329,6 +4327,11 @@ mod tests {
             )
             .unwrap_err()
         );
+        assert_eq!(
+            probes.swept.get(),
+            1,
+            "the re-sweep was tried once and could not free the tree"
+        );
         assert!(
             err.contains("30620") && err.contains("holds the sandbox's disks"),
             "{err}"
@@ -4340,15 +4343,28 @@ mod tests {
         );
     }
 
-    /// Answers `[30620]` for the first `stuck_calls` survivor queries and `[]`
-    /// afterwards — "the re-sweep reaped it" — and counts the queries. Pid
-    /// liveness stays REAL; only the teardown verdict is faked.
-    struct ReapedAfterProbes {
-        stuck_calls: usize,
-        calls: std::cell::Cell<usize>,
+    /// Records re-sweeps. `tree_survivors` answers `survivors` until a sweep
+    /// has been recorded and, when `sweep_reaps`, `[]` afterwards — "the
+    /// re-sweep terminated it"; with `sweep_reaps == false` the survivors
+    /// persist regardless (teardown truly stuck). Pid liveness stays REAL;
+    /// only the teardown verdict is faked.
+    struct ResweepProbes {
+        survivors: Vec<u32>,
+        sweep_reaps: bool,
+        swept: std::cell::Cell<u32>,
     }
 
-    impl Probes for ReapedAfterProbes {
+    impl ResweepProbes {
+        fn new(survivors: Vec<u32>, sweep_reaps: bool) -> Self {
+            Self {
+                survivors,
+                sweep_reaps,
+                swept: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Probes for ResweepProbes {
         fn pid_alive(&self, id: &crate::state::PidIdentity) -> bool {
             procmgr::pid_alive(id)
         }
@@ -4356,22 +4372,24 @@ mod tests {
             false
         }
         fn tree_survivors(&self, _id: &crate::state::PidIdentity) -> Vec<u32> {
-            let n = self.calls.get();
-            self.calls.set(n + 1);
-            if n < self.stuck_calls {
-                vec![30620]
-            } else {
+            if self.sweep_reaps && self.swept.get() > 0 {
                 Vec::new()
+            } else {
+                self.survivors.clone()
             }
+        }
+        fn sweep_tree_survivors(&self, _id: &crate::state::PidIdentity) -> anyhow::Result<()> {
+            self.swept.set(self.swept.get() + 1);
+            Ok(())
         }
     }
 
     /// Fix 2 of the #319 review: the launcher died on its own and its worker
     /// keeps RUNNING. No kill of the launcher can reach it, so `stop` must
-    /// re-sweep the tree itself, then keep asking (bounded) until the tree
-    /// drains — not refuse on the first look and send the user to a reboot
-    /// for a process that was never terminated. A dead launcher is not sent
-    /// the Shutdown RPC (it would only burn the control timeout).
+    /// re-sweep the tree itself — exactly once, through the `Probes` seam —
+    /// and then find it gone, not refuse on the first look and send the user
+    /// to a reboot for a process that was never terminated. A dead launcher
+    /// is not sent the Shutdown RPC (it would only burn the control timeout).
     #[test]
     fn stop_resweeps_an_orphaned_worker_when_the_launcher_is_already_gone() {
         let (dir, paths) = test_paths();
@@ -4382,10 +4400,7 @@ mod tests {
 
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log.clone(), None);
-        let probes = ReapedAfterProbes {
-            stuck_calls: 3,
-            calls: std::cell::Cell::new(0),
-        };
+        let probes = ResweepProbes::new(vec![30620], true);
         stop_locked_with(
             &paths,
             "web",
@@ -4395,14 +4410,10 @@ mod tests {
             &probes,
         )
         .expect("the re-sweep frees the sandbox");
+        assert_eq!(probes.swept.get(), 1, "exactly one re-sweep of the tree");
         assert!(
             !paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "a drained tree is a clean stop"
-        );
-        assert!(
-            probes.calls.get() > 3,
-            "stop must keep asking until the tree drains, saw {} queries",
-            probes.calls.get()
         );
         assert_eq!(
             count_shutdowns(&log),
@@ -4411,7 +4422,8 @@ mod tests {
         );
     }
 
-    /// With no survivor the dead-launcher path is the ordinary clean stop.
+    /// With no survivor the dead-launcher path is the ordinary clean stop:
+    /// no kill was issued and nothing survives, so NO re-sweep either.
     #[test]
     fn stop_cleans_up_a_dead_launcher_when_nothing_of_its_tree_survives() {
         let (dir, paths) = test_paths();
@@ -4421,7 +4433,7 @@ mod tests {
         write_state(&paths, "web", dead_identity());
 
         let conn = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
-        let probes = StuckTeardownProbes { survivors: vec![] };
+        let probes = ResweepProbes::new(vec![], true);
         stop_locked_with(
             &paths,
             "web",
@@ -4431,6 +4443,7 @@ mod tests {
             &probes,
         )
         .unwrap();
+        assert_eq!(probes.swept.get(), 0, "nothing survives => no re-sweep");
         assert!(!paths.sandbox_dir("web").join(STATE_FILE).exists());
     }
 
