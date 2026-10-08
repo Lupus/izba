@@ -1585,16 +1585,16 @@ pub fn control(
 fn disks_held_error(name: &str, survivors: &[u32]) -> anyhow::Error {
     let pids: Vec<String> = survivors.iter().map(u32::to_string).collect();
     let pids = pids.join(", ");
-    let (noun, verb) = if survivors.len() == 1 {
-        ("process", "has")
+    let (noun, verb, hold, pid_noun) = if survivors.len() == 1 {
+        ("process", "has", "holds", "pid")
     } else {
-        ("processes", "have")
+        ("processes", "have", "hold", "pids")
     };
     anyhow::anyhow!(
         "sandbox '{name}': VMM {noun} {pids} {verb} been terminated but {verb} not finished exiting \
-         and still holds the sandbox's disks (rw.img, volumes); state preserved so the sandbox \
+         and still {hold} the sandbox's disks (rw.img, volumes); state preserved so the sandbox \
          cannot be double-booted, and `izba status {name}` reports it degraded. \
-         Retry `izba stop {name}` once pid {pids} has left the process list; a process stuck \
+         Retry `izba stop {name}` once {pid_noun} {pids} {verb} left the process list; a process stuck \
          in kernel-side teardown is released only by a host reboot."
     )
 }
@@ -1966,13 +1966,15 @@ fn remove_with(
     Ok(())
 }
 
-/// Context for a failed tombstone rename. `PermissionDenied` on a directory
-/// rename is Windows' way of saying "a file inside is open in some process"
+/// Context for a failed tombstone rename. On Windows, `PermissionDenied` on a
+/// directory rename is the OS saying "a file inside is open in some process"
 /// — the one case `refuse_if_teardown_stuck` could not see (no state.json,
 /// or a holder outside the VMM tree) — so point the user at the cause and at
-/// `izba status`; every other kind keeps the plain context.
+/// `izba status`. On Unix the same kind means EACCES/EPERM (a parent
+/// directory's permissions or sticky bit), never an open file, so Unix — and
+/// every other kind — keeps the plain context.
 fn rename_for_removal_error(dir: &Path, name: &str, e: std::io::Error) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
+    if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied {
         anyhow::Error::new(e).context(format!(
             "renaming {} for removal: a file inside it is still open in some process \
              (a VMM that has not finished exiting? check `izba status {name}` and the \
@@ -4244,6 +4246,10 @@ mod tests {
             paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "state.json must survive a refused stop"
         );
+        assert!(
+            paths.run_dir("web").is_dir(),
+            "the run dir must survive a refused stop"
+        );
         assert!(wait_dead(&sleep_id), "the kill itself still happens");
     }
 
@@ -4280,6 +4286,10 @@ mod tests {
             "{err}"
         );
         assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
+        assert!(
+            paths.run_dir("web").is_dir(),
+            "the run dir must survive a refused stop"
+        );
     }
 
     /// With no survivor the dead-launcher path is the ordinary clean stop.
@@ -4355,6 +4365,66 @@ mod tests {
             );
             assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
         }
+    }
+
+    /// The path the issue describes: launcher alive, `rm --force` kills it,
+    /// a worker lingers. The gate inside `stop_locked_with` (not the pre-check,
+    /// which sees a live launcher and stays silent) must refuse AFTER the kill.
+    #[test]
+    fn rm_force_refuses_after_the_kill_when_a_worker_survives() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        let conn = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
+        let probes = StuckTeardownProbes {
+            survivors: vec![30620],
+        };
+        let err = format!(
+            "{:#}",
+            remove_with(&paths, "web", &conn, true, &probes).unwrap_err()
+        );
+        assert!(err.contains("30620"), "{err}");
+        assert!(err.contains("still holds the sandbox's disks"), "{err}");
+        assert!(paths.sandbox_dir("web").is_dir(), "dir must survive");
+        assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
+        assert!(wait_dead(&sleep_id), "the kill itself still happens");
+    }
+
+    #[test]
+    fn disks_held_error_reads_correctly_for_one_and_several_pids() {
+        let one = format!("{:#}", disks_held_error("web", &[30620]));
+        assert!(
+            one.contains("process 30620 has been terminated but has not"),
+            "{one}"
+        );
+        assert!(one.contains("still holds the sandbox's disks"), "{one}");
+        assert!(one.contains("once pid 30620 has left"), "{one}");
+
+        let many = format!("{:#}", disks_held_error("web", &[29588, 30620]));
+        assert!(
+            many.contains("processes 29588, 30620 have been terminated but have not"),
+            "{many}"
+        );
+        assert!(many.contains("still hold the sandbox's disks"), "{many}");
+        assert!(many.contains("once pids 29588, 30620 have left"), "{many}");
+    }
+
+    /// On Unix `PermissionDenied` from rename(2) is a parent-directory
+    /// permission problem, not an open file — the Windows hint must not appear.
+    #[cfg(unix)]
+    #[test]
+    fn rename_failure_hint_is_windows_only() {
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = format!(
+            "{:#}",
+            rename_for_removal_error(Path::new("/x/web"), "web", e)
+        );
+        assert!(msg.contains("renaming /x/web for removal"), "{msg}");
+        assert!(!msg.contains("still open"), "{msg}");
     }
 
     /// Windows refuses to rename a directory with an open file inside and says
