@@ -1,5 +1,5 @@
 import type { Access } from "../lib/types";
-import { SegmentedControl } from "@/components/ui/segmented-control";
+import { SegmentedControl, type SegmentedControlName } from "@/components/ui/segmented-control";
 
 /** The read / read-write segmented control. Its accessible name defaults to
  *  "access" (SeedDialog renders one per candidate inside a row that is itself
@@ -18,11 +18,12 @@ export function AccessPicker({
   "aria-labelledby"?: string;
 }) {
   const labelledby = aria["aria-labelledby"];
-  const label = labelledby ? undefined : (aria["aria-label"] ?? "access");
+  const name: SegmentedControlName = labelledby
+    ? { "aria-labelledby": labelledby }
+    : { "aria-label": aria["aria-label"] ?? "access" };
   return (
     <SegmentedControl<Access>
-      aria-label={label}
-      aria-labelledby={labelledby}
+      {...name}
       value={value}
       onChange={onChange}
       options={[

@@ -24,4 +24,12 @@ describe("SegmentedControl", () => {
     const group = screen.getByRole("radiogroup", { name: "Access for host rule 1 (api.x.com)" });
     expect(group).not.toHaveAttribute("aria-label");
   });
+  it("cannot be rendered without a name (type-level guard)", () => {
+    // @ts-expect-error — neither aria-label nor aria-labelledby: must not compile.
+    const unnamed = <SegmentedControl value="read" onChange={() => {}} options={opts} />;
+    // @ts-expect-error — both at once is also refused: exactly one naming path.
+    const both = <SegmentedControl aria-label="a" aria-labelledby="b" value="read" onChange={() => {}} options={opts} />;
+    expect(unnamed).toBeTruthy();
+    expect(both).toBeTruthy();
+  });
 });
