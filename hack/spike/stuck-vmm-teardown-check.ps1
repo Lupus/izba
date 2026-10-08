@@ -7,8 +7,8 @@
 # It never creates or starts anything. It runs `izba status`, `izba stop` and
 # `izba rm --force` against the given sandbox, which is what a user would do,
 # and reports PASS/FAIL per #319 acceptance criterion.
-# If `izba stop` is NOT refused, `rm --force` is skipped (it would really delete
-# the sandbox).
+# `rm --force` runs only when `izba stop` was refused BECAUSE the disks are
+# held; otherwise it is skipped (it would really delete the sandbox).
 #
 # Exit code: number of failed checks; 100 when a prerequisite is missing.
 Set-StrictMode -Version Latest
@@ -73,26 +73,27 @@ $status = Invoke-Izba @('status', $name)
 Say "izba status: rc=$($status.rc)"
 Say ("  " + ($status.out -replace "`r?`n", "`n  "))
 Check 'status does not report a clean stop (no bare "stopped" line)' ($status.out -notmatch '(?m)^\s*status:\s*stopped\s*$')
-Check 'status reports the stuck teardown (degraded ... not torn down, disks still held)' ($status.out -match 'degraded \(vmm process(es)? [0-9, ]+ terminated but not torn down, disks still held\)')
+Check 'status reports the stuck teardown (degraded ... outlived its launcher and still holds the disks)' ($status.out -match 'degraded \(vmm process(es)? [0-9, ]+ outlived (its|their) launcher and still holds? the disks\)')
 
 $stop = Invoke-Izba @('stop', $name)
 Say "izba stop: rc=$($stop.rc)"
 Say ("  " + ($stop.out -replace "`r?`n", "`n  "))
 Check 'stop exits non-zero' ($stop.rc -ne 0)
-Check 'stop names a pid and says the disks are still held' ($stop.out -match 'VMM process(es)? [0-9, ]+ ha(s|ve) been terminated' -and $stop.out -match 'still holds the sandbox''s disks')
-Check 'stop says what to do (retry / host reboot)' ($stop.out -match 'Retry `izba stop' -and $stop.out -match 'host reboot')
+Check 'stop names a pid and says the disks are still held' ($stop.out -match 'VMM process(es)? [0-9, ]+ from its last run (is|are) still present and holds? the sandbox''s disks')
+Check 'stop says what to do (run stop again / host reboot)' ($stop.out -match 'Run `izba stop' -and $stop.out -match 'host reboot')
 Check 'state.json is preserved after the refused stop' (Test-Path (Join-Path $sandboxDir 'state.json'))
 
-if ($stop.rc -ne 0) {
+$stopRefusedForDisks = ($stop.rc -ne 0 -and $stop.out -match 'holds? the sandbox''s disks')
+if ($stopRefusedForDisks) {
     $rm = Invoke-Izba @('rm', $name, '--force')
     Say "izba rm --force: rc=$($rm.rc)"
     Say ("  " + ($rm.out -replace "`r?`n", "`n  "))
     Check 'rm --force exits non-zero' ($rm.rc -ne 0)
-    Check 'rm --force gives the same explanation, not a raw Access is denied' ($rm.out -match 'still holds the sandbox''s disks' -and $rm.out -notmatch 'Access is denied')
+    Check 'rm --force gives the same explanation, not a raw Access is denied' ($rm.out -match 'holds? the sandbox''s disks' -and $rm.out -notmatch 'Access is denied')
     Check 'sandbox dir still exists after the refused rm' (Test-Path $sandboxDir)
 }
 else {
-    Say 'izba rm --force: skipped, because stop did not refuse (rm --force would really delete the sandbox)'
+    Say 'izba rm --force: skipped, because stop was not refused for held disks (rm --force would really delete the sandbox)'
     Check 'rm --force exits non-zero' $false
     Check 'rm --force gives the same explanation, not a raw Access is denied' $false
     Check 'sandbox dir still exists after the refused rm' $false
