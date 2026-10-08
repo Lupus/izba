@@ -1127,7 +1127,7 @@ describe("PolicyEditor accessible names (#244)", () => {
     expect(screen.getByRole("button", { name: "Add port to host rule 2 (db.internal)" })).toBeInTheDocument();
   });
 
-  it("associates the visible Host label with its input, and the name starts with that text", async () => {
+  it("associates the visible Host, Ports and Access labels with their controls", async () => {
     render(<PolicyEditor name="web" />); // default mock: api.x.com + db.internal
     const input = await screen.findByRole("textbox", { name: "Host for host rule 1" });
     const labels = screen.getAllByText("Host").filter((el) => el.tagName === "LABEL") as HTMLLabelElement[];
@@ -1160,6 +1160,17 @@ describe("PolicyEditor accessible names (#244)", () => {
       "for host rule 1",
       "(api.x.com)",
     ]);
+    // The visible "Access" text is a <label> for the CHECKED radio, so
+    // activating it focuses the current choice — and follows the choice.
+    const accessLabel = screen
+      .getAllByText("Access")
+      .find((el) => el.tagName === "LABEL" && row1.contains(el)) as HTMLLabelElement | undefined;
+    expect(accessLabel).toBeDefined();
+    expect(accessLabel?.control).toBe(within(access).getByRole("radio", { name: "read-write" }));
+    fireEvent.click(within(access).getByRole("radio", { name: "read" }));
+    expect(accessLabel?.control).toBe(within(access).getByRole("radio", { name: "read" }));
+    // Shielded: the radios keep their own names.
+    expect(within(access).queryByRole("radio", { name: /Access/ })).not.toBeInTheDocument();
   });
 
   it("names git rows by their target, not the placeholder", async () => {

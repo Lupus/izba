@@ -8,10 +8,13 @@ import { SegmentedControl, type SegmentedControlName } from "@/components/ui/seg
  *  with `aria-labelledby` ids; when `aria-labelledby` is given no `aria-label`
  *  is rendered, so the two never compete for the name. */
 export function AccessPicker({
+  id,
   value,
   onChange,
   ...aria
 }: {
+  /** Forwarded to SegmentedControl: stable per-item ids for a `<label htmlFor>`. */
+  id?: string;
   value: Access;
   onChange: (v: Access) => void;
   "aria-label"?: string;
@@ -24,6 +27,7 @@ export function AccessPicker({
   return (
     <SegmentedControl<Access>
       {...name}
+      id={id}
       value={value}
       onChange={onChange}
       options={[

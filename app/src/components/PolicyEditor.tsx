@@ -8,6 +8,7 @@ import { Section } from "./Section";
 import { EnforceToggle } from "./EnforceToggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { segmentedItemId } from "@/components/ui/segmented-control";
 import { Badge } from "@/components/ui/badge";
 import { EditableList } from "@/components/ui/editable-list";
 
@@ -662,6 +663,7 @@ export function PolicyEditor({ name }: { name: string }) {
                   const hostInputId = `${rowId}-host`;
                   const portsLabelId = `${rowId}-ports-label`;
                   const accessLabelId = `${rowId}-access-label`;
+                  const accessPickerId = `${rowId}-access`;
                   return (
                     <>
                       {/* `hidden`, NOT `sr-only`: sr-only is position:absolute,
@@ -730,12 +732,20 @@ export function PolicyEditor({ name }: { name: string }) {
                         />
                       </div>
                       <div className="flex w-full items-center gap-2">
-                        {/* A span, not a <label>: a label would rename a Radix
-                            radio item to "Access". */}
-                        <span id={accessLabelId} className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">
+                        {/* A <label> for the CHECKED radio (it follows
+                            `r.access`), so activating "Access" focuses the
+                            current choice and arrow keys move from there.
+                            Each item carries its own aria-label, so the label
+                            cannot rename it (#244 AC2). */}
+                        <label
+                          id={accessLabelId}
+                          htmlFor={segmentedItemId(accessPickerId, r.access)}
+                          className="w-12 shrink-0 text-xs font-semibold text-muted-foreground"
+                        >
                           Access
-                        </span>
+                        </label>
                         <AccessPicker
+                          id={accessPickerId}
                           aria-labelledby={`${accessLabelId} ${ordinalId} ${valueId}`}
                           value={r.access}
                           onChange={(v) => setHostAccess(i, v)}
