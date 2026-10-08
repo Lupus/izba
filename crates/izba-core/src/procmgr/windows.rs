@@ -64,17 +64,18 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const STILL_ACTIVE: u32 = 259;
 
 /// Access [`open_sync_query`] asks for: read the creation time AND ask whether
-/// the process object is signaled. A `const` (not an inline `|`) because the
-/// flags are disjoint bits, so a `| -> ^` mutant of the expression would be an
-/// equivalent, unkillable mutant; cargo-mutants does not mutate const
-/// initialisers.
-const QUERY_SYNC_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+/// the process object is signaled. `PROCESS_QUERY_LIMITED_INFORMATION |
+/// SYNCHRONIZE`, written as one literal: the flags are disjoint bits, so the
+/// `|`→`^` mutant of the OR is semantically identical and unkillable, and
+/// cargo-mutants mutates const initialisers too.
+/// `access_mask_literals_match_the_flags` pins the value.
+const QUERY_SYNC_ACCESS: u32 = 0x0010_1000;
 
 /// Access [`terminate_identity`] asks for: verify the creation time, terminate,
 /// and wait for full death — all through the ONE handle that pins the process.
-/// A `const` for the same equivalent-mutant reason as [`QUERY_SYNC_ACCESS`].
-const TERMINATE_IDENTITY_ACCESS: u32 =
-    PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+/// `PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` as one
+/// literal — same reason as [`QUERY_SYNC_ACCESS`].
+const TERMINATE_IDENTITY_ACCESS: u32 = 0x0010_1001;
 
 /// Closes the handle on drop.
 struct OwnedHandle(HANDLE);
@@ -510,6 +511,20 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    /// The access masks are single literals so the mutation gate has no `|`
+    /// to flip into an equivalent `^`; this pins them to the real flags.
+    #[test]
+    fn access_mask_literals_match_the_flags() {
+        assert_eq!(
+            QUERY_SYNC_ACCESS,
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        );
+        assert_eq!(
+            TERMINATE_IDENTITY_ACCESS,
+            PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        );
+    }
 
     fn log_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("izba-{tag}-{}.log", std::process::id()))
