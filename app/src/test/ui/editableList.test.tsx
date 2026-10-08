@@ -59,4 +59,43 @@ describe("EditableList", () => {
     );
     expect(screen.getByText("y").closest(".rounded-lg.border")).toBeNull();
   });
+
+  it("names each row as a group when rowLabel is given, in both densities", () => {
+    const { rerender } = render(
+      <EditableList
+        items={["api.x.com", "db.internal"]}
+        renderRow={(item) => <span>row-{item}</span>}
+        onAdd={() => {}}
+        onRemove={() => {}}
+        addLabel="Add"
+        emptyHint="none"
+        density="card"
+        rowLabel={(item, i) => `host rule ${i + 1} (${item})`}
+      />,
+    );
+    const first = screen.getByRole("group", { name: "host rule 1 (api.x.com)" });
+    expect(first).toContainElement(screen.getByText("row-api.x.com"));
+    expect(screen.getByRole("group", { name: "host rule 2 (db.internal)" })).toBeInTheDocument();
+    rerender(
+      <EditableList
+        items={["api.x.com"]}
+        renderRow={(item) => <span>row-{item}</span>}
+        onAdd={() => {}}
+        onRemove={() => {}}
+        addLabel="Add"
+        emptyHint="none"
+        density="inline"
+        rowLabel={(item, i) => `host rule ${i + 1} (${item})`}
+      />,
+    );
+    expect(screen.getByRole("group", { name: "host rule 1 (api.x.com)" })).toBeInTheDocument();
+  });
+
+  it("renders no group role when rowLabel is absent (markup unchanged for other callers)", () => {
+    render(
+      <EditableList items={["a"]} renderRow={() => <span>x</span>} onAdd={() => {}}
+        onRemove={() => {}} addLabel="Add" emptyHint="none" density="card" />,
+    );
+    expect(screen.queryByRole("group")).not.toBeInTheDocument();
+  });
 });

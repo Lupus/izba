@@ -10,7 +10,11 @@ export interface SegmentedControlProps<T extends string> {
   value: T;
   onChange: (value: T) => void;
   options: SegmentedOption<T>[];
-  "aria-label": string;
+  /** Accessible name of the group. Pass exactly one of these: a literal
+   *  `aria-label`, or `aria-labelledby` (space-separated element ids —
+   *  the name is the referenced elements' text, concatenated in order). */
+  "aria-label"?: string;
+  "aria-labelledby"?: string;
   className?: string;
 }
 
@@ -27,6 +31,7 @@ export function SegmentedControl<T extends string>({
       value={value}
       onValueChange={(v) => v && onChange(v as T)}
       aria-label={aria["aria-label"]}
+      aria-labelledby={aria["aria-labelledby"]}
       className={cn("inline-flex gap-1 rounded-lg border border-input p-0.5", className)}
     >
       {options.map((o) => (
