@@ -161,20 +161,101 @@ process whenever one exists.
    `izba status` says `degraded (… not torn down, disks still held)`, `izba
    stop` exits non-zero naming the pid, `state.json` is still there, `izba rm
    --force` exits non-zero with the same explanation.
-3. Validation of the fix on the 2026-10-02 survivor itself is recorded in the
-   next section.
+3. Validation of the fix on the 2026-10-02 survivor itself is recorded in
+   [Validation on the 2026-10-02 survivor](#validation-on-the-2026-10-02-survivor)
+   below.
+
+## Validation on the 2026-10-02 survivor
+
+Run on 2026-10-08 at 19:43 against the real stuck worker (pid 30620, still
+present, still one thread in `Wait:Executive`, 255 handles), with `izba.exe`
+cross-built from this branch (`izba 0.1.0 (fa9b93f)`) dropped into a copy of
+the spike's installer-shaped stage, and the data root `%TEMP%\i249m`.
+
+**What had to be reconstructed first.** At 18:46:55 that day — after the
+evidence above was read, and not by this work — everything deletable under
+`%TEMP%\i249m` and the spike's workspace dir `%TEMP%\i249-ws-p249h` was
+removed (the pattern fits a cleanup of the spike's leftovers; `izba249-stage`,
+named differently, survived). The worker kept every handle: `rw.img`,
+`rootfs.erofs` and the `oci`/`ssh`/`trust` share dirs now show up in its
+handle table as `C:\$Extend\$Deleted\…` entries (NTFS's name for a file
+unlinked while open), `vmm.log` kept its name. So the sandbox dir had only
+`logs/vmm.log` left; `config.json` was restored from a copy taken at 18:39 and
+`state.json` — which the old build had deleted on 2026-10-02 — was re-created
+as the plan prescribes, naming the dead launcher with `starttime: 0` (the
+check only needs `pid_alive` to be false and the PPID walk):
+
+```json
+{ "vmm_pid": { "pid": 29588, "starttime": 0 }, "sidecar_pids": [],
+  "started_unix_ms": 1790886982000, "usb_kernel": true, "vnc": false }
+```
+
+The detection does not look at the files at all — only at the process tree —
+so the emptied directory changes nothing about what is being validated, except
+that the script's `rw.img` sharing probe now reports `False` (there is no
+`rw.img` path to open; the worker holds the unlinked inode).
+
+**Result** (`hack/spike/stuck-vmm-teardown-check.ps1`, trimmed to the
+census, the three CLI results and the verdict; `izbad` was auto-started by
+the first call and adopted the sandbox from disk):
+
+```
+[19:43:55.854] openvmm.exe processes on the host:
+[19:43:56.102]   pid=30620 ppid=29588 exited=n/a threads=1 handles=255 working_set_mb=3330
+[19:43:56.106] rw.img exclusively held by another process: False
+[19:44:03.154] izba status: rc=0
+  status:      degraded (vmm process 30620 terminated but not torn down, disks still held)
+[19:44:03.164] PASS  status does not report a clean stop (no bare "stopped" line)
+[19:44:03.165] PASS  status reports the stuck teardown (degraded ... not torn down, disks still held)
+[19:44:03.446] izba stop: rc=1
+  izba: error: sandbox 'p249h': VMM process 30620 has been terminated but has not
+  finished exiting and still holds the sandbox's disks (rw.img, volumes); state
+  preserved so the sandbox cannot be double-booted, and `izba status p249h` reports
+  it degraded. Retry `izba stop p249h` once pid 30620 has left the process list; a
+  process stuck in kernel-side teardown is released only by a host reboot.
+[19:44:03.448] PASS  stop exits non-zero
+[19:44:03.449] PASS  stop names a pid and says the disks are still held
+[19:44:03.449] PASS  stop says what to do (retry / host reboot)
+[19:44:03.451] PASS  state.json is preserved after the refused stop
+[19:44:03.648] izba rm --force: rc=1
+  izba: error: sandbox 'p249h': VMM process 30620 has been terminated … (same text)
+[19:44:03.649] PASS  rm --force exits non-zero
+[19:44:03.649] PASS  rm --force gives the same explanation, not a raw Access is denied
+[19:44:03.652] PASS  sandbox dir still exists after the refused rm
+[19:44:03.652] VERDICT: izba reports the stuck teardown honestly on every surface
+```
+
+Eleven of eleven checks pass; `state.json` was still present afterwards and the
+daemon's adoption sweep did not reap it. (The `exited=n/a` in the census is
+cosmetic: under `pwsh` 7, `Get-Process -Id` does not return the exited-but-
+present process, so the script falls back; the CIM row still shows it.)
+
+**One thing observed on the way, outside #319.** The outer shell that ran the
+check never got end-of-file on its stdout pipe until `izba daemon stop` was
+issued for that data root: the `izba daemon run` the first CLI call
+auto-spawned had inherited the pipe, and a daemon supervising a degraded
+sandbox never idle-exits. The moment the daemon stopped, the pipe drained.
+`izba <anything> | <consumer>` on Windows therefore hangs the consumer for as
+long as an auto-started daemon lives — filed as a separate item.
 
 ## Limits
 
 Everything was read unelevated; kernel stacks, non-File handle types and the
 exit code of the exited process were not available. The spike's run log
 (`izba-probe249-<pid>` output dir) was not retained, so the detach's own
-duration and output are unknown.
+duration and output are unknown. The files the worker holds were unlinked by
+an outside cleanup on 2026-10-08 (see Validation), so the `rw.img` sharing
+probe can no longer be re-run against this survivor; the process-tree facts
+are unaffected.
 
 ## Follow-on work
 
-- Follow-up issue (guest side): *Windows/OpenVMM: guest fails to power off
-  with a vhci (usbip) device attached or mid-detach after sustained traffic* —
-  link added by Task 5.
+- [#325](https://github.com/Lupus/izba/issues/325) — guest side: *Windows/
+  OpenVMM: guest fails to power off with a vhci (usbip) device attached or
+  mid-detach after sustained traffic — `stop` always escalates to kill*
+  (`type:bug`, P3, M), from finding 4.
+- Windows CLI: an auto-spawned `izba daemon run` inherits the caller's stdout
+  pipe, so a piped `izba` command blocks its consumer until the daemon exits
+  (see Validation) — filed separately.
 - [#320](https://github.com/Lupus/izba/issues/320) — OpenVMM does not exit on
   guest power-off, so every Windows stop takes the kill path (unchanged here).
