@@ -408,6 +408,51 @@ mod tests {
         }
     }
 
+    /// Image names (`szExeFile`, lowercased) of every live process, keyed by
+    /// pid. Test-only: lets a test tell the `sleep.exe` worker apart from a
+    /// console-host (`conhost.exe`) descendant that `CREATE_NO_WINDOW`
+    /// launchers commonly pick up.
+    fn image_names() -> Vec<(u32, String)> {
+        // SAFETY: plain FFI; the snapshot handle is closed by OwnedHandle.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let snap = OwnedHandle(snap);
+        // SAFETY: PROCESSENTRY32 is plain-old-data; all-zero is a valid value.
+        let mut entry: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+        let mut out = Vec::new();
+        // SAFETY: valid snapshot handle and a properly-sized entry.
+        unsafe {
+            if Process32First(snap.0, &mut entry) != 0 {
+                loop {
+                    // `szExeFile` is a NUL-terminated array of C `char` (i8).
+                    let bytes: Vec<u8> = entry
+                        .szExeFile
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    let name = String::from_utf8_lossy(&bytes).to_lowercase();
+                    out.push((entry.th32ProcessID, name));
+                    if Process32Next(snap.0, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Pid of a live descendant of `root` whose image is `sleep.exe`, if any.
+    fn sleep_worker_of(root: &PidIdentity) -> Option<u32> {
+        let names = image_names();
+        descendants_of(root.pid, root.starttime)
+            .into_iter()
+            .find(|pid| names.iter().any(|(p, n)| p == pid && n == "sleep.exe"))
+    }
+
     /// `TerminateProcess` on ONE pid with no descendant sweep (unlike
     /// `kill_pid`), so a test can orphan a worker on purpose.
     fn terminate_root_only(pid: u32) {
@@ -435,7 +480,12 @@ mod tests {
             &log_path("tree-root"),
         )
         .expect("spawn sleep");
-        assert_eq!(tree_survivors(&id), vec![id.pid]);
+        // `contains`, not equality: a console host (`conhost.exe`) may show up
+        // as a descendant of the console client.
+        assert!(
+            tree_survivors(&id).contains(&id.pid),
+            "a running root is a survivor"
+        );
 
         kill_pid(&id).expect("kill");
         assert!(
@@ -469,9 +519,15 @@ mod tests {
             "precondition: the pid is still reserved while we hold a handle"
         );
         assert!(!pid_alive(&id), "an exited process is not alive");
+        // The pid we hold the handle for is the thing under test; a lingering
+        // `conhost.exe` child of the just-exited cmd must not make this flaky.
         assert!(
-            tree_survivors(&id).is_empty(),
+            !tree_survivors(&id).contains(&id.pid),
             "an exited, signaled process is not a survivor even though its pid is reserved"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || tree_survivors(&id).is_empty()),
+            "the whole tree must drain once any console host finishes teardown"
         );
         drop(child);
     }
@@ -494,13 +550,13 @@ mod tests {
             &log_path("tree-launcher"),
         )
         .expect("spawn cmd");
+        // Wait for the `sleep.exe` worker specifically: a console host can be
+        // a descendant long before sleep is spawned.
         assert!(
-            wait_until(Duration::from_secs(5), || {
-                !descendants_of(root.pid, root.starttime).is_empty()
-            }),
+            wait_until(Duration::from_secs(5), || sleep_worker_of(&root).is_some()),
             "cmd must have spawned its sleep worker"
         );
-        let workers = descendants_of(root.pid, root.starttime);
+        let worker = sleep_worker_of(&root).expect("sleep worker");
 
         terminate_root_only(root.pid);
         assert!(
@@ -513,12 +569,10 @@ mod tests {
             !survivors.contains(&root.pid),
             "the torn-down launcher is not a survivor: {survivors:?}"
         );
-        for w in &workers {
-            assert!(
-                survivors.contains(w),
-                "orphaned worker {w} must be reported; got {survivors:?}"
-            );
-        }
+        assert!(
+            survivors.contains(&worker),
+            "orphaned worker {worker} must be reported; got {survivors:?}"
+        );
 
         kill_pid(&root).expect("sweep orphans");
         assert!(
