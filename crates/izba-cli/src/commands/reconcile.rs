@@ -16,6 +16,9 @@ impl Probes for PidProbes {
     fn control_answers(&self) -> bool {
         true
     }
+    fn tree_survivors(&self, id: &PidIdentity) -> Vec<u32> {
+        izba_core::procmgr::tree_survivors(id)
+    }
 }
 
 #[mutants::skip] // reason: drives a live daemon (List over the socket) and real sleeps; the settle/intersection decision logic is unit-tested in izba_core::reconcile.
