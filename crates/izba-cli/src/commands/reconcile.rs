@@ -16,6 +16,7 @@ impl Probes for PidProbes {
     fn control_answers(&self) -> bool {
         true
     }
+    #[mutants::skip] // reason: pass-through to `procmgr::tree_survivors`; the primitive is mutation-tested in izba-core, and this impl is only observable with a live sandbox (daemon e2e).
     fn tree_survivors(&self, id: &PidIdentity) -> Vec<u32> {
         izba_core::procmgr::tree_survivors(id)
     }

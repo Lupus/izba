@@ -1711,10 +1711,9 @@ fn stop_locked_with(
             let _ = rpc(&mut s, &Request::Shutdown, CONTROL_RPC_TIMEOUT);
             Ok(())
         })();
-        let deadline = Instant::now() + timeout;
-        while probes.pid_alive(&state.vmm_pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        poll_until(timeout, Duration::from_millis(50), || {
+            !probes.pid_alive(&state.vmm_pid)
+        });
     }
 
     let any_alive = probes.pid_alive(&state.vmm_pid)
@@ -1745,12 +1744,12 @@ fn stop_locked_with(
     // while the teardown that releases its handles (rw.img, volumes, the WHP
     // partition) runs afterwards and can hang; `pid_alive` would call that
     // dead.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut survivors = probes.tree_survivors(&state.vmm_pid);
-    while !survivors.is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-        survivors = probes.tree_survivors(&state.vmm_pid);
-    }
+    poll_until(Duration::from_secs(2), Duration::from_millis(20), || {
+        probes.tree_survivors(&state.vmm_pid).is_empty()
+    });
+    // Re-read for the gate rather than carrying the poll's last answer out of
+    // the closure: the gate then never depends on the poll having run at all.
+    let survivors = probes.tree_survivors(&state.vmm_pid);
 
     // The sandbox is clean only when NO process of the VMM tree survives.
     // Runs on every path — a kill we just issued, a re-sweep, or a tree that
@@ -1767,6 +1766,20 @@ fn stop_locked_with(
     // confined" signal).
     restore_confined_workspace(paths, name);
     cleanup_runtime(paths, name)
+}
+
+/// Poll `done` every `step` until it holds or `budget` has elapsed in steps
+/// (`budget / step` polls, sleeping `step` after each one that is false).
+/// Counted rather than deadline-based so there is no `Instant` comparison to
+/// mutate into an equivalent (`<` vs `<=`) — the stop path is mutation-gated.
+fn poll_until(budget: Duration, step: Duration, mut done: impl FnMut() -> bool) {
+    let steps = budget.as_millis() / step.as_millis().max(1);
+    for _ in 0..steps {
+        if done() {
+            return;
+        }
+        std::thread::sleep(step);
+    }
 }
 
 /// Best-effort kill every sidecar recorded in state.json.
@@ -4352,12 +4365,17 @@ mod tests {
     /// Records re-sweeps. `tree_survivors` answers `survivors` until a sweep
     /// has been recorded and, when `sweep_reaps`, `[]` afterwards — "the
     /// re-sweep terminated it"; with `sweep_reaps == false` the survivors
-    /// persist regardless (teardown truly stuck). Pid liveness stays REAL;
-    /// only the teardown verdict is faked.
+    /// persist regardless (teardown truly stuck). A reaping sweep may leave
+    /// the survivors `linger`ing for that many further calls — a teardown
+    /// that drains over a few polls. Pid liveness stays REAL; only the
+    /// teardown verdict is faked.
     struct ResweepProbes {
         survivors: Vec<u32>,
         sweep_reaps: bool,
         swept: std::cell::Cell<u32>,
+        linger: std::cell::Cell<u32>,
+        /// `tree_survivors` calls answered after a reaping sweep.
+        polls_after_sweep: std::cell::Cell<u32>,
     }
 
     impl ResweepProbes {
@@ -4366,7 +4384,17 @@ mod tests {
                 survivors,
                 sweep_reaps,
                 swept: std::cell::Cell::new(0),
+                linger: std::cell::Cell::new(0),
+                polls_after_sweep: std::cell::Cell::new(0),
             }
+        }
+
+        /// A reaping sweep whose survivors are still reported by the next
+        /// `linger` calls, then gone.
+        fn draining(survivors: Vec<u32>, linger: u32) -> Self {
+            let p = Self::new(survivors, true);
+            p.linger.set(linger);
+            p
         }
     }
 
@@ -4378,11 +4406,15 @@ mod tests {
             false
         }
         fn tree_survivors(&self, _id: &crate::state::PidIdentity) -> Vec<u32> {
-            if self.sweep_reaps && self.swept.get() > 0 {
-                Vec::new()
-            } else {
-                self.survivors.clone()
+            if !self.sweep_reaps || self.swept.get() == 0 {
+                return self.survivors.clone();
             }
+            self.polls_after_sweep.set(self.polls_after_sweep.get() + 1);
+            if self.linger.get() > 0 {
+                self.linger.set(self.linger.get() - 1);
+                return self.survivors.clone();
+            }
+            Vec::new()
         }
         fn sweep_tree_survivors(&self, _id: &crate::state::PidIdentity) -> anyhow::Result<()> {
             self.swept.set(self.swept.get() + 1);
@@ -4426,6 +4458,183 @@ mod tests {
             0,
             "no Shutdown RPC to a launcher that is already dead"
         );
+    }
+
+    /// The post-kill wait POLLS: a tree whose teardown drains over a few
+    /// polls (survivors for 3 more looks after the re-sweep, then gone) is a
+    /// clean stop — the stop must have kept asking (a wait that never polls
+    /// refuses on the first look) and must return as soon as the tree is gone
+    /// (a wait that sleeps out its whole 2 s budget is too slow).
+    #[test]
+    fn stop_polls_a_draining_tree_until_it_is_gone_and_returns_promptly() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        write_state(&paths, "web", dead_identity());
+
+        let conn = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
+        let probes = ResweepProbes::draining(vec![30620], 3);
+        let t0 = Instant::now();
+        stop_locked_with(
+            &paths,
+            "web",
+            &conn,
+            Duration::from_millis(300),
+            false,
+            &probes,
+        )
+        .expect("a tree that drains within the budget is a clean stop");
+        let elapsed = t0.elapsed();
+        assert_eq!(probes.swept.get(), 1, "exactly one re-sweep of the tree");
+        assert!(
+            probes.polls_after_sweep.get() > 2,
+            "the wait must keep polling a draining tree, asked only {} times",
+            probes.polls_after_sweep.get()
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the wait must return once the tree is gone, not sleep out its \
+             budget: took {elapsed:?}"
+        );
+        assert!(
+            !paths.sandbox_dir("web").join(STATE_FILE).exists(),
+            "a drained tree is a clean stop"
+        );
+    }
+
+    /// A guest that powers off a few polls after `Shutdown`: the VMM reads
+    /// alive until a Shutdown has been sent, then for `linger` more probes,
+    /// then dead. Models the graceful path without the kill the fake
+    /// connector's `kill_on_shutdown` would issue itself.
+    struct PoweringOffProbes {
+        log: Arc<Mutex<Vec<Request>>>,
+        linger: u32,
+        probes_after_shutdown: std::cell::Cell<u32>,
+    }
+
+    impl Probes for PoweringOffProbes {
+        fn pid_alive(&self, _id: &crate::state::PidIdentity) -> bool {
+            if count_shutdowns(&self.log) == 0 {
+                return true;
+            }
+            let n = self.probes_after_shutdown.get() + 1;
+            self.probes_after_shutdown.set(n);
+            n <= self.linger
+        }
+        fn control_answers(&self) -> bool {
+            true
+        }
+    }
+
+    /// The graceful wait WAITS: a VMM that powers off on its own within the
+    /// timeout is never escalated to a kill. The recorded pid is a real
+    /// `sleep` that only the escalation could reach — so it must still be
+    /// alive afterwards. A wait that returns while the VMM still reads alive
+    /// would escalate and kill it.
+    #[test]
+    fn stop_graceful_waits_for_the_guest_to_power_off_instead_of_killing() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), None);
+        let probes = PoweringOffProbes {
+            log: log.clone(),
+            linger: 2,
+            probes_after_shutdown: std::cell::Cell::new(0),
+        };
+        let result = stop_locked_with(&paths, "web", &conn, Duration::from_secs(2), true, &probes);
+        let escalated = !procmgr::pid_alive(&sleep_id);
+        let _ = procmgr::kill_pid(&sleep_id);
+        result.expect("a guest that powers off in time is a clean stop");
+        assert_eq!(count_shutdowns(&log), 1, "Shutdown must be sent once");
+        assert!(
+            probes.probes_after_shutdown.get() > 2,
+            "the wait must keep probing until the VMM reads dead"
+        );
+        assert!(
+            !escalated,
+            "a VMM that powered off within the timeout must not be killed"
+        );
+        assert!(!paths.sandbox_dir("web").join(STATE_FILE).exists());
+    }
+
+    /// `poll_until` returns on the FIRST poll that holds, after sleeping one
+    /// step per poll that did not.
+    #[test]
+    fn poll_until_returns_as_soon_as_done_holds() {
+        let calls = std::cell::Cell::new(0u32);
+        let t0 = Instant::now();
+        poll_until(Duration::from_secs(2), Duration::from_millis(10), || {
+            calls.set(calls.get() + 1);
+            calls.get() == 3
+        });
+        let elapsed = t0.elapsed();
+        assert_eq!(calls.get(), 3, "stops polling once done holds");
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "slept one step after each of the two false polls: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "returned long before the 2 s budget: {elapsed:?}"
+        );
+    }
+
+    /// A `done` that never holds is polled exactly `budget / step` times —
+    /// the budget is spent in steps, neither skipped nor overrun.
+    #[test]
+    fn poll_until_polls_budget_over_step_times_when_never_done() {
+        let calls = std::cell::Cell::new(0u32);
+        poll_until(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+        );
+        assert_eq!(calls.get(), 10);
+    }
+
+    /// Fix 2's REAL seam: `RealProbes` relies on the trait default for the
+    /// re-sweep, which must reach the real `procmgr::sweep_tree_survivors`
+    /// (on Unix `kill_pid`) — a no-op default would leave the worker running.
+    #[test]
+    fn real_probes_sweep_tree_survivors_kills_the_recorded_process() {
+        let (dir, paths) = test_paths();
+        let sleep_id = spawn_sleep(dir.path());
+        let connector = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
+        let probes = RealProbes {
+            connector: &connector,
+            paths: &paths,
+            name: "web",
+        };
+        probes.sweep_tree_survivors(&sleep_id).unwrap();
+        assert!(wait_dead(&sleep_id), "the re-sweep must kill the process");
+    }
+
+    /// `RealProbes::tree_survivors` reports the real primitive's answer: the
+    /// recorded process while it lives, nothing once it is gone.
+    #[test]
+    fn real_probes_tree_survivors_reports_the_recorded_process_while_it_lives() {
+        let (dir, paths) = test_paths();
+        let sleep_id = spawn_sleep(dir.path());
+        let connector = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
+        let probes = RealProbes {
+            connector: &connector,
+            paths: &paths,
+            name: "web",
+        };
+        assert_eq!(probes.tree_survivors(&sleep_id), vec![sleep_id.pid]);
+        procmgr::kill_pid(&sleep_id).unwrap();
+        assert!(wait_dead(&sleep_id));
+        assert!(probes.tree_survivors(&sleep_id).is_empty());
     }
 
     /// With no survivor the dead-launcher path is the ordinary clean stop:

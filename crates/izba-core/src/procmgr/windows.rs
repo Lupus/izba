@@ -63,6 +63,19 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 /// documented Win32 caveat and is corrected by the next liveness probe.
 const STILL_ACTIVE: u32 = 259;
 
+/// Access [`open_sync_query`] asks for: read the creation time AND ask whether
+/// the process object is signaled. A `const` (not an inline `|`) because the
+/// flags are disjoint bits, so a `| -> ^` mutant of the expression would be an
+/// equivalent, unkillable mutant; cargo-mutants does not mutate const
+/// initialisers.
+const QUERY_SYNC_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+
+/// Access [`terminate_identity`] asks for: verify the creation time, terminate,
+/// and wait for full death — all through the ONE handle that pins the process.
+/// A `const` for the same equivalent-mutant reason as [`QUERY_SYNC_ACCESS`].
+const TERMINATE_IDENTITY_ACCESS: u32 =
+    PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+
 /// Closes the handle on drop.
 struct OwnedHandle(HANDLE);
 
@@ -334,7 +347,7 @@ pub fn kill_pid(id: &PidIdentity) -> anyhow::Result<()> {
 /// the process object is signaled).
 fn open_sync_query(pid: u32) -> Option<OwnedHandle> {
     // SAFETY: plain FFI call; null means no such process or no access.
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    let h = unsafe { OpenProcess(QUERY_SYNC_ACCESS, 0, pid) };
     if h.is_null() {
         None
     } else {
@@ -454,13 +467,7 @@ fn tree_survivor_identities(id: &PidIdentity) -> Vec<PidIdentity> {
 fn terminate_identity(target: &PidIdentity) {
     // SAFETY: plain FFI call; a null return (gone, or no access) is handled
     // below and the non-null handle is closed exactly once by OwnedHandle.
-    let h = unsafe {
-        OpenProcess(
-            PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            target.pid,
-        )
-    };
+    let h = unsafe { OpenProcess(TERMINATE_IDENTITY_ACCESS, 0, target.pid) };
     if h.is_null() {
         return;
     }
@@ -718,11 +725,18 @@ mod tests {
         (root, worker)
     }
 
+    /// 2000-01-01 00:00 UTC in FILETIME ticks (100 ns since 1601-01-01). A
+    /// boot time earlier than this is a kernel lie, not a real boot — so it
+    /// is the floor a plausible [`boot_time`] must clear.
+    const FILETIME_2000: u64 = 125_911_584_000_000_000;
+
     /// Guard (a) is only as good as its input: where the boot time is
-    /// readable, no process can predate it. Opening pid 4 is NOT guaranteed
-    /// for an unprivileged user (the spike recorded it failing), and
-    /// production then disables the guard by design — so an unreadable boot
-    /// time is a runtime skip here, not a failure.
+    /// readable, no process can predate it — and it is a REAL time, not a
+    /// placeholder (`Some(0)`/`Some(1)` would satisfy `boot <= me` alone and
+    /// silently disable the guard for every record). Opening pid 4 is NOT
+    /// guaranteed for an unprivileged user (the spike recorded it failing),
+    /// and production then disables the guard by design — so an unreadable
+    /// boot time is a runtime skip here, not a failure.
     #[test]
     fn boot_time_is_readable_and_precedes_this_process() {
         let Some(boot) = boot_time() else {
@@ -732,6 +746,10 @@ mod tests {
             return;
         };
         let me = proc_starttime(std::process::id()).expect("own creation time");
+        assert!(
+            boot > FILETIME_2000,
+            "boot {boot} is not a plausible boot time (before 2000-01-01)"
+        );
         assert!(
             boot <= me,
             "boot {boot} must not be after this process ({me})"
@@ -791,10 +809,15 @@ mod tests {
         };
         let survivors = tree_survivors(&pre_boot);
         match boot_time() {
-            Some(_) => assert!(
-                survivors.is_empty(),
-                "a pre-boot record has no surviving tree: {survivors:?}"
-            ),
+            // The guard drops the record only because `1 < boot`; pin that the
+            // boot is a real time so the test cannot pass on a placeholder.
+            Some(boot) => {
+                assert!(boot > FILETIME_2000, "implausible boot time {boot}");
+                assert!(
+                    survivors.is_empty(),
+                    "a pre-boot record has no surviving tree: {survivors:?}"
+                );
+            }
             None => assert!(
                 survivors.contains(&worker),
                 "boot guard disabled (pid 4 unreadable): the orphaned worker {worker} \
