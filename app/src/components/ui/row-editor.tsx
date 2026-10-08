@@ -7,9 +7,13 @@ export function RowList({ children, className }: { children: React.ReactNode; cl
   return <div className={cn("flex flex-col gap-2", className)}>{children}</div>;
 }
 
-export function RowCard({ children, className }: { children: React.ReactNode; className?: string }) {
+export function RowCard({
+  children,
+  className,
+  ...rest
+}: { children: React.ReactNode; className?: string } & React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <div className={cn("flex items-center gap-2 rounded-lg border border-border p-2", className)}>
+    <div className={cn("flex items-center gap-2 rounded-lg border border-border p-2", className)} {...rest}>
       {children}
     </div>
   );

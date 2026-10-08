@@ -14,4 +14,14 @@ describe("SegmentedControl", () => {
     fireEvent.click(screen.getByRole("radio", { name: "read-write" }));
     expect(onChange).toHaveBeenCalledWith("read-write");
   });
+  it("can be named by aria-labelledby instead of aria-label", () => {
+    render(
+      <>
+        <span id="row-name">Access for host rule 1 (api.x.com)</span>
+        <SegmentedControl aria-labelledby="row-name" value="read" onChange={() => {}} options={opts} />
+      </>,
+    );
+    const group = screen.getByRole("radiogroup", { name: "Access for host rule 1 (api.x.com)" });
+    expect(group).not.toHaveAttribute("aria-label");
+  });
 });
