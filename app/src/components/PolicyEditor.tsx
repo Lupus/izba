@@ -39,6 +39,19 @@ function gitRuleTarget(rule: GitRule): string {
   return "repo" in rule ? rule.repo : rule.host;
 }
 
+/** The ONE row-identifying descriptor every control in a rule's row is
+ *  named by (#244): `host rule 3 (api.x.com)` / `git rule 1 (github.com/o/a)`.
+ *  Ordinal + value, always both: the value says WHICH rule a screen-reader
+ *  user (or the dogfood driver's set-of-marks) is on, and the ordinal keeps
+ *  two rows with the same value — or two still-empty rows — from ever
+ *  sharing a name. The value is trimmed, as Save will persist it; a blank
+ *  row reads `(empty)`. The name is live — it follows edits and renumbers
+ *  on removal — which is the point: it describes the rule as it is now. */
+function ruleName(kind: "host" | "git", value: string, index: number): string {
+  const v = value.trim();
+  return `${kind} rule ${index + 1} (${v === "" ? "empty" : v})`;
+}
+
 function toGitRow(rule: GitRule): GitRow {
   return { target: gitRuleTarget(rule), access: rule.access ?? "read" };
 }
@@ -202,6 +215,8 @@ function PortEditor({
   ports,
   access,
   enforcing,
+  rule,
+  labelledBy,
   onAdd,
   onRemove,
 }: {
@@ -214,6 +229,13 @@ function PortEditor({
   // non-enforcing sandbox is inert, and the chip must say so in the same
   // words the row notice does (both read `portDeclarationLabel`).
   enforcing: boolean;
+  /** The row descriptor from `ruleName` — every control in here names the
+   *  rule it acts on, so two rows sharing a port (or a blank add field) are
+   *  never announced identically (#244). */
+  rule: string;
+  /** Space-separated ids for this group's `aria-labelledby`: the visible
+   *  "Ports" label, then the row's hidden `for <rule>` span. */
+  labelledBy: string;
   onAdd: (port: number) => void;
   onRemove: (port: number) => void;
 }) {
@@ -240,7 +262,7 @@ function PortEditor({
     setErr(null);
   }
   return (
-    <div className="flex flex-1 flex-col gap-1">
+    <div role="group" aria-labelledby={labelledBy} className="flex flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
         {ports.map((p) => {
           const declaration = portDeclarationLabel(p, access, enforcing);
@@ -264,7 +286,7 @@ function PortEditor({
                 type="button"
                 variant="ghost"
                 size="icon"
-                aria-label={`Remove port ${p.port}`}
+                aria-label={`Remove port ${p.port} from ${rule}`}
                 onClick={() => onRemove(p.port)}
                 className="h-3.5 w-3.5 p-0 text-muted-foreground-2 hover:text-destructive"
               >
@@ -286,7 +308,7 @@ function PortEditor({
             }
           }}
           placeholder="add port"
-          aria-label="add port"
+          aria-label={`Add port to ${rule}`}
           inputMode="numeric"
           className="w-20 py-1 text-xs"
         />
@@ -294,6 +316,7 @@ function PortEditor({
           type="button"
           variant="secondary"
           size="sm"
+          aria-label={`Add port to ${rule}`}
           onClick={commit}
         >
           Add
@@ -599,15 +622,36 @@ export function PolicyEditor({ name }: { name: string }) {
                   const pinned = pinnedPorts(r);
                   const locked = pinned.length > 0;
                   // Namespaced by instanceId (useId) AND per-row by index, so
-                  // aria-describedby resolves the right notice even with
-                  // several locked rows in this instance, or two mounted
-                  // instances of PolicyEditor.
-                  const noticeId = `${instanceId}-passthrough-notice-${i}`;
+                  // aria-describedby / aria-labelledby resolve the right
+                  // element even with several rows in this instance, or two
+                  // mounted instances of PolicyEditor.
+                  const rowId = `${instanceId}-host-${i}`;
+                  const noticeId = `${rowId}-passthrough-notice`;
+                  // #244: one hidden "for <rule>" span per row; each visible
+                  // field label is referenced FIRST, so the accessible name
+                  // is the visible text followed by the rule — "Host for
+                  // host rule 1 (api.x.com)" — and a label edit can never
+                  // drift from the name.
+                  const rule = ruleName("host", r.host, i);
+                  const ruleId = `${rowId}-rule`;
+                  const hostLabelId = `${rowId}-host-label`;
+                  const hostInputId = `${rowId}-host`;
+                  const portsLabelId = `${rowId}-ports-label`;
+                  const accessLabelId = `${rowId}-access-label`;
                   return (
                     <>
+                      <span id={ruleId} className="sr-only">for {rule}</span>
                       <div className="flex w-full items-center gap-2">
-                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
+                        <label
+                          id={hostLabelId}
+                          htmlFor={hostInputId}
+                          className="w-12 shrink-0 text-xs font-semibold text-muted-foreground"
+                        >
+                          Host
+                        </label>
                         <Input
+                          id={hostInputId}
+                          aria-labelledby={`${hostLabelId} ${ruleId}`}
                           value={r.host}
                           onChange={(e) => setHost(i, e.target.value)}
                           placeholder="api.example.com or *.example.com"
@@ -630,18 +674,28 @@ export function PolicyEditor({ name }: { name: string }) {
                         </p>
                       )}
                       <div className="flex w-full items-center gap-2">
-                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
+                        {/* A span, not a <label>: a label can only target a
+                            labelable element, and the ports control is a
+                            group — it is named through aria-labelledby. */}
+                        <span id={portsLabelId} className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">
+                          Ports
+                        </span>
                         <PortEditor
                           ports={r.ports}
                           access={r.access}
                           enforcing={enforcing}
+                          rule={rule}
+                          labelledBy={`${portsLabelId} ${ruleId}`}
                           onAdd={(p) => addPort(i, p)}
                           onRemove={(p) => removePort(i, p)}
                         />
                       </div>
                       <div className="flex w-full items-center gap-2">
-                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
+                        <span id={accessLabelId} className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">
+                          Access
+                        </span>
                         <AccessPicker
+                          aria-labelledby={`${accessLabelId} ${ruleId}`}
                           value={r.access}
                           onChange={(v) => setHostAccess(i, v)}
                         />
@@ -653,7 +707,8 @@ export function PolicyEditor({ name }: { name: string }) {
                 onRemove={(i) => removeRow(i)}
                 addLabel="Add host"
                 emptyHint="No allowed hosts — add one to permit egress."
-                rowAriaLabel={(_,i) => `Remove host ${i + 1}`}
+                rowAriaLabel={(r, i) => `Remove ${ruleName("host", r.host, i)}`}
+                rowLabel={(r, i) => ruleName("host", r.host, i)}
               />
             </Section>
 
@@ -665,25 +720,34 @@ export function PolicyEditor({ name }: { name: string }) {
               <EditableList
                 density="card"
                 items={gitRows}
-                renderRow={(gr, i) => (
-                  <div className="flex w-full items-center gap-2">
-                    <Input
-                      value={gr.target}
-                      onChange={(e) => setGitTarget(i, e.target.value)}
-                      placeholder="github.com/owner/repo"
-                      className="flex-1 font-mono text-sm"
-                    />
-                    <AccessPicker
-                      value={gr.access}
-                      onChange={(v) => setGitAccess(i, v)}
-                    />
-                  </div>
-                )}
+                renderRow={(gr, i) => {
+                  // #244: git rows have no visible field labels (and must not
+                  // gain any — appearance is frozen), so the names are plain
+                  // aria-label strings built from the same `ruleName`.
+                  const rule = ruleName("git", gr.target, i);
+                  return (
+                    <div className="flex w-full items-center gap-2">
+                      <Input
+                        aria-label={`Repo for ${rule}`}
+                        value={gr.target}
+                        onChange={(e) => setGitTarget(i, e.target.value)}
+                        placeholder="github.com/owner/repo"
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <AccessPicker
+                        aria-label={`Access for ${rule}`}
+                        value={gr.access}
+                        onChange={(v) => setGitAccess(i, v)}
+                      />
+                    </div>
+                  );
+                }}
                 onAdd={addGitRow}
                 onRemove={(i) => removeGitRow(i)}
                 addLabel="Add repo"
                 emptyHint="No git rules — add one to allow a repo."
-                rowAriaLabel={(_,i) => `Remove repo ${i + 1}`}
+                rowAriaLabel={(gr, i) => `Remove ${ruleName("git", gr.target, i)}`}
+                rowLabel={(gr, i) => ruleName("git", gr.target, i)}
               />
             </Section>
           </div>
