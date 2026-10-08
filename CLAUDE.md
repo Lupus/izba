@@ -145,12 +145,22 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   #319): on Windows a `TerminateProcess`'d `openvmm.exe` carries an exit code
   at once while the kernel-side teardown that releases `rw.img`/the WHP
   partition can hang, so the verdict is "process object signaled", never
-  `GetExitCodeProcess`. A survivor makes `assess` answer
-  `Degraded(vmm process <pid> terminated but not torn down, disks still held)`
+  `GetExitCodeProcess`. Once the launcher is dead the tree is found by a PPID
+  walk on its pid NUMBER, so `tree_survivors` drops what a recycled pid drags
+  in (`procmgr::survivors`: a launcher started before the current boot has no
+  tree; candidates created at/after a DIFFERENT current holder of the pid are
+  the holder's). A survivor makes `assess` answer
+  `Degraded(vmm process <pid> outlived its launcher and still holds the disks)`
   — never `Stopped`, which is what lets `reap_stale_stopped` drop `state.json`
-  and `start` double-boot — and `stop`/`rm` (forced or not) refuse with one
-  shared message (`sandbox::disks_held_error`) that names the pid and keeps
-  `state.json`. Runtime sockets live OUTSIDE that dir, in
+  and `start` double-boot. `stop` re-sweeps a tree whose launcher is already
+  gone (`procmgr::sweep_tree_survivors` — through those guards, never
+  `kill_pid`'s bare PPID sweep) and waits up to 2 s for the WHOLE tree; a
+  survivor after that makes `stop` and `rm --force` refuse with one shared
+  message (`sandbox::disks_held_error`) that names the pid and keeps
+  `state.json`, plain `rm` reports the `degraded (…)` state, and `start`
+  returns the same error instead of the idempotent "already running" success.
+  The wording states only what izba observed (the process is still present),
+  never a termination. Runtime sockets live OUTSIDE that dir, in
   a short hashed dir (`<data>/run/<hex8(sha256(name))>/`, keeping AF_UNIX
   paths under the SUN_LEN budget — #71/#85), claimed by an `owner` marker,
   recorded per-run in `state.json`'s `run_dir` field, and removed by `rm`; a

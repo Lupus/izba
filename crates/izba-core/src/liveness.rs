@@ -39,18 +39,21 @@ impl Liveness {
 }
 
 /// The `Degraded` reason for a VMM whose launcher is gone while a process of
-/// its tree still holds the sandbox's disks (#319). Rendered inside
+/// its tree is still present and so still holds the sandbox's disks (#319).
+/// It states only what was observed — the process outlived its launcher —
+/// never that it was terminated: a launcher that died on its own can leave
+/// its worker running. Rendered inside
 /// `degraded (…)`, so it must never end with `)` — the desktop app strips
 /// exactly one trailing paren (`app/src-tauri/src/views.rs::parse_state`).
 pub fn stuck_teardown_reason(survivors: &[u32]) -> String {
-    let noun = if survivors.len() == 1 {
-        "process"
+    let (noun, their, hold) = if survivors.len() == 1 {
+        ("process", "its", "holds")
     } else {
-        "processes"
+        ("processes", "their", "hold")
     };
     let pids: Vec<String> = survivors.iter().map(u32::to_string).collect();
     format!(
-        "vmm {noun} {} terminated but not torn down, disks still held",
+        "vmm {noun} {} outlived {their} launcher and still {hold} the disks",
         pids.join(", ")
     )
 }
@@ -61,8 +64,8 @@ pub fn stuck_teardown_reason(survivors: &[u32]) -> String {
 /// 1. `run == None`                        → Stopped
 /// 2. vmm pid dead, nothing of its tree survives → Stopped
 ///    2b. vmm pid dead but a process of its tree still holds its resources
-///    → Degraded("vmm process <pid> terminated but not torn down, disks still
-///    held") (#319) — never Stopped, which would let the stale-state reaper
+///    → Degraded("vmm process <pid> outlived its launcher and still holds the
+///    disks") (#319) — never Stopped, which would let the stale-state reaper
 ///    delete state.json and a later start boot against held disks
 /// 3. any sidecar dead                     → Degraded("sidecar <role> died")
 ///    (sidecar death takes precedence over control unresponsiveness)
@@ -211,8 +214,12 @@ mod tests {
         match assess(Some(&run), &p) {
             Liveness::Degraded(reason) => {
                 assert!(reason.contains("30620"), "names the pid: {reason}");
-                assert!(reason.contains("disks still held"), "{reason}");
-                assert!(reason.contains("not torn down"), "{reason}");
+                assert!(reason.contains("outlived its launcher"), "{reason}");
+                assert!(reason.contains("still holds the disks"), "{reason}");
+                assert!(
+                    !reason.contains("terminated"),
+                    "izba did not observe a termination: {reason}"
+                );
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -230,11 +237,11 @@ mod tests {
         }
         assert_eq!(
             stuck_teardown_reason(&[30620]),
-            "vmm process 30620 terminated but not torn down, disks still held"
+            "vmm process 30620 outlived its launcher and still holds the disks"
         );
         assert_eq!(
             stuck_teardown_reason(&[29588, 30620]),
-            "vmm processes 29588, 30620 terminated but not torn down, disks still held"
+            "vmm processes 29588, 30620 outlived their launcher and still hold the disks"
         );
     }
 

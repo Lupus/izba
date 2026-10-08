@@ -496,8 +496,8 @@ cargo build --release --target x86_64-pc-windows-gnu --manifest-path hack/fake-u
 
 **Stuck VMM teardown check (#319).** A `TerminateProcess`'d `openvmm.exe`
 worker can hang in kernel-side teardown with the sandbox's disks still held;
-izba then refuses `stop`/`rm` and shows the sandbox `degraded (vmm process
-<pid> terminated but not torn down, disks still held)`. The real-host check
+izba then refuses `stop`/`rm --force` and shows the sandbox `degraded (vmm
+process <pid> outlived its launcher and still holds the disks)`. The real-host check
 for that contract — and the reproduction conditions — are in
 [`docs/spikes/0003-windows-openvmm-worker-teardown-hang.md`](spikes/0003-windows-openvmm-worker-teardown-hang.md):
 

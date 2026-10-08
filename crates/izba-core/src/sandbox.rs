@@ -1236,6 +1236,18 @@ pub fn start_with_timeouts(
     }
 
     let conn = default_connector();
+    // #319: a dead launcher whose VMM tree still holds the disks is not
+    // "already running" — reporting that would be a false success (`izba
+    // run` would then exec into nothing). Refuse with the disks-held error.
+    refuse_if_teardown_stuck(
+        paths,
+        name,
+        &RealProbes {
+            connector: &conn,
+            paths,
+            name,
+        },
+    )?;
     if liveness_of(paths, name, &conn)? != Liveness::Stopped {
         return Err(AlreadyRunning {
             name: name.to_string(),
@@ -1576,33 +1588,38 @@ pub fn control(
     }
 }
 
-/// The refusal `stop` and `rm` return while a process of the sandbox's VMM
-/// tree has been terminated but has not finished exiting (#319): it still
-/// holds the writable disk and any volumes, so state.json must stay (a later
-/// start would double-boot against held disks) and nothing may be renamed
-/// or deleted. One text for both verbs; `izba status` carries the same fact
-/// as `degraded (…)` via `liveness::stuck_teardown_reason`.
+/// The refusal `stop` (and so `rm --force`, which stops first) returns while
+/// a process of the sandbox's VMM tree is still present after the stop's own
+/// kill or re-sweep and its bounded wait (#319): it still holds the writable
+/// disk and any volumes, so state.json must stay (a later start would
+/// double-boot against held disks) and nothing may be renamed or deleted.
+/// `start` returns it too, via [`refuse_if_teardown_stuck`]. It claims only
+/// what izba observed — the process is still there — never that it was
+/// terminated. `izba status` carries the same fact as `degraded (…)` via
+/// `liveness::stuck_teardown_reason`.
 fn disks_held_error(name: &str, survivors: &[u32]) -> anyhow::Error {
     let pids: Vec<String> = survivors.iter().map(u32::to_string).collect();
     let pids = pids.join(", ");
-    let (noun, verb, hold, pid_noun) = if survivors.len() == 1 {
-        ("process", "has", "holds", "pid")
+    let (noun, are, hold, them, they, stay) = if survivors.len() == 1 {
+        ("process", "is", "holds", "it", "it", "stays")
     } else {
-        ("processes", "have", "hold", "pids")
+        ("processes", "are", "hold", "them", "they", "stay")
     };
     anyhow::anyhow!(
-        "sandbox '{name}': VMM {noun} {pids} {verb} been terminated but {verb} not finished exiting \
-         and still {hold} the sandbox's disks (rw.img, volumes); state preserved so the sandbox \
-         cannot be double-booted, and `izba status {name}` reports it degraded. \
-         Retry `izba stop {name}` once {pid_noun} {pids} {verb} left the process list; a process stuck \
-         in kernel-side teardown is released only by a host reboot."
+        "sandbox '{name}': VMM {noun} {pids} from its last run {are} still present and {hold} \
+         the sandbox's disks (rw.img, volumes), so the sandbox is not cleanly stopped; state \
+         preserved so it cannot be double-booted, and `izba status {name}` reports it degraded. \
+         Run `izba stop {name}` again to make {them} exit; if {they} {stay} in the process list \
+         after that, {they} {are} stuck in kernel-side teardown, which only a host reboot releases."
     )
 }
 
-/// `rm` must not even attempt the rename while a terminated VMM process still
-/// holds files inside the dir — Windows answers `Access is denied (os error
-/// 5)` with no hint of why (#319). A sandbox without state.json has nothing
-/// to check.
+/// `start` must not answer "already running" — an idempotent success — for a
+/// sandbox whose launcher is dead while a process of its VMM tree still holds
+/// the disks (#319): nothing is running that a later `exec` could reach. The
+/// refusal is the disks-held error instead; a launcher that is alive is left
+/// to `start`'s own `AlreadyRunning`. A sandbox without state.json has
+/// nothing to check.
 fn refuse_if_teardown_stuck(paths: &Paths, name: &str, probes: &dyn Probes) -> anyhow::Result<()> {
     let state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))?;
     if let Some(s) = state {
@@ -1679,7 +1696,9 @@ fn stop_locked_with(
         (_, Some(s)) => s,
     };
 
-    if graceful {
+    // A launcher that is already dead cannot answer the Shutdown RPC: skip it
+    // rather than pay the control timeout on every retry of a stuck stop.
+    if graceful && probes.pid_alive(&state.vmm_pid) {
         // Best-effort: the guest may die mid-reply or hang, which is fine —
         // the bounded RPC guarantees we reach the escalation path below.
         let _ = (|| -> anyhow::Result<()> {
@@ -1704,23 +1723,36 @@ fn stop_locked_with(
         for (_, id) in &state.sidecar_pids {
             procmgr::kill_pid(id)?;
         }
-        // SIGKILL is asynchronous; wait briefly so cleanup happens after death.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while probes.pid_alive(&state.vmm_pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    } else if !probes.tree_survivors(&state.vmm_pid).is_empty() {
+        // #319: the launcher is already gone — it died on its own, or an
+        // earlier stop killed it — yet a worker of its tree is still there,
+        // possibly still RUNNING the guest. No kill above reached it, so
+        // re-sweep the tree. The sweep goes through `tree_survivors`'
+        // recycled-pid guards, never a bare PPID walk, so the children of
+        // whatever process now holds the launcher pid are left alone.
+        procmgr::sweep_tree_survivors(&state.vmm_pid)?;
     }
 
-    // The sandbox is clean only when NO process of the VMM tree survives —
-    // the recorded launcher AND its worker children (#319). On Windows a
-    // terminated process carries an exit code at once while the teardown
-    // that releases its handles (rw.img, volumes, the WHP partition) can
-    // hang; `pid_alive` would call that dead. Runs on both paths — a kill we
-    // just issued, or a launcher found already exited by an earlier attempt
-    // — so a RETRY never falls through to cleanup while a worker lingers.
-    // A survivor keeps state.json (a later start would double-boot against
-    // held disks) and the run dir, and the refusal names the pid.
-    let survivors = probes.tree_survivors(&state.vmm_pid);
+    // Kills are asynchronous: wait briefly for the WHOLE tree — the recorded
+    // launcher AND its worker children (#319) — to finish exiting. On Unix
+    // the tree is the root alone, so this is the plain "wait for the VMM to
+    // die". On Windows a terminated process carries an exit code at once
+    // while the teardown that releases its handles (rw.img, volumes, the WHP
+    // partition) runs afterwards and can hang; `pid_alive` would call that
+    // dead.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut survivors = probes.tree_survivors(&state.vmm_pid);
+    while !survivors.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        survivors = probes.tree_survivors(&state.vmm_pid);
+    }
+
+    // The sandbox is clean only when NO process of the VMM tree survives.
+    // Runs on every path — a kill we just issued, a re-sweep, or a tree that
+    // was already gone — so a RETRY never falls through to cleanup while a
+    // worker lingers. A survivor keeps state.json (a later start would
+    // double-boot against held disks) and the run dir, and the refusal names
+    // the pid.
     if !survivors.is_empty() {
         return Err(disks_held_error(name, &survivors));
     }
@@ -1925,13 +1957,17 @@ fn remove_with(
         .join(format!("{name}.removing-{}", std::process::id()));
     {
         let _lock = lock_sandbox(paths, name)?;
-        // #319: a terminated VMM process whose teardown is stuck still holds
-        // files inside `dir`; neither a plain nor a forced remove can proceed,
-        // and the refusal must say so rather than the rename's raw OS error.
-        refuse_if_teardown_stuck(paths, name, probes)?;
+        // #319: a sandbox whose launcher is gone while a worker of its VMM
+        // tree survives reads `degraded (…)`, and the plain refusal says so
+        // rather than "running". `--force` goes through `stop`, whose
+        // re-sweep either frees the sandbox or whose gate refuses with the
+        // disks-held explanation before anything is renamed.
         match liveness_of_with(paths, name, probes)? {
             Liveness::Stopped => {}
-            _ if !force => bail!("sandbox '{name}' is running (use force to remove)"),
+            live if !force => bail!(
+                "sandbox '{name}' is {} (use force to remove)",
+                live.describe()
+            ),
             _ => {
                 // #78: killing a live guest outright loses page-cache writes
                 // not yet flushed to the volume images. With persistent
@@ -1968,8 +2004,8 @@ fn remove_with(
 
 /// Context for a failed tombstone rename. On Windows, `PermissionDenied` on a
 /// directory rename is the OS saying "a file inside is open in some process"
-/// — the one case `refuse_if_teardown_stuck` could not see (no state.json,
-/// or a holder outside the VMM tree) — so point the user at the cause and at
+/// — the one case `stop`'s survivor gate could not see (no state.json, or a
+/// holder outside the VMM tree) — so point the user at the cause and at
 /// `izba status`. On Unix the same kind means EACCES/EPERM (a parent
 /// directory's permissions or sticky bit), never an open file, so Unix — and
 /// every other kind — keeps the plain context.
@@ -4239,9 +4275,21 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.contains("30620"), "names the pid: {err}");
-        assert!(err.contains("still holds the sandbox's disks"), "{err}");
+        assert!(
+            err.contains("VMM process 30620 from its last run is still present"),
+            "{err}"
+        );
+        assert!(err.contains("holds the sandbox's disks"), "{err}");
         assert!(err.contains("state preserved"), "{err}");
-        assert!(err.contains("izba stop web"), "says what to do: {err}");
+        assert!(
+            err.contains("Run `izba stop web` again"),
+            "says what to do: {err}"
+        );
+        assert!(err.contains("host reboot"), "{err}");
+        assert!(
+            !err.contains("terminated"),
+            "claims nothing izba did not observe: {err}"
+        );
         assert!(
             paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "state.json must survive a refused stop"
@@ -4282,13 +4330,84 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            err.contains("30620") && err.contains("still holds"),
+            err.contains("30620") && err.contains("holds the sandbox's disks"),
             "{err}"
         );
         assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
         assert!(
             paths.run_dir("web").is_dir(),
             "the run dir must survive a refused stop"
+        );
+    }
+
+    /// Answers `[30620]` for the first `stuck_calls` survivor queries and `[]`
+    /// afterwards — "the re-sweep reaped it" — and counts the queries. Pid
+    /// liveness stays REAL; only the teardown verdict is faked.
+    struct ReapedAfterProbes {
+        stuck_calls: usize,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Probes for ReapedAfterProbes {
+        fn pid_alive(&self, id: &crate::state::PidIdentity) -> bool {
+            procmgr::pid_alive(id)
+        }
+        fn control_answers(&self) -> bool {
+            false
+        }
+        fn tree_survivors(&self, _id: &crate::state::PidIdentity) -> Vec<u32> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n < self.stuck_calls {
+                vec![30620]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Fix 2 of the #319 review: the launcher died on its own and its worker
+    /// keeps RUNNING. No kill of the launcher can reach it, so `stop` must
+    /// re-sweep the tree itself, then keep asking (bounded) until the tree
+    /// drains — not refuse on the first look and send the user to a reboot
+    /// for a process that was never terminated. A dead launcher is not sent
+    /// the Shutdown RPC (it would only burn the control timeout).
+    #[test]
+    fn stop_resweeps_an_orphaned_worker_when_the_launcher_is_already_gone() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        write_state(&paths, "web", dead_identity());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), None);
+        let probes = ReapedAfterProbes {
+            stuck_calls: 3,
+            calls: std::cell::Cell::new(0),
+        };
+        stop_locked_with(
+            &paths,
+            "web",
+            &conn,
+            Duration::from_millis(300),
+            true,
+            &probes,
+        )
+        .expect("the re-sweep frees the sandbox");
+        assert!(
+            !paths.sandbox_dir("web").join(STATE_FILE).exists(),
+            "a drained tree is a clean stop"
+        );
+        assert!(
+            probes.calls.get() > 3,
+            "stop must keep asking until the tree drains, saw {} queries",
+            probes.calls.get()
+        );
+        assert_eq!(
+            count_shutdowns(&log),
+            0,
+            "no Shutdown RPC to a launcher that is already dead"
         );
     }
 
@@ -4333,10 +4452,12 @@ mod tests {
         }
     }
 
-    /// `rm` — forced or not — must explain, not fail on a raw rename error,
-    /// and must not suggest `--force` (it cannot help). The dir stays.
+    /// `rm --force` on a stuck sandbox goes through `stop`, whose re-sweep
+    /// cannot free a tree whose teardown is stuck: the gate refuses with the
+    /// disks-held explanation rather than a raw rename error, and the dir
+    /// and state.json stay.
     #[test]
-    fn rm_refuses_with_the_disks_held_explanation_with_and_without_force() {
+    fn rm_force_refuses_with_the_disks_held_explanation_when_the_tree_survives() {
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
@@ -4347,29 +4468,51 @@ mod tests {
         let probes = StuckTeardownProbes {
             survivors: vec![30620],
         };
-        for force in [false, true] {
-            let err = format!(
-                "{:#}",
-                remove_with(&paths, "web", &conn, force, &probes).unwrap_err()
-            );
-            assert!(err.contains("30620"), "force={force}: {err}");
-            assert!(
-                err.contains("still holds the sandbox's disks"),
-                "force={force}: {err}"
-            );
-            assert!(!err.contains("use force"), "force cannot help: {err}");
-            assert!(!err.contains("Access is denied"), "{err}");
-            assert!(
-                paths.sandbox_dir("web").is_dir(),
-                "dir must survive (force={force})"
-            );
-            assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
-        }
+        let err = format!(
+            "{:#}",
+            remove_with(&paths, "web", &conn, true, &probes).unwrap_err()
+        );
+        assert!(err.contains("30620"), "{err}");
+        assert!(err.contains("holds the sandbox's disks"), "{err}");
+        assert!(!err.contains("use force"), "force cannot help: {err}");
+        assert!(!err.contains("Access is denied"), "{err}");
+        assert!(paths.sandbox_dir("web").is_dir(), "dir must survive");
+        assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
+    }
+
+    /// A plain `rm` of a stuck sandbox reports what the sandbox actually is —
+    /// the same `degraded (…)` `izba status` shows — and points at `--force`,
+    /// which now reaches the re-sweep.
+    #[test]
+    fn rm_without_force_shows_the_degraded_reason_for_a_stuck_sandbox() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        write_state(&paths, "web", dead_identity());
+
+        let conn = fake_connector(Arc::new(Mutex::new(Vec::new())), None);
+        let probes = StuckTeardownProbes {
+            survivors: vec![30620],
+        };
+        let err = format!(
+            "{:#}",
+            remove_with(&paths, "web", &conn, false, &probes).unwrap_err()
+        );
+        assert!(
+            err.contains(
+                "degraded (vmm process 30620 outlived its launcher and still holds the disks)"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("use force"), "{err}");
+        assert!(paths.sandbox_dir("web").is_dir(), "dir must survive");
+        assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
     }
 
     /// The path the issue describes: launcher alive, `rm --force` kills it,
-    /// a worker lingers. The gate inside `stop_locked_with` (not the pre-check,
-    /// which sees a live launcher and stays silent) must refuse AFTER the kill.
+    /// a worker lingers. The gate inside `stop_locked_with` must refuse AFTER
+    /// the kill.
     #[test]
     fn rm_force_refuses_after_the_kill_when_a_worker_survives() {
         let (dir, paths) = test_paths();
@@ -4388,7 +4531,7 @@ mod tests {
             remove_with(&paths, "web", &conn, true, &probes).unwrap_err()
         );
         assert!(err.contains("30620"), "{err}");
-        assert!(err.contains("still holds the sandbox's disks"), "{err}");
+        assert!(err.contains("holds the sandbox's disks"), "{err}");
         assert!(paths.sandbox_dir("web").is_dir(), "dir must survive");
         assert!(paths.sandbox_dir("web").join(STATE_FILE).exists());
         assert!(wait_dead(&sleep_id), "the kill itself still happens");
@@ -4396,21 +4539,70 @@ mod tests {
 
     #[test]
     fn disks_held_error_reads_correctly_for_one_and_several_pids() {
-        let one = format!("{:#}", disks_held_error("web", &[30620]));
-        assert!(
-            one.contains("process 30620 has been terminated but has not"),
-            "{one}"
+        assert_eq!(
+            format!("{:#}", disks_held_error("web", &[30620])),
+            "sandbox 'web': VMM process 30620 from its last run is still present and holds \
+             the sandbox's disks (rw.img, volumes), so the sandbox is not cleanly stopped; \
+             state preserved so it cannot be double-booted, and `izba status web` reports it \
+             degraded. Run `izba stop web` again to make it exit; if it stays in the process \
+             list after that, it is stuck in kernel-side teardown, which only a host reboot \
+             releases."
         );
-        assert!(one.contains("still holds the sandbox's disks"), "{one}");
-        assert!(one.contains("once pid 30620 has left"), "{one}");
 
         let many = format!("{:#}", disks_held_error("web", &[29588, 30620]));
         assert!(
-            many.contains("processes 29588, 30620 have been terminated but have not"),
+            many.contains(
+                "VMM processes 29588, 30620 from its last run are still present and hold \
+                 the sandbox's disks (rw.img, volumes)"
+            ),
             "{many}"
         );
-        assert!(many.contains("still hold the sandbox's disks"), "{many}");
-        assert!(many.contains("once pids 29588, 30620 have left"), "{many}");
+        assert!(
+            many.contains("Run `izba stop web` again to make them exit; if they stay"),
+            "{many}"
+        );
+        assert!(many.contains("only a host reboot releases."), "{many}");
+    }
+
+    /// Fix 3 of the #319 review: `start` consults this right before its
+    /// `AlreadyRunning` refusal, so a stuck sandbox fails the start with the
+    /// disks-held explanation (exit 1) instead of the idempotent "already
+    /// running" success. `start` itself always probes with the real
+    /// primitive, which cannot report a stuck tree on Linux, so the decision
+    /// is pinned here.
+    #[test]
+    fn refuse_if_teardown_stuck_refuses_only_a_dead_launcher_with_survivors() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let stuck = StuckTeardownProbes {
+            survivors: vec![30620],
+        };
+
+        // No state.json: nothing ran, nothing to refuse.
+        refuse_if_teardown_stuck(&paths, "web", &stuck).expect("no run state");
+
+        // A live launcher is a running sandbox — that is `AlreadyRunning`'s
+        // business, not a stuck teardown.
+        write_state(&paths, "web", live_identity());
+        refuse_if_teardown_stuck(&paths, "web", &stuck).expect("live launcher");
+
+        // A dead launcher with nothing surviving is simply stopped.
+        write_state(&paths, "web", dead_identity());
+        refuse_if_teardown_stuck(&paths, "web", &StuckTeardownProbes { survivors: vec![] })
+            .expect("drained tree");
+
+        // A dead launcher whose tree survives: the disks-held refusal.
+        let err = format!(
+            "{:#}",
+            refuse_if_teardown_stuck(&paths, "web", &stuck).unwrap_err()
+        );
+        assert!(
+            err.contains("VMM process 30620 from its last run is still present"),
+            "{err}"
+        );
+        assert!(!err.contains("already running"), "{err}");
     }
 
     /// On Unix `PermissionDenied` from rename(2) is a parent-directory

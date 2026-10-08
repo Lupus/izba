@@ -160,6 +160,14 @@ pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
     }
 }
 
+/// Kill whatever of the VMM tree rooted at `id` still survives — the re-sweep
+/// `stop` issues when the launcher is already gone but [`tree_survivors`]
+/// still reports part of its tree (#319). On Linux the tree is the root
+/// alone, so this is [`kill_pid`].
+pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
+    kill_pid(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +293,33 @@ mod tests {
             starttime: 1,
         };
         assert!(tree_survivors(&id).is_empty());
+    }
+
+    /// #319: `stop`'s re-sweep on Linux kills the (root-only) tree, and is a
+    /// harmless no-op for an identity that no longer matches — it must never
+    /// signal whatever process now holds a recycled pid (here: ourselves).
+    #[test]
+    fn sweep_tree_survivors_kills_the_root_and_spares_a_recycled_pid() {
+        let dir = std::env::temp_dir();
+        let id = spawn_detached(
+            &CommandSpec {
+                argv: vec!["sleep".into(), "30".into()],
+            },
+            &dir.join(format!("izba-tree-sweep-{}.log", std::process::id())),
+        )
+        .expect("spawn sleep");
+        sweep_tree_survivors(&id).expect("sweep");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pid_alive(&id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!pid_alive(&id), "the sweep must kill a surviving root");
+
+        let recycled = PidIdentity {
+            pid: std::process::id(),
+            starttime: 1,
+        };
+        sweep_tree_survivors(&recycled).expect("no-op sweep");
+        // Still here: the test process was not signalled.
     }
 }

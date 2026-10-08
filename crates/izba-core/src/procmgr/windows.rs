@@ -419,6 +419,24 @@ pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
     out
 }
 
+/// Terminate every process [`tree_survivors`] reports for `id`, waiting for
+/// each to fully die (bounded, see [`TERMINATION_WAIT_MS`]) — the re-sweep
+/// `stop` issues when the launcher is already gone but a worker of its tree
+/// is still there, possibly still running the guest (#319).
+///
+/// Deliberately NOT [`kill_pid`]: once the launcher is dead its sweep walks
+/// PPIDs by the launcher's pid NUMBER with only the creation-time floor, so
+/// if Windows has handed that pid to another process it would terminate that
+/// process's children. This sweep kills exactly what `tree_survivors`
+/// reports, after its boot-time and pid-holder guards. Best-effort and
+/// infallible, like `kill_pid`'s own descendant sweep; the caller re-probes.
+pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
+    for pid in tree_survivors(id) {
+        terminate_quiet(pid);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +725,44 @@ mod tests {
             "control: the orphan IS a survivor of the real, post-boot record"
         );
         kill_pid(&root).expect("sweep orphans");
+    }
+
+    /// #319 Fix 2: `stop`'s re-sweep for a launcher that is already gone
+    /// reaps the orphaned, still-running worker of the real record.
+    #[test]
+    fn sweep_tree_survivors_reaps_an_orphaned_worker() {
+        let (root, worker) = launcher_with_worker("sweep-orphan");
+        terminate_root_only(root.pid);
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_alive(&root)),
+            "the launcher must be gone"
+        );
+        assert!(tree_survivors(&root).contains(&worker), "precondition");
+
+        sweep_tree_survivors(&root).expect("sweep");
+        assert!(
+            wait_until(Duration::from_secs(5), || tree_survivors(&root).is_empty()),
+            "the re-sweep must reap the orphaned worker"
+        );
+    }
+
+    /// #319 Fix 2, the reason the re-sweep is not `kill_pid`: when the
+    /// recorded launcher pid now belongs to a DIFFERENT process, the re-sweep
+    /// must not terminate that process's children (`kill_pid`'s PPID-number
+    /// sweep would).
+    #[test]
+    fn sweep_tree_survivors_spares_the_children_of_a_process_that_reused_the_launcher_pid() {
+        let (holder, worker) = launcher_with_worker("sweep-reused");
+        let recorded = PidIdentity {
+            pid: holder.pid,
+            starttime: holder.starttime - 1,
+        };
+        sweep_tree_survivors(&recorded).expect("sweep");
+        assert!(pid_alive(&holder), "the new pid holder itself is untouched");
+        assert!(
+            tree_survivors(&holder).contains(&worker),
+            "the new holder's child {worker} must still be running"
+        );
+        kill_pid(&holder).expect("cleanup");
     }
 }
