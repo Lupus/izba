@@ -35,7 +35,7 @@ six days later, unelevated, from WSL over `powershell.exe` interop:
 | Fact | Value (2026-10-08) |
 | --- | --- |
 | pid / image | 30620, `…\Temp\izba249-stage\bin\libexec\openvmm.exe vm` |
-| parent | 29588 (the launcher izba recorded; gone) |
+| parent | 29588 — the launcher izba recorded. Its process OBJECT is still there too: exited 2026-10-02 00:38:38 with code 1 (the `TerminateProcess` code), signaled, holding nothing; its pid stays reserved because the worker holds a handle to its parent, so `OpenProcess` still succeeds and `GetProcessTimes` still reports its real creation time (`134353605823541370`, 00:36:22.354), while CIM and `tasklist` no longer list it |
 | created | 2026-10-02 00:36:22; `HasExited=True`, `ExitCode`/`ExitTime` unreadable |
 | threads | exactly one (tid 29052), `ThreadState=5` (Wait), `WaitReason=Executive`, 1 min 22 s CPU in total, started with the process |
 | handles | 255 open |
@@ -136,7 +136,9 @@ wait then expired and the kill path in finding 2 took over.
   that `TerminateProcess` cannot interrupt; izba cannot fix it and must detect
   it. #319 makes `stop`/`rm` refuse while any process of the VMM tree is not
   yet signaled, keeps `state.json`, and shows `degraded (vmm process <pid>
-  terminated but not torn down, disks still held)`.
+  outlived its launcher and still holds the disks)`; when the launcher is gone
+  but a worker is still running, `stop` re-sweeps the guarded tree before it
+  decides.
 - The guest power-off failure is a separate, guest-side defect around a vhci
   device at shutdown after traffic — follow-up filed.
 - Nothing here changes a normal stop: the new check is one Toolhelp snapshot
@@ -158,19 +160,26 @@ process whenever one exists.
    with `IZBA_EXE`, `IZBA_DATA_DIR` and `IZBA_SANDBOX` set. It lists every
    `openvmm.exe` with its exited/thread/handle state, probes `rw.img` for an
    exclusive lock, and then asserts the #319 contract through the CLI:
-   `izba status` says `degraded (… not torn down, disks still held)`, `izba
+   `izba status` says `degraded (vmm process <pid> outlived its launcher and
+   still holds the disks)`, `izba
    stop` exits non-zero naming the pid, `state.json` is still there, `izba rm
    --force` exits non-zero with the same explanation.
+   If the stuck sandbox's `state.json` is gone (an older build removed it),
+   re-create it with the launcher's REAL creation time: while the worker
+   holds a handle to its parent, `OpenProcess(<launcher pid>)` still works
+   and `GetProcessTimes` returns it — a forged value reads as a recycled pid
+   and the sandbox as stopped (see Run 2 below).
 3. Validation of the fix on the 2026-10-02 survivor itself is recorded in
    [Validation on the 2026-10-02 survivor](#validation-on-the-2026-10-02-survivor)
    below.
 
 ## Validation on the 2026-10-02 survivor
 
-Run on 2026-10-08 at 19:43 against the real stuck worker (pid 30620, still
-present, still one thread in `Wait:Executive`, 255 handles), with `izba.exe`
-cross-built from this branch (`izba 0.1.0 (fa9b93f)`) dropped into a copy of
-the spike's installer-shaped stage, and the data root `%TEMP%\i249m`.
+Run on 2026-10-08 against the real stuck worker (pid 30620 — still present,
+still one thread in `Wait:Executive`, 255 handles), with `izba.exe`
+cross-built from this branch and dropped into a copy of the spike's
+installer-shaped stage, against the data root `%TEMP%\i249m`. Three runs,
+and the two that did not pass taught something each.
 
 **What had to be reconstructed first.** At 18:46:55 that day — after the
 evidence above was read, and not by this work — everything deletable under
@@ -179,64 +188,85 @@ removed (the pattern fits a cleanup of the spike's leftovers; `izba249-stage`,
 named differently, survived). The worker kept every handle: `rw.img`,
 `rootfs.erofs` and the `oci`/`ssh`/`trust` share dirs now show up in its
 handle table as `C:\$Extend\$Deleted\…` entries (NTFS's name for a file
-unlinked while open), `vmm.log` kept its name. So the sandbox dir had only
-`logs/vmm.log` left; `config.json` was restored from a copy taken at 18:39 and
-`state.json` — which the old build had deleted on 2026-10-02 — was re-created
-as the plan prescribes, naming the dead launcher with `starttime: 0` (the
-check only needs `pid_alive` to be false and the PPID walk):
+unlinked while open); `vmm.log` kept its name. So the sandbox dir had only
+`logs/vmm.log` left; `config.json` was restored from a copy taken at 18:39,
+and `state.json` — which the old build had deleted on 2026-10-02 — was
+re-created. The detection looks only at the process tree, so the emptied
+directory changes nothing about what is validated, except that the script's
+`rw.img` sharing probe now reports `False` (no path to open; the worker holds
+the unlinked inode).
+
+**Run 1 (binary `fa9b93f`, before the final-review fixes), `starttime: 0`:**
+11/11 PASS. It proved the detection, not its discrimination: a zero start
+time disables every creation-time comparison.
+
+**Run 2 (binary `fff0e1f`, with the recycled-pid guards), `starttime` forged
+to 1.5 s before the worker's creation: 9 FAIL** — `status: stopped`, `stop`
+exited 0 and deleted `state.json`. Four more forged values (boot + 1 tick, the
+worker's own creation time, zero) all read `stopped` too. The cause is in
+finding 1's table: the launcher's process object still exists, so
+`OpenProcess(29588)` succeeds and reports a creation time that differs from
+the forged one — exactly the signature of a stranger holding a recycled pid,
+and the pid-holder guard correctly dropped everything created after it.
+(Separately, `OpenProcess(4)` fails with `ERROR_ACCESS_DENIED` for an
+unprivileged caller on this host, so the boot guard was disabled, as
+designed — it never fired in any run.) The lesson for the recipe below: a
+reconstructed `state.json` must carry the launcher's REAL creation time;
+anything else is, to the guards, a different process.
+
+**Run 3 (binary `fff0e1f`), `starttime` = the launcher's real creation time
+read from its still-reserved process object:**
 
 ```json
-{ "vmm_pid": { "pid": 29588, "starttime": 0 }, "sidecar_pids": [],
+{ "vmm_pid": { "pid": 29588, "starttime": 134353605823541370 }, "sidecar_pids": [],
   "started_unix_ms": 1790886982000, "usb_kernel": true, "vnc": false }
 ```
 
-The detection does not look at the files at all — only at the process tree —
-so the emptied directory changes nothing about what is being validated, except
-that the script's `rw.img` sharing probe now reports `False` (there is no
-`rw.img` path to open; the worker holds the unlinked inode).
-
-**Result** (`hack/spike/stuck-vmm-teardown-check.ps1`, trimmed to the
-census, the three CLI results and the verdict; `izbad` was auto-started by
-the first call and adopted the sandbox from disk):
-
 ```
-[19:43:55.854] openvmm.exe processes on the host:
-[19:43:56.102]   pid=30620 ppid=29588 exited=n/a threads=1 handles=255 working_set_mb=3330
-[19:43:56.106] rw.img exclusively held by another process: False
-[19:44:03.154] izba status: rc=0
-  status:      degraded (vmm process 30620 terminated but not torn down, disks still held)
-[19:44:03.164] PASS  status does not report a clean stop (no bare "stopped" line)
-[19:44:03.165] PASS  status reports the stuck teardown (degraded ... not torn down, disks still held)
-[19:44:03.446] izba stop: rc=1
-  izba: error: sandbox 'p249h': VMM process 30620 has been terminated but has not
-  finished exiting and still holds the sandbox's disks (rw.img, volumes); state
-  preserved so the sandbox cannot be double-booted, and `izba status p249h` reports
-  it degraded. Retry `izba stop p249h` once pid 30620 has left the process list; a
-  process stuck in kernel-side teardown is released only by a host reboot.
-[19:44:03.448] PASS  stop exits non-zero
-[19:44:03.449] PASS  stop names a pid and says the disks are still held
-[19:44:03.449] PASS  stop says what to do (retry / host reboot)
-[19:44:03.451] PASS  state.json is preserved after the refused stop
-[19:44:03.648] izba rm --force: rc=1
-  izba: error: sandbox 'p249h': VMM process 30620 has been terminated … (same text)
-[19:44:03.649] PASS  rm --force exits non-zero
-[19:44:03.649] PASS  rm --force gives the same explanation, not a raw Access is denied
-[19:44:03.652] PASS  sandbox dir still exists after the refused rm
-[19:44:03.652] VERDICT: izba reports the stuck teardown honestly on every surface
+[20:54:42.127] openvmm.exe processes on the host:
+[20:54:42.382]   pid=30620 ppid=29588 exited=n/a threads=1 handles=255 working_set_mb=3330
+[20:54:42.385] rw.img exclusively held by another process: False
+[20:54:42.851] izba status: rc=0
+  status:      degraded (vmm process 30620 outlived its launcher and still holds the disks)
+[20:54:42.858] PASS  status does not report a clean stop (no bare "stopped" line)
+[20:54:42.859] PASS  status reports the stuck teardown (degraded ... outlived its launcher and still holds the disks)
+[20:54:55.081] izba stop: rc=1
+  izba: error: sandbox 'p249h': VMM process 30620 from its last run is still present and
+  holds the sandbox's disks (rw.img, volumes), so the sandbox is not cleanly stopped;
+  state preserved so it cannot be double-booted, and `izba status p249h` reports it
+  degraded. Run `izba stop p249h` again to make it exit; if it stays in the process
+  list after that, it is stuck in kernel-side teardown, which only a host reboot releases.
+[20:54:55.083] PASS  stop exits non-zero
+[20:54:55.084] PASS  stop names a pid and says the disks are still held
+[20:54:55.085] PASS  stop says what to do (run stop again / host reboot)
+[20:54:55.088] PASS  state.json is preserved after the refused stop
+[20:55:07.368] izba rm --force: rc=1
+  izba: error: sandbox 'p249h': VMM process 30620 from its last run is still present … (same text)
+[20:55:07.369] PASS  rm --force exits non-zero
+[20:55:07.369] PASS  rm --force gives the same explanation, not a raw Access is denied
+[20:55:07.372] PASS  sandbox dir still exists after the refused rm
+[20:55:07.372] VERDICT: izba reports the stuck teardown honestly on every surface
 ```
 
-Eleven of eleven checks pass; `state.json` was still present afterwards and the
-daemon's adoption sweep did not reap it. (The `exited=n/a` in the census is
+Eleven of eleven checks pass; `state.json` was still present afterwards and
+the daemon's adoption sweep did not reap it. `stop` and `rm --force` each
+took about 12 s: with the launcher gone, `stop` first re-sweeps the guarded
+tree (a `TerminateProcess` on the stuck worker, which cannot take effect, plus
+the bounded 10 s wait for it to die) and polls the tree for 2 s before it
+refuses — the price of making an orphaned but still-RUNNING worker
+recoverable through the same path. (The `exited=n/a` in the census is
 cosmetic: under `pwsh` 7, `Get-Process -Id` does not return the exited-but-
 present process, so the script falls back; the CIM row still shows it.)
 
 **One thing observed on the way, outside #319.** The outer shell that ran the
-check never got end-of-file on its stdout pipe until `izba daemon stop` was
-issued for that data root: the `izba daemon run` the first CLI call
-auto-spawned had inherited the pipe, and a daemon supervising a degraded
-sandbox never idle-exits. The moment the daemon stopped, the pipe drained.
-`izba <anything> | <consumer>` on Windows therefore hangs the consumer for as
-long as an auto-started daemon lives — filed as [#326](https://github.com/Lupus/izba/issues/326).
+check never got end-of-file on its stdout until `izba daemon stop` was issued
+for that data root: the `izba daemon run` the first CLI call auto-spawned had
+inherited the pipe, and a daemon supervising a degraded sandbox never
+idle-exits. The moment the daemon stopped, the pipe drained — every run,
+including with stdout redirected to a file (WSL interop still relays through
+a pipe). `izba <anything> | <consumer>` on Windows therefore blocks the
+consumer for as long as an auto-started daemon lives — filed as
+[#326](https://github.com/Lupus/izba/issues/326).
 
 ## Limits
 
