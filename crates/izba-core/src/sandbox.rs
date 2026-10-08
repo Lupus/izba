@@ -4620,7 +4620,7 @@ mod tests {
     }
 
     /// `RealProbes::tree_survivors` reports the real primitive's answer: the
-    /// recorded process while it lives, nothing once it is gone.
+    /// recorded process while it lives, and not once it is gone.
     #[test]
     fn real_probes_tree_survivors_reports_the_recorded_process_while_it_lives() {
         let (dir, paths) = test_paths();
@@ -4631,10 +4631,13 @@ mod tests {
             paths: &paths,
             name: "web",
         };
-        assert_eq!(probes.tree_survivors(&sleep_id), vec![sleep_id.pid]);
+        // `contains`, not equality: on Windows a CREATE_NO_WINDOW console
+        // client gets a hidden `conhost.exe` child that shows up as a
+        // descendant of the recorded process (and drains asynchronously).
+        assert!(probes.tree_survivors(&sleep_id).contains(&sleep_id.pid));
         procmgr::kill_pid(&sleep_id).unwrap();
         assert!(wait_dead(&sleep_id));
-        assert!(probes.tree_survivors(&sleep_id).is_empty());
+        assert!(!probes.tree_survivors(&sleep_id).contains(&sleep_id.pid));
     }
 
     /// With no survivor the dead-launcher path is the ordinary clean stop:
