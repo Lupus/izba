@@ -24,7 +24,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::proc_starttime;
 #[cfg(unix)]
-pub use unix::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
+pub use unix::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits, tree_survivors};
 
 #[cfg(windows)]
 mod jail_windows;
@@ -39,7 +39,9 @@ mod windows;
 #[cfg(windows)]
 pub use windows::proc_starttime;
 #[cfg(windows)]
-pub use windows::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
+pub use windows::{
+    kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits, tree_survivors,
+};
 
 /// Unix fallback so call sites can use `spawn_confined` uniformly: the Linux
 /// jailer is a separate work item, so this is a plain detached spawn (the VMM

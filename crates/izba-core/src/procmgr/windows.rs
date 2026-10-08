@@ -17,10 +17,20 @@
 //! live descendant of the target, validated by creation time so a recycled
 //! PID is never killed by mistake.
 //!
-//! Aliveness: a process that exited but still has open handles keeps its PID
-//! reserved (the zombie analog) — `GetExitCodeProcess` reports its exit code,
-//! so the `STILL_ACTIVE` check treats it as dead, mirroring the Unix `Z`
-//! state handling.
+//! Aliveness vs teardown (#319): `pid_alive` asks `GetExitCodeProcess` — a
+//! process that exited but whose pid is still reserved by someone's open
+//! handle (the zombie analog) reads as dead, mirroring the Unix `Z` state.
+//! That is the right answer for "is the guest still running", and the WRONG
+//! one for "may I reuse its disks": `TerminateProcess` sets the exit code at
+//! once, while the kernel-side teardown that closes the handle table (disk
+//! images, the vsock sockets, the `\Device\VidExo` WHP partition) runs
+//! afterwards and can hang — observed as a worker with one thread left in a
+//! kernel `Wait:Executive`, all handles open, hours later. The process
+//! OBJECT is signaled only when teardown completes, so `tree_survivors` uses
+//! `WaitForSingleObject(h, 0)`, never the exit code, and covers the WORKER
+//! children too — `openvmm.exe` runs the VM in an `openvmm vm` child, and a
+//! stop that verified only the recorded launcher once reported success while
+//! the worker still held `rw.img`.
 
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
@@ -32,6 +42,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use windows_sys::Win32::Foundation::{
     CloseHandle, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
@@ -250,6 +261,8 @@ fn is_live_descendant(pid: u32, root_starttime: u64) -> bool {
 /// lingers until kernel-side teardown finishes. Callers like `stop` rename
 /// or reuse those resources right after kill, so kill must wait for the
 /// handle to signal, not just for the exit code to flip.
+/// The wait result is deliberately NOT the verdict: `stop` asks
+/// [`tree_survivors`] afterwards, which covers the worker children too.
 const TERMINATION_WAIT_MS: u32 = 10_000;
 
 /// Best-effort terminate + wait-for-full-death on a bare pid (used for the
@@ -314,4 +327,203 @@ pub fn kill_pid(id: &PidIdentity) -> anyhow::Result<()> {
         terminate_quiet(pid);
     }
     root_result
+}
+
+/// Open `pid` for liveness queries AND synchronization (needed to ask whether
+/// the process object is signaled).
+fn open_sync_query(pid: u32) -> Option<OwnedHandle> {
+    // SAFETY: plain FFI call; null means no such process or no access.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        None
+    } else {
+        Some(OwnedHandle(h))
+    }
+}
+
+/// True iff the process object is signaled, i.e. kernel-side teardown has
+/// completed and every handle the process held is closed. A terminated
+/// process whose teardown is stuck already carries an exit code but is NOT
+/// signaled — that is the whole point of asking this instead of
+/// `GetExitCodeProcess`.
+fn is_signaled(h: HANDLE) -> bool {
+    // SAFETY: valid handle opened with SYNCHRONIZE; a zero timeout never blocks.
+    unsafe { WaitForSingleObject(h, 0) == WAIT_OBJECT_0 }
+}
+
+/// Pids of the VMM process tree rooted at `id` — the recorded root (only
+/// while its creation time still matches, defeating pid reuse) and every
+/// descendant per [`descendants_of`] — whose process object is NOT yet
+/// signaled: still running, or terminated but stuck in teardown with its
+/// handles (disk images, sockets, the WHP partition) still held (#319).
+///
+/// An exited process whose pid is merely reserved (someone holds a handle)
+/// is signaled and therefore not a survivor. A process this user cannot open
+/// reads as gone — the same blind spot [`pid_alive`] has. The descendant walk
+/// inherits `descendants_of`'s caveat: a recycled launcher pid whose new
+/// owner has children created after the recorded start time would be
+/// reported too — a loud, retry-able refusal, never a silent success.
+///
+/// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
+/// process of the tree; no sleeps.
+pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Some(h) = open_sync_query(id.pid) {
+        if creation_time(h.0) == Some(id.starttime) && !is_signaled(h.0) {
+            out.push(id.pid);
+        }
+    }
+    for pid in descendants_of(id.pid, id.starttime) {
+        if let Some(h) = open_sync_query(pid) {
+            if !is_signaled(h.0) {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn log_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("izba-{tag}-{}.log", std::process::id()))
+    }
+
+    /// Poll `pred` for up to `timeout`; true if it held before the deadline.
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// `TerminateProcess` on ONE pid with no descendant sweep (unlike
+    /// `kill_pid`), so a test can orphan a worker on purpose.
+    fn terminate_root_only(pid: u32) {
+        // SAFETY: plain FFI; handle closed by OwnedHandle.
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+        assert!(!h.is_null(), "OpenProcess({pid}) for terminate");
+        let h = OwnedHandle(h);
+        // SAFETY: valid handle with PROCESS_TERMINATE | SYNCHRONIZE access.
+        unsafe {
+            TerminateProcess(h.0, 1);
+            WaitForSingleObject(h.0, TERMINATION_WAIT_MS);
+        }
+    }
+
+    /// #319: a running root is a survivor; after `kill_pid` waits out its
+    /// teardown the tree is empty. (`sleep` is Git for Windows' sleep.exe,
+    /// present on windows-latest — the same binary `testutil::spawn_sleep`
+    /// relies on.)
+    #[test]
+    fn tree_survivors_lists_a_running_root_and_is_empty_after_it_fully_exits() {
+        let id = spawn_detached(
+            &CommandSpec {
+                argv: vec!["sleep".into(), "30".into()],
+            },
+            &log_path("tree-root"),
+        )
+        .expect("spawn sleep");
+        assert_eq!(tree_survivors(&id), vec![id.pid]);
+
+        kill_pid(&id).expect("kill");
+        assert!(
+            wait_until(Duration::from_secs(5), || tree_survivors(&id).is_empty()),
+            "a terminated sleep must finish teardown and leave the tree"
+        );
+    }
+
+    /// #319, the distinction the whole fix rests on: `GetExitCodeProcess` is
+    /// NOT the criterion. Here the process has exited AND its pid is still
+    /// reserved (our `Child` handle keeps the object alive — the "zombie
+    /// analog" the module docs describe), so `open_query` still succeeds,
+    /// yet the object IS signaled: not a survivor. If this ever reads as a
+    /// survivor, every Windows stop would fail.
+    #[test]
+    fn tree_survivors_ignores_an_exited_process_whose_pid_our_handle_keeps_reserved() {
+        let mut child = Command::new("C:\\Windows\\System32\\cmd.exe")
+            .args(["/c", "exit", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        let starttime = creation_time(child.as_raw_handle() as HANDLE).expect("creation time");
+        child.wait().expect("wait"); // exited; `child` still holds the handle
+        let id = PidIdentity { pid, starttime };
+
+        assert!(
+            open_query(pid).is_some(),
+            "precondition: the pid is still reserved while we hold a handle"
+        );
+        assert!(!pid_alive(&id), "an exited process is not alive");
+        assert!(
+            tree_survivors(&id).is_empty(),
+            "an exited, signaled process is not a survivor even though its pid is reserved"
+        );
+        drop(child);
+    }
+
+    /// #319: the observed shape — the recorded launcher is gone but a worker
+    /// child it spawned is still there. `cmd.exe /c sleep 30` is the
+    /// launcher, `sleep` its worker; terminating ONLY cmd orphans sleep,
+    /// whose PPID keeps naming the dead launcher. The tree must report the
+    /// worker and not the launcher; `kill_pid`'s sweep then reaps it.
+    #[test]
+    fn tree_survivors_reports_an_orphaned_worker_after_its_launcher_is_gone() {
+        let root = spawn_detached(
+            &CommandSpec {
+                argv: vec![
+                    "C:\\Windows\\System32\\cmd.exe".into(),
+                    "/c".into(),
+                    "sleep 30".into(),
+                ],
+            },
+            &log_path("tree-launcher"),
+        )
+        .expect("spawn cmd");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !descendants_of(root.pid, root.starttime).is_empty()
+            }),
+            "cmd must have spawned its sleep worker"
+        );
+        let workers = descendants_of(root.pid, root.starttime);
+
+        terminate_root_only(root.pid);
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_alive(&root)),
+            "the launcher must be gone"
+        );
+
+        let survivors = tree_survivors(&root);
+        assert!(
+            !survivors.contains(&root.pid),
+            "the torn-down launcher is not a survivor: {survivors:?}"
+        );
+        for w in &workers {
+            assert!(
+                survivors.contains(w),
+                "orphaned worker {w} must be reported; got {survivors:?}"
+            );
+        }
+
+        kill_pid(&root).expect("sweep orphans");
+        assert!(
+            wait_until(Duration::from_secs(5), || tree_survivors(&root).is_empty()),
+            "the sweep must reap the orphaned worker"
+        );
+    }
 }
