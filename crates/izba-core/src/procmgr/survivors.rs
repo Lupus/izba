@@ -32,7 +32,7 @@ pub(crate) struct Candidate {
 ///   after boot, launchers started within Δ of boot read as pre-boot and their
 ///   survivors are dropped — the unsafe direction. The robust form (recording
 ///   the boot identity in `state.json` at start and comparing by equality) is
-///   tracked as a follow-up issue.
+///   tracked as #327.
 /// - (b) **Pid-holder guard** — `pid_holder_created` is `Some(t)` when a
 ///   DIFFERENT process (creation time `t`) now holds the launcher's pid. Our
 ///   workers were created while our launcher was alive, i.e. before it died

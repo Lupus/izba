@@ -368,7 +368,7 @@ const SYSTEM_PID: u32 = 4;
 /// boot, launchers started within Δ of boot read as pre-boot and their
 /// survivors are dropped — the unsafe direction (a live tree reported as
 /// stopped). The robust form (recording the boot identity in `state.json` at
-/// start and comparing by equality) is tracked as a follow-up issue.
+/// start and comparing by equality) is tracked as #327.
 fn boot_time() -> Option<u64> {
     open_query(SYSTEM_PID).and_then(|h| creation_time(h.0))
 }
