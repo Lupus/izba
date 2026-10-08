@@ -1768,14 +1768,19 @@ fn stop_locked_with(
     cleanup_runtime(paths, name)
 }
 
-/// Poll `done` every `step` until it holds or `budget` has elapsed in steps
-/// (`budget / step` polls, sleeping `step` after each one that is false).
-/// Counted rather than deadline-based so there is no `Instant` comparison to
-/// mutate into an equivalent (`<` vs `<=`) — the stop path is mutation-gated.
+/// Poll `done` every `step` until it holds or `budget` has elapsed (wall clock,
+/// so time spent inside `done` counts). The deadline test is
+/// `saturating_duration_since(..).is_zero()` rather than `<`/`<=`: the stop
+/// path is mutation-gated, and an `Instant` comparison has an equivalent
+/// mutant (`<` vs `<=`) that nothing can kill, while a counted loop's
+/// `/`->`*` mutant hangs the test run for minutes.
 fn poll_until(budget: Duration, step: Duration, mut done: impl FnMut() -> bool) {
-    let steps = budget.as_millis() / step.as_millis().max(1);
-    for _ in 0..steps {
+    let deadline = Instant::now() + budget;
+    loop {
         if done() {
+            return;
+        }
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return;
         }
         std::thread::sleep(step);
@@ -4586,20 +4591,32 @@ mod tests {
         );
     }
 
-    /// A `done` that never holds is polled exactly `budget / step` times —
-    /// the budget is spent in steps, neither skipped nor overrun.
+    /// A `done` that never holds is polled until the wall-clock budget is
+    /// spent: neither abandoned early nor overrun. Deliberately no exact call
+    /// count — the number of polls depends on how long each one takes.
     #[test]
-    fn poll_until_polls_budget_over_step_times_when_never_done() {
+    fn poll_until_gives_up_after_the_wall_clock_budget_when_never_done() {
         let calls = std::cell::Cell::new(0u32);
-        poll_until(
-            Duration::from_millis(100),
-            Duration::from_millis(10),
-            || {
-                calls.set(calls.get() + 1);
-                false
-            },
+        let budget = Duration::from_millis(100);
+        let t0 = Instant::now();
+        poll_until(budget, Duration::from_millis(10), || {
+            calls.set(calls.get() + 1);
+            false
+        });
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= budget,
+            "gave up before the budget elapsed: {elapsed:?}"
         );
-        assert_eq!(calls.get(), 10);
+        assert!(
+            elapsed < budget + Duration::from_millis(500),
+            "overran the budget: {elapsed:?}"
+        );
+        assert!(
+            calls.get() >= 2,
+            "must keep polling across the budget, polled {} times",
+            calls.get()
+        );
     }
 
     /// Fix 2's REAL seam: `RealProbes` relies on the trait default for the
