@@ -393,10 +393,21 @@ fn boot_time() -> Option<u64> {
 /// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
 /// process of the tree, plus two `OpenProcess` calls for the guards; no sleeps.
 pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
+    tree_survivor_identities(id)
+        .into_iter()
+        .map(|s| s.pid)
+        .collect()
+}
+
+/// [`tree_survivors`] with each survivor's creation time kept alongside its
+/// pid — the identity [`sweep_tree_survivors`] re-verifies on the very handle
+/// it terminates through, so a pid Windows recycled between this enumeration
+/// and the kill is never terminated.
+fn tree_survivor_identities(id: &PidIdentity) -> Vec<PidIdentity> {
     let mut out = Vec::new();
     if let Some(h) = open_sync_query(id.pid) {
         if creation_time(h.0) == Some(id.starttime) && !is_signaled(h.0) {
-            out.push(id.pid);
+            out.push(id.clone());
         }
     }
     // A different process now holding the root pid: its creation time, read
@@ -417,13 +428,52 @@ pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
             Some(Candidate { pid, created })
         })
         .collect();
-    out.extend(filter_tree_survivors(
-        id.starttime,
-        boot_time(),
-        pid_holder_created,
-        &candidates,
-    ));
+    let kept = filter_tree_survivors(id.starttime, boot_time(), pid_holder_created, &candidates);
+    // `descendants_of` never yields a pid twice, so mapping the kept pids back
+    // onto their candidates recovers each survivor's creation time exactly.
+    out.extend(
+        candidates
+            .iter()
+            .filter(|c| kept.contains(&c.pid))
+            .map(|c| PidIdentity {
+                pid: c.pid,
+                starttime: c.created,
+            }),
+    );
     out
+}
+
+/// Terminate `target` only if the process holding its pid is still the one
+/// with its recorded creation time, then wait (bounded) for full death.
+///
+/// The identity check and the kill go through the SAME handle: an open handle
+/// pins the process object, so once its creation time matches, the
+/// `TerminateProcess` on that handle cannot reach a process that later reuses
+/// the pid. A mismatch means a different process now holds the pid — left
+/// alone. Best-effort, like [`terminate_quiet`].
+fn terminate_identity(target: &PidIdentity) {
+    // SAFETY: plain FFI call; a null return (gone, or no access) is handled
+    // below and the non-null handle is closed exactly once by OwnedHandle.
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            target.pid,
+        )
+    };
+    if h.is_null() {
+        return;
+    }
+    let h = OwnedHandle(h);
+    if creation_time(h.0) != Some(target.starttime) {
+        return;
+    }
+    // SAFETY: valid handle opened with PROCESS_TERMINATE | SYNCHRONIZE, and
+    // it pins the very process whose creation time was just verified.
+    unsafe {
+        TerminateProcess(h.0, 1);
+        WaitForSingleObject(h.0, TERMINATION_WAIT_MS);
+    }
 }
 
 /// Terminate every process [`tree_survivors`] reports for `id`, waiting for
@@ -435,11 +485,14 @@ pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
 /// PPIDs by the launcher's pid NUMBER with only the creation-time floor, so
 /// if Windows has handed that pid to another process it would terminate that
 /// process's children. This sweep kills exactly what `tree_survivors`
-/// reports, after its boot-time and pid-holder guards. Best-effort and
-/// infallible, like `kill_pid`'s own descendant sweep; the caller re-probes.
+/// reports, after its boot-time and pid-holder guards — and carries each
+/// survivor's IDENTITY, not its bare pid, to [`terminate_identity`]: the
+/// bounded wait on one survivor can take seconds, long enough for a later
+/// survivor to exit and its pid to be reused. Best-effort and infallible,
+/// like `kill_pid`'s own descendant sweep; the caller re-probes.
 pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
-    for pid in tree_survivors(id) {
-        terminate_quiet(pid);
+    for target in tree_survivor_identities(id) {
+        terminate_identity(&target);
     }
     Ok(())
 }
@@ -665,11 +718,19 @@ mod tests {
         (root, worker)
     }
 
-    /// Guard (a) is only as good as its input: the boot time must actually be
-    /// readable by the test user, and no process can predate it.
+    /// Guard (a) is only as good as its input: where the boot time is
+    /// readable, no process can predate it. Opening pid 4 is NOT guaranteed
+    /// for an unprivileged user (the spike recorded it failing), and
+    /// production then disables the guard by design — so an unreadable boot
+    /// time is a runtime skip here, not a failure.
     #[test]
     fn boot_time_is_readable_and_precedes_this_process() {
-        let boot = boot_time().expect("System (pid 4) creation time must be readable");
+        let Some(boot) = boot_time() else {
+            eprintln!(
+                "skipped: pid 4 not openable by this user — boot guard disabled here by design"
+            );
+            return;
+        };
         let me = proc_starttime(std::process::id()).expect("own creation time");
         assert!(
             boot <= me,
@@ -710,6 +771,12 @@ mod tests {
     /// boot has no surviving tree, whatever now claims its pid number as a
     /// parent. Modelled with a real orphaned worker whose launcher is gone,
     /// recorded with a pre-boot start time.
+    ///
+    /// Both branches below are the contract: where the boot time is readable
+    /// the pre-boot record reports nothing; where it is not (pid 4 not
+    /// openable by this user) the guard is disabled by design and the
+    /// orphaned worker MUST still be reported — over-reporting is the safe
+    /// direction (see `filter_tree_survivors`).
     #[test]
     fn tree_survivors_ignores_a_tree_recorded_before_the_current_boot() {
         let (root, worker) = launcher_with_worker("tree-preboot");
@@ -723,10 +790,17 @@ mod tests {
             starttime: 1,
         };
         let survivors = tree_survivors(&pre_boot);
-        assert!(
-            survivors.is_empty(),
-            "a pre-boot record has no surviving tree: {survivors:?}"
-        );
+        match boot_time() {
+            Some(_) => assert!(
+                survivors.is_empty(),
+                "a pre-boot record has no surviving tree: {survivors:?}"
+            ),
+            None => assert!(
+                survivors.contains(&worker),
+                "boot guard disabled (pid 4 unreadable): the orphaned worker {worker} \
+                 must still be reported; got {survivors:?}"
+            ),
+        }
         assert!(
             tree_survivors(&root).contains(&worker),
             "control: the orphan IS a survivor of the real, post-boot record"

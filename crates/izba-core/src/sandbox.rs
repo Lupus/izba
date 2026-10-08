@@ -1236,19 +1236,24 @@ pub fn start_with_timeouts(
     }
 
     let conn = default_connector();
+    let probes = RealProbes {
+        connector: &conn,
+        paths,
+        name,
+    };
     // #319: a dead launcher whose VMM tree still holds the disks is not
     // "already running" — reporting that would be a false success (`izba
     // run` would then exec into nothing). Refuse with the disks-held error.
-    refuse_if_teardown_stuck(
-        paths,
-        name,
-        &RealProbes {
-            connector: &conn,
-            paths,
-            name,
-        },
-    )?;
-    if liveness_of(paths, name, &conn)? != Liveness::Stopped {
+    //
+    // Order matters: liveness FIRST, the stuck-teardown check SECOND. The
+    // check re-reads state.json and the process tree AFTER the liveness read,
+    // so a launcher that dies between the two (leaving its worker behind) is
+    // caught by the check instead of being answered `AlreadyRunning` from a
+    // stale `Degraded` read — the reverse order had exactly that
+    // check-then-act window. A sandbox that is genuinely running passes the
+    // check (its launcher is alive) and still gets `AlreadyRunning`.
+    if liveness_of_with(paths, name, &probes)? != Liveness::Stopped {
+        refuse_if_teardown_stuck(paths, name, &probes)?;
         return Err(AlreadyRunning {
             name: name.to_string(),
         }
@@ -2003,18 +2008,19 @@ fn remove_with(
 }
 
 /// Context for a failed tombstone rename. On Windows, `PermissionDenied` on a
-/// directory rename is the OS saying "a file inside is open in some process"
+/// directory rename most often means "a file inside is open in some process"
 /// — the one case `stop`'s survivor gate could not see (no state.json, or a
-/// holder outside the VMM tree) — so point the user at the cause and at
-/// `izba status`. On Unix the same kind means EACCES/EPERM (a parent
+/// holder outside the VMM tree) — so point the user at that cause and at
+/// `izba status`, while naming the other one (this account lacks the right to
+/// rename the directory) rather than asserting the first. On Unix the same kind means EACCES/EPERM (a parent
 /// directory's permissions or sticky bit), never an open file, so Unix — and
 /// every other kind — keeps the plain context.
 fn rename_for_removal_error(dir: &Path, name: &str, e: std::io::Error) -> anyhow::Error {
     if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied {
         anyhow::Error::new(e).context(format!(
             "renaming {} for removal: a file inside it is still open in some process \
-             (a VMM that has not finished exiting? check `izba status {name}` and the \
-             process list)",
+             (a VMM that has not finished exiting? check `izba status {name}`), or this \
+             account may not rename it",
             dir.display()
         ))
     } else {
