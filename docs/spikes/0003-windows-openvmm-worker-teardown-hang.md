@@ -236,7 +236,7 @@ issued for that data root: the `izba daemon run` the first CLI call
 auto-spawned had inherited the pipe, and a daemon supervising a degraded
 sandbox never idle-exits. The moment the daemon stopped, the pipe drained.
 `izba <anything> | <consumer>` on Windows therefore hangs the consumer for as
-long as an auto-started daemon lives — filed as a separate item.
+long as an auto-started daemon lives — filed as [#326](https://github.com/Lupus/izba/issues/326).
 
 ## Limits
 
@@ -254,7 +254,8 @@ are unaffected.
   OpenVMM: guest fails to power off with a vhci (usbip) device attached or
   mid-detach after sustained traffic — `stop` always escalates to kill*
   (`type:bug`, P3, M), from finding 4.
-- Windows CLI: an auto-spawned `izba daemon run` inherits the caller's stdout
+- [#326](https://github.com/Lupus/izba/issues/326) — Windows CLI: an
+  auto-spawned `izba daemon run` inherits the caller's stdout
   pipe, so a piped `izba` command blocks its consumer until the daemon exits
   (see Validation) — filed separately.
 - [#320](https://github.com/Lupus/izba/issues/320) — OpenVMM does not exit on
