@@ -19,6 +19,12 @@ pub use logon::spawn_confined_as_account;
 // `#[cfg]` split inside the module). cloud-hypervisor itself only runs on Linux.
 pub mod jail_linux;
 
+// The FFI-free half of the Windows `tree_survivors` (#319). Only Windows calls
+// it, but it is compiled into every test build so its guards are exercised on
+// the Linux gates too.
+#[cfg(any(windows, test))]
+mod survivors;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

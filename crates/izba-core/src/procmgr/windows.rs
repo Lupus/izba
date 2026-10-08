@@ -32,6 +32,7 @@
 //! stop that verified only the recorded launcher once reported success while
 //! the worker still held `rw.img`.
 
+use super::survivors::{filter_tree_survivors, Candidate};
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
 use anyhow::Context;
@@ -351,6 +352,20 @@ fn is_signaled(h: HANDLE) -> bool {
     unsafe { WaitForSingleObject(h, 0) == WAIT_OBJECT_0 }
 }
 
+/// Pid of the `System` process, whose creation time is the current boot.
+const SYSTEM_PID: u32 = 4;
+
+/// Creation time of the current boot, read EXACTLY as the `System` process's
+/// creation time — `PROCESS_QUERY_LIMITED_INFORMATION` on pid 4 is granted to
+/// unprivileged users. `None` when it cannot be read; the boot guard is then
+/// disabled rather than estimated (see [`super::survivors::filter_tree_survivors`]).
+/// Caveat: a Fast-Startup shutdown hibernates the kernel session instead of
+/// ending it, so the `System` process (and this time) survives it; a tree
+/// recorded before such a power cycle is then left to the pid-holder guard.
+fn boot_time() -> Option<u64> {
+    open_query(SYSTEM_PID).and_then(|h| creation_time(h.0))
+}
+
 /// Pids of the VMM process tree rooted at `id` — the recorded root (only
 /// while its creation time still matches, defeating pid reuse) and every
 /// descendant per [`descendants_of`] — whose process object is NOT yet
@@ -359,13 +374,17 @@ fn is_signaled(h: HANDLE) -> bool {
 ///
 /// An exited process whose pid is merely reserved (someone holds a handle)
 /// is signaled and therefore not a survivor. A process this user cannot open
-/// reads as gone — the same blind spot [`pid_alive`] has. The descendant walk
-/// inherits `descendants_of`'s caveat: a recycled launcher pid whose new
-/// owner has children created after the recorded start time would be
-/// reported too — a loud, retry-able refusal, never a silent success.
+/// reads as gone — the same blind spot [`pid_alive`] has.
+///
+/// Once the root is dead the PPID walk keys on its pid NUMBER, which Windows
+/// may hand to an unrelated process; the descendants are therefore passed
+/// through [`super::survivors::filter_tree_survivors`] with two guards: a
+/// root created before the current boot ([`boot_time`]) has no surviving
+/// tree, and when a DIFFERENT process now holds the root pid, everything
+/// created at or after that holder is the holder's, not ours.
 ///
 /// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
-/// process of the tree; no sleeps.
+/// process of the tree, plus two `OpenProcess` calls for the guards; no sleeps.
 pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
     let mut out = Vec::new();
     if let Some(h) = open_sync_query(id.pid) {
@@ -373,13 +392,30 @@ pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
             out.push(id.pid);
         }
     }
-    for pid in descendants_of(id.pid, id.starttime) {
-        if let Some(h) = open_sync_query(pid) {
-            if !is_signaled(h.0) {
-                out.push(pid);
+    // A different process now holding the root pid: its creation time, read
+    // with query-only access so a holder we may not synchronize on still
+    // counts.
+    let pid_holder_created = open_query(id.pid)
+        .and_then(|h| creation_time(h.0))
+        .filter(|&t| t != id.starttime);
+    let candidates: Vec<Candidate> = descendants_of(id.pid, id.starttime)
+        .into_iter()
+        .filter_map(|pid| {
+            let h = open_sync_query(pid)?;
+            if is_signaled(h.0) {
+                return None;
             }
-        }
-    }
+            // `descendants_of` already required a readable creation time.
+            let created = creation_time(h.0)?;
+            Some(Candidate { pid, created })
+        })
+        .collect();
+    out.extend(filter_tree_survivors(
+        id.starttime,
+        boot_time(),
+        pid_holder_created,
+        &candidates,
+    ));
     out
 }
 
@@ -579,5 +615,97 @@ mod tests {
             wait_until(Duration::from_secs(5), || tree_survivors(&root).is_empty()),
             "the sweep must reap the orphaned worker"
         );
+    }
+
+    /// Spawn `cmd.exe /c sleep 30` and wait for its `sleep.exe` worker: a
+    /// launcher with one real child, the shape of `openvmm.exe` + its
+    /// `openvmm vm` worker.
+    fn launcher_with_worker(tag: &str) -> (PidIdentity, u32) {
+        let root = spawn_detached(
+            &CommandSpec {
+                argv: vec![
+                    "C:\\Windows\\System32\\cmd.exe".into(),
+                    "/c".into(),
+                    "sleep 30".into(),
+                ],
+            },
+            &log_path(tag),
+        )
+        .expect("spawn cmd");
+        assert!(
+            wait_until(Duration::from_secs(5), || sleep_worker_of(&root).is_some()),
+            "cmd must have spawned its sleep worker"
+        );
+        let worker = sleep_worker_of(&root).expect("sleep worker");
+        (root, worker)
+    }
+
+    /// Guard (a) is only as good as its input: the boot time must actually be
+    /// readable by the test user, and no process can predate it.
+    #[test]
+    fn boot_time_is_readable_and_precedes_this_process() {
+        let boot = boot_time().expect("System (pid 4) creation time must be readable");
+        let me = proc_starttime(std::process::id()).expect("own creation time");
+        assert!(
+            boot <= me,
+            "boot {boot} must not be after this process ({me})"
+        );
+    }
+
+    /// #319 Fix 1 (b): a recorded launcher whose pid now belongs to a DIFFERENT
+    /// process — modelled by forging an identity one tick older than the live
+    /// `cmd.exe` that holds the pid — must not adopt that process's children.
+    /// Before the pid-holder guard, the PPID walk reported the `sleep` child
+    /// (created after the forged start time) as a surviving VMM worker,
+    /// wedging the sandbox.
+    #[test]
+    fn tree_survivors_ignores_the_children_of_a_process_that_reused_the_launcher_pid() {
+        let (holder, worker) = launcher_with_worker("tree-reused");
+        let recorded = PidIdentity {
+            pid: holder.pid,
+            starttime: holder.starttime - 1,
+        };
+        let survivors = tree_survivors(&recorded);
+        assert!(
+            !survivors.contains(&worker),
+            "the new pid holder's child {worker} is not ours: {survivors:?}"
+        );
+        assert!(
+            survivors.is_empty(),
+            "nothing of the new holder's tree is ours: {survivors:?}"
+        );
+        assert!(
+            tree_survivors(&holder).contains(&worker),
+            "control: under its real identity the worker IS a survivor"
+        );
+        kill_pid(&holder).expect("cleanup");
+    }
+
+    /// #319 Fix 1 (a): a record whose launcher started before the current
+    /// boot has no surviving tree, whatever now claims its pid number as a
+    /// parent. Modelled with a real orphaned worker whose launcher is gone,
+    /// recorded with a pre-boot start time.
+    #[test]
+    fn tree_survivors_ignores_a_tree_recorded_before_the_current_boot() {
+        let (root, worker) = launcher_with_worker("tree-preboot");
+        terminate_root_only(root.pid);
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_alive(&root)),
+            "the launcher must be gone"
+        );
+        let pre_boot = PidIdentity {
+            pid: root.pid,
+            starttime: 1,
+        };
+        let survivors = tree_survivors(&pre_boot);
+        assert!(
+            survivors.is_empty(),
+            "a pre-boot record has no surviving tree: {survivors:?}"
+        );
+        assert!(
+            tree_survivors(&root).contains(&worker),
+            "control: the orphan IS a survivor of the real, post-boot record"
+        );
+        kill_pid(&root).expect("sweep orphans");
     }
 }
