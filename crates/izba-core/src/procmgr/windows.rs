@@ -36,6 +36,7 @@ use super::survivors::{filter_tree_survivors, Candidate};
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
 use anyhow::Context;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -46,7 +47,7 @@ use windows_sys::Win32::Foundation::{
     WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
@@ -263,20 +264,22 @@ fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
 /// [`descendants_of`] over an already-taken snapshot, so a caller that also
 /// needs each descendant's image name reads it from the SAME snapshot the
 /// walk used.
+///
+/// Breadth-first, so the order is oldest-ancestor first. `seen` starts with
+/// the root, so its `insert` returning false covers both a pid listing itself
+/// as its own parent (pid 0 on Windows) and a pid already queued.
 fn descendants_in(table: &[ProcEntry], root: u32, root_starttime: u64) -> Vec<u32> {
-    let mut frontier = vec![root];
+    let mut queue: VecDeque<u32> = VecDeque::from([root]);
+    let mut seen: HashSet<u32> = HashSet::from([root]);
     let mut found = Vec::new();
-    let mut i = 0;
-    while i < frontier.len() {
-        let parent = frontier[i];
-        i += 1;
-        for e in table {
-            if e.ppid != parent || e.pid == parent || frontier.contains(&e.pid) {
-                continue;
-            }
-            if is_live_descendant(e.pid, root_starttime) {
-                frontier.push(e.pid);
-                found.push(e.pid);
+    while let Some(parent) = queue.pop_front() {
+        for entry in table {
+            if entry.ppid == parent
+                && seen.insert(entry.pid)
+                && is_live_descendant(entry.pid, root_starttime)
+            {
+                queue.push_back(entry.pid);
+                found.push(entry.pid);
             }
         }
     }
@@ -291,16 +294,17 @@ struct ProcEntry {
     image: String,
 }
 
-/// Decode a NUL-terminated `szExeFile` (C `char` array) and lowercase it.
-/// Non-ASCII bytes of the ANSI code page are replaced lossily — only ever
-/// compared against ASCII image names.
-fn exe_file_name(sz: &[i8]) -> String {
-    let bytes: Vec<u8> = sz
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).to_lowercase()
+/// Decode a NUL-terminated wide `szExeFile` (`PROCESSENTRY32W`, UTF-16) and
+/// lowercase it with `str::to_lowercase` — the SAME function
+/// [`worker_image_for`] lowercases the `$IZBA_OPENVMM` file name with, so a
+/// non-ASCII override (`openvmm-é.exe`) compares equal to its own worker's
+/// image. (The ANSI `PROCESSENTRY32` would hand back code-page bytes that
+/// never equal the Unicode name on a non-UTF-8 code page, so a surviving
+/// worker would be filtered out — the unsafe direction.) Unpaired surrogates
+/// are replaced lossily; no image name izba compares against contains one.
+fn exe_file_name(sz: &[u16]) -> String {
+    let len = sz.iter().position(|&c| c == 0).unwrap_or(sz.len());
+    String::from_utf16_lossy(&sz[..len]).to_lowercase()
 }
 
 /// Snapshot the live process set. Empty on failure.
@@ -311,21 +315,24 @@ fn process_table() -> Vec<ProcEntry> {
         return Vec::new();
     }
     let snap = OwnedHandle(snap);
-    // SAFETY: PROCESSENTRY32 is plain-old-data; all-zero is a valid value.
-    let mut entry: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+    // SAFETY: PROCESSENTRY32W is plain-old-data (integers and a u16 array);
+    // all-zero is a valid value.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     let mut table: Vec<ProcEntry> = Vec::new();
-    // SAFETY: valid snapshot handle and a properly-sized entry; `szExeFile`
-    // is read only after Process32First/Next filled the entry.
+    // SAFETY: valid snapshot handle and an exclusively-borrowed entry whose
+    // `dwSize` is the size of the wide struct the W functions write; the
+    // fields are read only after Process32FirstW/NextW returned success and
+    // filled the entry (a zeroed `szExeFile` is NUL-terminated regardless).
     unsafe {
-        if Process32First(snap.0, &mut entry) != 0 {
+        if Process32FirstW(snap.0, &mut entry) != 0 {
             loop {
                 table.push(ProcEntry {
                     pid: entry.th32ProcessID,
                     ppid: entry.th32ParentProcessID,
                     image: exe_file_name(&entry.szExeFile),
                 });
-                if Process32Next(snap.0, &mut entry) == 0 {
+                if Process32NextW(snap.0, &mut entry) == 0 {
                     break;
                 }
             }
@@ -704,13 +711,35 @@ mod tests {
         );
     }
 
+    /// A zero-padded wide `szExeFile` buffer holding `s` (which may itself
+    /// carry an embedded NUL followed by junk, like a reused entry).
+    fn wide_sz(s: &str) -> [u16; 32] {
+        let mut sz = [0u16; 32];
+        for (d, c) in sz.iter_mut().zip(s.encode_utf16()) {
+            *d = c;
+        }
+        sz
+    }
+
     #[test]
     fn exe_file_name_stops_at_the_nul_and_lowercases() {
-        let mut sz = [0i8; 16];
-        for (d, s) in sz.iter_mut().zip(b"OpenVMM.EXE\0junk") {
-            *d = *s as i8;
-        }
-        assert_eq!(exe_file_name(&sz), "openvmm.exe");
+        assert_eq!(exe_file_name(&wide_sz("OpenVMM.EXE\0junk")), "openvmm.exe");
+        // No NUL at all: the whole buffer is the name.
+        let full: Vec<u16> = "SLEEP.EXE".encode_utf16().collect();
+        assert_eq!(exe_file_name(&full), "sleep.exe");
+    }
+
+    /// Greptile P1 on #328: the image name is decoded from the WIDE Toolhelp
+    /// entry and lowercased by the same function as the `$IZBA_OPENVMM` file
+    /// name, so a non-ASCII override still matches its own worker — an ANSI
+    /// decode would never equal it on a non-UTF-8 code page and the worker
+    /// would be filtered out while it holds the disks.
+    #[test]
+    fn a_non_ascii_worker_image_matches_the_override_it_was_launched_from() {
+        use std::ffi::OsStr;
+        let expected = worker_image_for(Some(OsStr::new("C:\\tools\\OpenVMM-\u{c9}.exe")));
+        assert_eq!(expected, "openvmm-\u{e9}.exe");
+        assert_eq!(exe_file_name(&wide_sz("OpenVMM-\u{c9}.EXE")), expected);
     }
 
     fn log_path(tag: &str) -> std::path::PathBuf {
@@ -778,6 +807,34 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || tree_survivors(&id).is_empty()),
             "a terminated sleep must finish teardown and leave the tree"
+        );
+    }
+
+    /// The PPID walk adopts ONLY the root's own descendants. A childless
+    /// `sleep` root plus an unrelated `sleep` bystander spawned AFTER it (so
+    /// it passes the creation-time check; its parent is this test process,
+    /// not the root): the walk must report exactly the root. Pins the walk's
+    /// conditions — `ppid == parent` flipped to `!=` adopts every
+    /// non-child, and either `&&` flipped to `||` adopts every new live pid
+    /// — each of which drags the bystander (and any other test's later
+    /// `sleep.exe`) in. Filtered to `sleep.exe` because `CREATE_NO_WINDOW`
+    /// may still give the root a `conhost.exe` child.
+    #[test]
+    fn tree_survivors_of_a_childless_root_is_exactly_the_root() {
+        let sleep30 = CommandSpec {
+            argv: vec!["sleep".into(), "30".into()],
+        };
+        let root = spawn_detached(&sleep30, &log_path("childless-root")).expect("spawn root");
+        let bystander =
+            spawn_detached(&sleep30, &log_path("childless-bystander")).expect("spawn bystander");
+        let survivors = tree_survivors_of_image(&root, SLEEP);
+        kill_pid(&bystander).expect("kill bystander");
+        kill_pid(&root).expect("kill root");
+        assert_eq!(
+            survivors,
+            vec![root.pid],
+            "only the root itself (bystander pid {}) may be in its tree",
+            bystander.pid
         );
     }
 
