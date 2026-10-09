@@ -484,7 +484,7 @@ fn boot_time() -> Option<u64> {
 /// Residual: two STALE izba sandboxes whose launcher pids were reused by each
 /// other's launchers can still cross-report (both trees are `openvmm.exe`);
 /// the full fix records the worker identities in `state.json` at start
-/// (follow-up issue).
+/// (#329).
 ///
 /// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
 /// process of the tree, plus two `OpenProcess` calls for the guards; no sleeps.

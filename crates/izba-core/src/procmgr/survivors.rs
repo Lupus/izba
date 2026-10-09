@@ -34,7 +34,7 @@ pub(crate) struct Candidate {
 ///   two izba VMMs apart — if two STALE sandboxes' launcher pids were reused
 ///   by each other's launchers, both trees are `openvmm.exe` and one can
 ///   still report (and re-sweep) the other's workers. The full fix records
-///   the worker identities in `state.json` at start (follow-up issue).
+///   the worker identities in `state.json` at start (#329).
 /// - (a) **Boot guard** — a launcher created before the current boot cannot
 ///   have a surviving tree: nothing outlives a reboot. `root_starttime <
 ///   boot_time` ⇒ `[]`. `boot_time` is `None` when it could not be read; the
