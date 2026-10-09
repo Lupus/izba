@@ -149,7 +149,8 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   walk on its pid NUMBER, so `tree_survivors` drops what a recycled pid drags
   in (`procmgr::survivors`: a launcher started before the current boot has no
   tree; candidates created at/after a DIFFERENT current holder of the pid are
-  the holder's; and only `openvmm.exe` images count as workers). A survivor makes `assess` answer
+  the holder's; and only the VMM's own image — `openvmm.exe`, or the
+  `$IZBA_OPENVMM` override's file name — counts as a worker). A survivor makes `assess` answer
   `Degraded(vmm process <pid> outlived its launcher and still holds the disks)`
   — never `Stopped`, which is what lets `reap_stale_stopped` drop `state.json`
   and `start` double-boot. `stop` re-sweeps a tree whose launcher is already

@@ -77,15 +77,46 @@ const QUERY_SYNC_ACCESS: u32 = 0x0010_1000;
 /// literal — same reason as [`QUERY_SYNC_ACCESS`].
 const TERMINATE_IDENTITY_ACCESS: u32 = 0x0010_1001;
 
-/// Image file name of the only VMM izba launches on Windows: OpenVMM, whose
-/// `openvmm vm` worker re-runs the same binary (`crate::vmm::openvmm` locates
-/// and spawns it under this name). [`tree_survivors`] and
-/// [`sweep_tree_survivors`] count only descendants with this image as VMM
-/// workers — see the image guard in [`super::survivors::filter_tree_survivors`].
-/// Caveat: an `$IZBA_OPENVMM` override naming a binary with a DIFFERENT file
-/// name would have its workers ignored; the shipped layout and CI both use
-/// `openvmm.exe`.
+/// Default image file name of the only VMM izba launches on Windows: OpenVMM,
+/// whose `openvmm vm` worker re-runs the same binary (`crate::vmm::openvmm`
+/// locates the bundled / `PATH` copy under this name). [`tree_survivors`] and
+/// [`sweep_tree_survivors`] count only descendants with the VMM's image as
+/// workers — see the image guard in [`super::survivors::filter_tree_survivors`]
+/// — and take that image from [`vmm_worker_image`], which follows an
+/// `$IZBA_OPENVMM` override and falls back to this name.
 pub const VMM_IMAGE_NAME: &str = "openvmm.exe";
+
+/// Environment override the OpenVMM driver resolves its binary by
+/// (`crate::discover::find_tool`).
+const OPENVMM_ENV: &str = "IZBA_OPENVMM";
+
+/// Image name of this host's VMM worker, as [`tree_survivors`] expects it:
+/// the file name of `$IZBA_OPENVMM` when that is set, else
+/// [`VMM_IMAGE_NAME`]. The override and the bundled copy are the two launch
+/// paths `crate::vmm::openvmm::find_openvmm` takes (its `PATH` fallback also
+/// searches for [`VMM_IMAGE_NAME`]); the worker is the same binary, so its
+/// image name is this file name.
+///
+/// Deliberately reads the variable instead of calling `find_tool`: that
+/// fails when the override names a file that no longer exists, and falling
+/// back to the default name then would ignore the workers of a VMM that WAS
+/// launched from it — the unsafe direction. Only the file name matters here,
+/// so the override's existence is irrelevant. Residual: the variable is read
+/// in THIS process at stop time; a stop run with a different `$IZBA_OPENVMM`
+/// than the start that launched the VMM can still miss its workers.
+fn vmm_worker_image() -> String {
+    worker_image_for(std::env::var_os(OPENVMM_ENV).as_deref())
+}
+
+/// [`vmm_worker_image`] over an explicit override value: its file name,
+/// lowercased, or [`VMM_IMAGE_NAME`] when there is no override or it has no
+/// file name (empty, a bare root such as `C:\`, or ending in `..`).
+fn worker_image_for(override_path: Option<&std::ffi::OsStr>) -> String {
+    override_path
+        .and_then(|p| Path::new(p).file_name())
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| VMM_IMAGE_NAME.to_string())
+}
 
 /// Closes the handle on drop.
 struct OwnedHandle(HANDLE);
@@ -442,7 +473,7 @@ fn boot_time() -> Option<u64> {
 /// Once the root is dead the PPID walk keys on its pid NUMBER, which Windows
 /// may hand to an unrelated process; the descendants are therefore passed
 /// through [`super::survivors::filter_tree_survivors`] with three guards:
-/// only a descendant whose image is [`VMM_IMAGE_NAME`] can be a worker (a
+/// only a descendant whose image is the VMM's ([`vmm_worker_image`]) can be a worker (a
 /// stranger that reused the pid, spawned a child and exited leaves no holder
 /// to compare against — the image is then the only tell), a root created
 /// before the current boot ([`boot_time`]) has no surviving tree, and when a
@@ -458,11 +489,11 @@ fn boot_time() -> Option<u64> {
 /// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
 /// process of the tree, plus two `OpenProcess` calls for the guards; no sleeps.
 pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
-    tree_survivors_of_image(id, VMM_IMAGE_NAME)
+    tree_survivors_of_image(id, &vmm_worker_image())
 }
 
 /// [`tree_survivors`] with the worker image as a parameter — the seam the
-/// tests drive with a `sleep.exe` worker; production fixes [`VMM_IMAGE_NAME`].
+/// tests drive with a `sleep.exe` worker; production passes [`vmm_worker_image`].
 fn tree_survivors_of_image(id: &PidIdentity, vmm_image: &str) -> Vec<u32> {
     tree_survivor_identities(id, vmm_image)
         .into_iter()
@@ -571,7 +602,7 @@ fn terminate_identity(target: &PidIdentity) {
 /// survivor to exit and its pid to be reused. Best-effort and infallible,
 /// like `kill_pid`'s own descendant sweep; the caller re-probes.
 pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
-    sweep_tree_survivors_of_image(id, VMM_IMAGE_NAME)
+    sweep_tree_survivors_of_image(id, &vmm_worker_image())
 }
 
 /// [`sweep_tree_survivors`] with the worker image as a parameter — the test
@@ -605,8 +636,73 @@ mod tests {
     }
 
     /// Image of the test trees' worker (Git for Windows' `sleep.exe`), passed
-    /// to the `_of_image` seams in place of [`VMM_IMAGE_NAME`].
+    /// to the `_of_image` seams in place of [`vmm_worker_image`].
     const SLEEP: &str = "sleep.exe";
+
+    /// Serializes every test that reads or writes `$IZBA_OPENVMM` (the only
+    /// env var this module's production code reads).
+    static OPENVMM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets (`Some`) or removes (`None`) `$IZBA_OPENVMM` while held, restoring
+    /// the previous value on drop — so an assertion failure cannot leak the
+    /// test's value into a later test. Holds [`OPENVMM_ENV_LOCK`].
+    struct OpenvmmEnv {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl OpenvmmEnv {
+        fn set(value: Option<&str>) -> Self {
+            // A test that panicked while holding the lock still restored the
+            // variable in Drop, so a poisoned lock is safe to reuse.
+            let lock = OPENVMM_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev = std::env::var_os(OPENVMM_ENV);
+            match value {
+                Some(v) => std::env::set_var(OPENVMM_ENV, v),
+                None => std::env::remove_var(OPENVMM_ENV),
+            }
+            OpenvmmEnv { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for OpenvmmEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(OPENVMM_ENV, v),
+                None => std::env::remove_var(OPENVMM_ENV),
+            }
+        }
+    }
+
+    /// Fix round 1 of the #328 review: the expected worker image follows the
+    /// `$IZBA_OPENVMM` override the launcher resolves by — a VMM launched
+    /// from a renamed binary must not have its workers ignored — and is the
+    /// default name when the variable is unset.
+    #[test]
+    fn vmm_worker_image_follows_the_izba_openvmm_override() {
+        {
+            let _env = OpenvmmEnv::set(Some("C:\\x\\OpenVMM-Dev.EXE"));
+            assert_eq!(vmm_worker_image(), "openvmm-dev.exe");
+        }
+        {
+            let _env = OpenvmmEnv::set(None);
+            assert_eq!(vmm_worker_image(), VMM_IMAGE_NAME);
+        }
+    }
+
+    #[test]
+    fn worker_image_for_falls_back_when_the_override_has_no_file_name() {
+        use std::ffi::OsStr;
+        assert_eq!(worker_image_for(None), VMM_IMAGE_NAME);
+        assert_eq!(worker_image_for(Some(OsStr::new(""))), VMM_IMAGE_NAME);
+        assert_eq!(worker_image_for(Some(OsStr::new("C:\\"))), VMM_IMAGE_NAME);
+        assert_eq!(
+            worker_image_for(Some(OsStr::new("D:\\vmm\\openvmm.exe"))),
+            "openvmm.exe"
+        );
+    }
 
     #[test]
     fn exe_file_name_stops_at_the_nul_and_lowercases() {
@@ -961,6 +1057,10 @@ mod tests {
     /// expected one, so the empty answer is the image filter's doing.
     #[test]
     fn production_tree_survivors_ignore_a_descendant_that_is_not_openvmm() {
+        // Pin the production expectation to the default image, whatever the
+        // CI job's environment says.
+        let _env = OpenvmmEnv::set(None);
+        assert_eq!(vmm_worker_image(), VMM_IMAGE_NAME);
         let (root, worker) = launcher_with_worker("tree-foreign-image");
         terminate_root_only(root.pid);
         assert!(
