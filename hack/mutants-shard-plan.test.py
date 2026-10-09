@@ -54,9 +54,13 @@ check("linux floor is 2", sp.shard_count(0, sp.LINUX) == 2)
 check("windows floor is 4", sp.shard_count(0, sp.WINDOWS) == 4)
 check("linux cap is 16", sp.shard_count(100_000, sp.LINUX) == 16)
 check("windows cap is 36", sp.shard_count(100_000, sp.WINDOWS) == 36)
-# 641 mutants (PR #300): linux 641*40/1800 = 14.2 -> 15; windows 641*120/2400 = 32.05 -> 33 (under the 36 cap).
+# 641 mutants (PR #300): linux 641*40/1800 = 14.2 -> 15; windows 641*180/2400 = 48.1 -> 49, capped at 36
+# (a PR that big should be split, or the cap raised deliberately — see the planner's notes).
 check("linux 641 -> 15", sp.shard_count(641, sp.LINUX) == 15)
-check("windows 641 -> 33", sp.shard_count(641, sp.WINDOWS) == 33)
+check("windows 641 -> capped at 36", sp.shard_count(641, sp.WINDOWS) == 36)
+# 97 mutants (PR #328): windows 97*180/2400 = 7.3 -> 8 shards of ~13 mutants (5 shards of ~20 overran the 60-min cap).
+check("windows 97 -> 8", sp.shard_count(97, sp.WINDOWS) == 8)
+check("windows 480 -> 36 is the last count under the cap", sp.shard_count(480, sp.WINDOWS) == 36)
 # Every production budget must leave headroom under its job's timeout-minutes
 # (baseline build + cache restore + install also spend wall clock).
 check("linux budget < 45-min job cap", sp.LINUX.shard_budget_secs < 45 * 60)
