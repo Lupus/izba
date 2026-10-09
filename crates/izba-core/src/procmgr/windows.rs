@@ -1027,11 +1027,19 @@ mod tests {
     /// parent. Modelled with a real orphaned worker whose launcher is gone,
     /// recorded with a pre-boot start time.
     ///
-    /// Both branches below are the contract: where the boot time is readable
-    /// the pre-boot record reports nothing; where it is not (pid 4 not
-    /// openable by this user) the guard is disabled by design and the
-    /// orphaned worker MUST still be reported — over-reporting is the safe
-    /// direction (see `filter_tree_survivors`).
+    /// Both branches below end in the same verdict for different reasons:
+    /// where the boot time is readable, the boot guard drops the pre-boot
+    /// record; where it is not (pid 4 not openable by an unprivileged user),
+    /// the boot guard is disabled by design and it is the PID-HOLDER guard
+    /// that drops it — the dead launcher's object is still reserved (its
+    /// worker holds a handle to it), so `open_query(root.pid)` succeeds and
+    /// reports the REAL creation time, which differs from the forged one;
+    /// a record whose start time does not match the pid's holder is, to the
+    /// guards, a stranger's pid, and the holder's later children are not ours.
+    /// (The same mechanism bit the real-host validation: a reconstructed
+    /// `state.json` must carry the launcher's real creation time.) The
+    /// control assertion then proves the orphan IS reported for the real
+    /// record, so nothing here hides a live worker.
     #[test]
     fn tree_survivors_ignores_a_tree_recorded_before_the_current_boot() {
         let (root, worker) = launcher_with_worker("tree-preboot");
@@ -1056,9 +1064,10 @@ mod tests {
                 );
             }
             None => assert!(
-                survivors.contains(&worker),
-                "boot guard disabled (pid 4 unreadable): the orphaned worker {worker} \
-                 must still be reported; got {survivors:?}"
+                survivors.is_empty(),
+                "boot guard disabled (pid 4 unreadable): the forged start time still \
+                 differs from the reserved launcher object's real creation time, so the \
+                 pid-holder guard must drop the worker {worker}; got {survivors:?}"
             ),
         }
         assert!(
