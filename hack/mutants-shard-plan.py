@@ -38,14 +38,19 @@ class Platform:
 
 # Per-mutant cost, measured on PR #300's gate runs (2026-09):
 #   Linux   ~37 s/mutant (27 s incremental build + 9 s test)      -> assume 40 s
-#   Windows 80-145 s/mutant (build dominates; varies with crate)  -> assume 120 s
+#   Windows 80-145 s/mutant (build dominates; varies with crate)  -> assumed 120 s
+# Re-measured on PR #328 (2026-10-09): a 20-mutant Windows shard ran past the
+# 60-min job cap THREE times on slow hosted runners (sibling shards 25-33 min),
+# i.e. >165 s/mutant once several mutants hit the auto-set ~62 s test timeout on
+# top of a ~60 s rebuild. Windows now assumes 180 s so a shard holds ~13 mutants
+# and stays inside the cap even on a degraded runner.
 # Shard budget = mutant work only. It stays well under the job's timeout-minutes
 # (Linux 45, Windows 60) because each shard ALSO pays cache restore, the
 # cargo-mutants install, and an unmutated baseline build + test before the first
 # mutant. The max caps parallel runner fan-out; past it a shard's slice exceeds
 # the budget (a PR that big should be split, or the cap raised deliberately).
 LINUX = Platform(name="linux", secs_per_mutant=40, shard_budget_secs=30 * 60, min_shards=2, max_shards=16)
-WINDOWS = Platform(name="windows", secs_per_mutant=120, shard_budget_secs=40 * 60, min_shards=4, max_shards=36)
+WINDOWS = Platform(name="windows", secs_per_mutant=180, shard_budget_secs=40 * 60, min_shards=4, max_shards=36)
 PLATFORMS = (LINUX, WINDOWS)
 
 

@@ -145,6 +145,29 @@ pub fn kill_pid(id: &PidIdentity) -> anyhow::Result<()> {
     }
 }
 
+/// Pids of the VMM process tree rooted at `id` that still hold their
+/// resources (#319). On Linux the VMM (cloud-hypervisor) spawns no worker
+/// children — the virtiofsd sidecars are tracked separately in
+/// `RunState.sidecar_pids` — so the tree is the root alone, and it survives
+/// exactly while [`pid_alive`] holds: a SIGKILLed process stuck in an
+/// uninterruptible `D` sleep still owns its disk fds and IS a survivor; a `Z`
+/// zombie has released them and is NOT (its pid is merely reserved).
+pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
+    if pid_alive(id) {
+        vec![id.pid]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Kill whatever of the VMM tree rooted at `id` still survives — the re-sweep
+/// `stop` issues when the launcher is already gone but [`tree_survivors`]
+/// still reports part of its tree (#319). On Linux the tree is the root
+/// alone, so this is [`kill_pid`].
+pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
+    kill_pid(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +255,71 @@ mod tests {
         let id = spawn_detached_with_limits(&cmd, &log, &limits).expect("spawn ok");
         assert_ne!(id.pid, 0);
         let _ = std::fs::remove_file(&log);
+    }
+
+    /// #319: the Unix tree is the root alone — cloud-hypervisor spawns no worker
+    /// children (virtiofsd sidecars are tracked separately) — so a survivor is
+    /// exactly a root that `pid_alive` still reports. Pins that the semantics
+    /// `stop_locked` relied on before #319 are unchanged on this platform.
+    #[test]
+    fn tree_survivors_is_the_root_while_alive_and_empty_once_dead() {
+        let dir = std::env::temp_dir();
+        let id = spawn_detached(
+            &CommandSpec {
+                argv: vec!["sleep".into(), "30".into()],
+            },
+            &dir.join(format!("izba-tree-survivors-{}.log", std::process::id())),
+        )
+        .expect("spawn sleep");
+        assert_eq!(tree_survivors(&id), vec![id.pid], "a running root survives");
+
+        kill_pid(&id).expect("kill");
+        // SIGKILL is asynchronous; the parentless child is reaped by init.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pid_alive(&id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            tree_survivors(&id).is_empty(),
+            "a dead root has no survivors"
+        );
+    }
+
+    /// A recycled pid (identity with a mismatching starttime) is not a survivor.
+    #[test]
+    fn tree_survivors_is_empty_for_a_mismatching_identity() {
+        let id = PidIdentity {
+            pid: std::process::id(),
+            starttime: 1,
+        };
+        assert!(tree_survivors(&id).is_empty());
+    }
+
+    /// #319: `stop`'s re-sweep on Linux kills the (root-only) tree, and is a
+    /// harmless no-op for an identity that no longer matches — it must never
+    /// signal whatever process now holds a recycled pid (here: ourselves).
+    #[test]
+    fn sweep_tree_survivors_kills_the_root_and_spares_a_recycled_pid() {
+        let dir = std::env::temp_dir();
+        let id = spawn_detached(
+            &CommandSpec {
+                argv: vec!["sleep".into(), "30".into()],
+            },
+            &dir.join(format!("izba-tree-sweep-{}.log", std::process::id())),
+        )
+        .expect("spawn sleep");
+        sweep_tree_survivors(&id).expect("sweep");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pid_alive(&id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!pid_alive(&id), "the sweep must kill a surviving root");
+
+        let recycled = PidIdentity {
+            pid: std::process::id(),
+            starttime: 1,
+        };
+        sweep_tree_survivors(&recycled).expect("no-op sweep");
+        // Still here: the test process was not signalled.
     }
 }

@@ -6,6 +6,26 @@ pub trait Probes {
     /// Returns `true` iff the control socket connects and the health check
     /// replies within a short timeout.
     fn control_answers(&self) -> bool;
+    /// Pids of the VMM process tree rooted at `id` (the root and its worker
+    /// children) that have NOT finished teardown and so still hold the
+    /// sandbox's disks — see `procmgr::tree_survivors` (#319). The default is
+    /// the pre-#319 reading, "the root is the whole tree, alive iff
+    /// `pid_alive`", so fakes that model only pid liveness are unchanged.
+    fn tree_survivors(&self, id: &PidIdentity) -> Vec<u32> {
+        if self.pid_alive(id) {
+            vec![id.pid]
+        } else {
+            Vec::new()
+        }
+    }
+    /// Terminate every process of the VMM tree that `tree_survivors` would
+    /// report — the re-sweep `stop` runs when the launcher is already gone but a
+    /// worker it spawned is still there (#319). Default: the real
+    /// `procmgr::sweep_tree_survivors`; fakes record the call and shrink their
+    /// survivors so the gate after the poll sees the effect.
+    fn sweep_tree_survivors(&self, id: &PidIdentity) -> anyhow::Result<()> {
+        crate::procmgr::sweep_tree_survivors(id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,11 +46,35 @@ impl Liveness {
     }
 }
 
+/// The `Degraded` reason for a VMM whose launcher is gone while a process of
+/// its tree is still present and so still holds the sandbox's disks (#319).
+/// It states only what was observed — the process outlived its launcher —
+/// never that it was terminated: a launcher that died on its own can leave
+/// its worker running. Rendered inside
+/// `degraded (…)`, so it must never end with `)` — the desktop app strips
+/// exactly one trailing paren (`app/src-tauri/src/views.rs::parse_state`).
+pub fn stuck_teardown_reason(survivors: &[u32]) -> String {
+    let (noun, their, hold) = if survivors.len() == 1 {
+        ("process", "its", "holds")
+    } else {
+        ("processes", "their", "hold")
+    };
+    let pids: Vec<String> = survivors.iter().map(u32::to_string).collect();
+    format!(
+        "vmm {noun} {} outlived {their} launcher and still {hold} the disks",
+        pids.join(", ")
+    )
+}
+
 /// Assess the liveness of a sandbox.
 ///
 /// Precedence:
 /// 1. `run == None`                        → Stopped
-/// 2. vmm pid dead                         → Stopped
+/// 2. vmm pid dead, nothing of its tree survives → Stopped
+///    2b. vmm pid dead but a process of its tree still holds its resources
+///    → Degraded("vmm process <pid> outlived its launcher and still holds the
+///    disks") (#319) — never Stopped, which would let the stale-state reaper
+///    delete state.json and a later start boot against held disks
 /// 3. any sidecar dead                     → Degraded("sidecar <role> died")
 ///    (sidecar death takes precedence over control unresponsiveness)
 /// 4. control not answering                → Degraded("control plane unresponsive")
@@ -42,7 +86,11 @@ pub fn assess(run: Option<&RunState>, probes: &dyn Probes) -> Liveness {
     };
 
     if !probes.pid_alive(&run.vmm_pid) {
-        return Liveness::Stopped;
+        let survivors = probes.tree_survivors(&run.vmm_pid);
+        if survivors.is_empty() {
+            return Liveness::Stopped;
+        }
+        return Liveness::Degraded(stuck_teardown_reason(&survivors));
     }
 
     for (role, id) in &run.sidecar_pids {
@@ -74,6 +122,9 @@ mod tests {
     struct FakeProbes {
         alive_pids: Vec<PidIdentity>,
         control: bool,
+        /// What `tree_survivors` answers for ANY id — the fake models the
+        /// stuck-teardown fact directly (#319).
+        survivors: Vec<u32>,
     }
 
     impl Probes for FakeProbes {
@@ -83,6 +134,10 @@ mod tests {
 
         fn control_answers(&self) -> bool {
             self.control
+        }
+
+        fn tree_survivors(&self, _id: &PidIdentity) -> Vec<u32> {
+            self.survivors.clone()
         }
     }
 
@@ -130,6 +185,7 @@ mod tests {
         let p = FakeProbes {
             alive_pids: vec![vmm_id()],
             control: true,
+            survivors: vec![],
         };
         assert_eq!(assess(None, &p), Liveness::Stopped);
     }
@@ -144,8 +200,79 @@ mod tests {
         let p = FakeProbes {
             alive_pids: vec![sidecar_id(0)],
             control: true,
+            survivors: vec![],
         };
         assert_eq!(assess(Some(&run), &p), Liveness::Stopped);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 2b (#319): vmm pid dead but a process of its tree still holds its
+    // resources → Degraded, never Stopped. `Stopped` is what lets the daemon's
+    // stale-state reaper delete state.json and `start` boot against the disks
+    // that process still holds.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn vmm_dead_with_a_surviving_tree_is_degraded_not_stopped() {
+        let run = run_with_sidecars(&[]);
+        let p = FakeProbes {
+            alive_pids: vec![],
+            control: false,
+            survivors: vec![30620],
+        };
+        match assess(Some(&run), &p) {
+            Liveness::Degraded(reason) => {
+                assert!(reason.contains("30620"), "names the pid: {reason}");
+                assert!(reason.contains("outlived its launcher"), "{reason}");
+                assert!(reason.contains("still holds the disks"), "{reason}");
+                assert!(
+                    !reason.contains("terminated"),
+                    "izba did not observe a termination: {reason}"
+                );
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    /// The reason is rendered as `degraded (<reason>)` and the desktop app
+    /// strips exactly one trailing `)` — a reason ending in `)` would lose a
+    /// character. Pin it for one and for several pids.
+    #[test]
+    fn stuck_teardown_reason_never_ends_with_a_paren() {
+        for pids in [&[30620u32][..], &[29588, 30620][..]] {
+            let r = stuck_teardown_reason(pids);
+            assert!(!r.ends_with(')'), "{r}");
+            assert!(!r.is_empty());
+        }
+        assert_eq!(
+            stuck_teardown_reason(&[30620]),
+            "vmm process 30620 outlived its launcher and still holds the disks"
+        );
+        assert_eq!(
+            stuck_teardown_reason(&[29588, 30620]),
+            "vmm processes 29588, 30620 outlived their launcher and still hold the disks"
+        );
+    }
+
+    /// Fakes that model only pid liveness (reconcile's, the CLI's) get the
+    /// pre-#319 semantics from the trait default: the root is the whole tree.
+    #[test]
+    fn default_tree_survivors_is_the_root_while_alive() {
+        struct PidOnly(Vec<PidIdentity>);
+        impl Probes for PidOnly {
+            fn pid_alive(&self, id: &PidIdentity) -> bool {
+                self.0.contains(id)
+            }
+            fn control_answers(&self) -> bool {
+                true
+            }
+        }
+        let alive = PidOnly(vec![vmm_id()]);
+        assert_eq!(alive.tree_survivors(&vmm_id()), vec![vmm_id().pid]);
+        let dead = PidOnly(vec![]);
+        assert!(dead.tree_survivors(&vmm_id()).is_empty());
+        // And through assess: a dead root with the default is plain Stopped.
+        let run = run_with_sidecars(&[]);
+        assert_eq!(assess(Some(&run), &dead), Liveness::Stopped);
     }
 
     // -----------------------------------------------------------------------
@@ -157,6 +284,7 @@ mod tests {
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0), sidecar_id(1)],
             control: true,
+            survivors: vec![],
         };
         assert_eq!(assess(Some(&run), &p), Liveness::Running);
     }
@@ -172,6 +300,7 @@ mod tests {
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0)],
             control: false,
+            survivors: vec![],
         };
         assert_eq!(
             assess(Some(&run), &p),
@@ -188,6 +317,7 @@ mod tests {
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0)],
             control: false,
+            survivors: vec![],
         };
         assert_eq!(
             assess(Some(&run), &p),

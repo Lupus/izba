@@ -25,8 +25,11 @@ use crate::vsock::hybrid_connect;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
+/// On Windows this is also the image the teardown check counts as a VMM
+/// worker (`openvmm vm` re-runs this same binary) — one constant, so the two
+/// cannot drift.
 #[cfg(windows)]
-const OPENVMM_EXE: &str = "openvmm.exe";
+const OPENVMM_EXE: &str = crate::procmgr::VMM_IMAGE_NAME;
 #[cfg(not(windows))]
 const OPENVMM_EXE: &str = "openvmm";
 

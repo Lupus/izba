@@ -19,12 +19,21 @@ pub use logon::spawn_confined_as_account;
 // `#[cfg]` split inside the module). cloud-hypervisor itself only runs on Linux.
 pub mod jail_linux;
 
+// The FFI-free half of the Windows `tree_survivors` (#319). Only Windows calls
+// it, but it is compiled into every test build so its guards are exercised on
+// the Linux gates too.
+#[cfg(any(windows, test))]
+mod survivors;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::proc_starttime;
 #[cfg(unix)]
-pub use unix::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
+pub use unix::{
+    kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits, sweep_tree_survivors,
+    tree_survivors,
+};
 
 #[cfg(windows)]
 mod jail_windows;
@@ -39,7 +48,10 @@ mod windows;
 #[cfg(windows)]
 pub use windows::proc_starttime;
 #[cfg(windows)]
-pub use windows::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
+pub use windows::{
+    kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits, sweep_tree_survivors,
+    tree_survivors, VMM_IMAGE_NAME,
+};
 
 /// Unix fallback so call sites can use `spawn_confined` uniformly: the Linux
 /// jailer is a separate work item, so this is a plain detached spawn (the VMM

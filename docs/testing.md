@@ -494,6 +494,19 @@ cargo build --release --target x86_64-pc-windows-gnu --manifest-path hack/fake-u
 #   pwsh -NoProfile -File hack/ci/usb-attach-gate.ps1     # expect: ALL PASS
 ```
 
+**Stuck VMM teardown check (#319).** A `TerminateProcess`'d `openvmm.exe`
+worker can hang in kernel-side teardown with the sandbox's disks still held;
+izba then refuses `stop`/`rm --force` and shows the sandbox `degraded (vmm
+process <pid> outlived its launcher and still holds the disks)`. The real-host check
+for that contract — and the reproduction conditions — are in
+[`docs/spikes/0003-windows-openvmm-worker-teardown-hang.md`](spikes/0003-windows-openvmm-worker-teardown-hang.md):
+
+```sh
+# Windows side, against an existing data root + sandbox (creates nothing):
+#   $env:IZBA_EXE = '<root>\bin\izba.exe'; $env:IZBA_DATA_DIR = '<data root>'; $env:IZBA_SANDBOX = '<name>'
+#   pwsh -NoProfile -File hack/spike/stuck-vmm-teardown-check.ps1
+```
+
 **Historical (pre-M1, no longer applies).** Guest egress on Windows used to
 ride OpenVMM's consomme NAT, which advertised IPv6 (SLAAC) to the guest
 whenever the host had *any* non-link-local IPv6 address — a Tailscale/VPN ULA
