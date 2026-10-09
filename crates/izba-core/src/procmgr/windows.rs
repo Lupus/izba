@@ -268,6 +268,17 @@ fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
 /// Breadth-first, so the order is oldest-ancestor first. `seen` starts with
 /// the root, so its `insert` returning false covers both a pid listing itself
 /// as its own parent (pid 0 on Windows) and a pid already queued.
+///
+/// `seen.insert` is deliberately the LAST operand of the condition: the dedupe
+/// must hold under any single-operator mutation of it. A mutant that adopts a
+/// pid without recording it in `seen` re-adopts it on every pop, so the queue
+/// grows without bound and the test run never ends — which the mutation gate
+/// records as a timeout, not a kill. With `insert` last, `==`→`!=` and the
+/// first `&&`→`||` still insert on every adoption (each pid is adopted at most
+/// once and the walk terminates), and the second `&&`→`||` skips the insert
+/// only for an entry that passed the genuine parent-and-liveness test, which
+/// happens once per pid (its one parent is popped once), so no pid is adopted
+/// more than twice. Each of those then fails an assertion instead of hanging.
 fn descendants_in(table: &[ProcEntry], root: u32, root_starttime: u64) -> Vec<u32> {
     let mut queue: VecDeque<u32> = VecDeque::from([root]);
     let mut seen: HashSet<u32> = HashSet::from([root]);
@@ -275,8 +286,8 @@ fn descendants_in(table: &[ProcEntry], root: u32, root_starttime: u64) -> Vec<u3
     while let Some(parent) = queue.pop_front() {
         for entry in table {
             if entry.ppid == parent
-                && seen.insert(entry.pid)
                 && is_live_descendant(entry.pid, root_starttime)
+                && seen.insert(entry.pid)
             {
                 queue.push_back(entry.pid);
                 found.push(entry.pid);
