@@ -77,6 +77,16 @@ const QUERY_SYNC_ACCESS: u32 = 0x0010_1000;
 /// literal — same reason as [`QUERY_SYNC_ACCESS`].
 const TERMINATE_IDENTITY_ACCESS: u32 = 0x0010_1001;
 
+/// Image file name of the only VMM izba launches on Windows: OpenVMM, whose
+/// `openvmm vm` worker re-runs the same binary (`crate::vmm::openvmm` locates
+/// and spawns it under this name). [`tree_survivors`] and
+/// [`sweep_tree_survivors`] count only descendants with this image as VMM
+/// workers — see the image guard in [`super::survivors::filter_tree_survivors`].
+/// Caveat: an `$IZBA_OPENVMM` override naming a binary with a DIFFERENT file
+/// name would have its workers ignored; the shipped layout and CI both use
+/// `openvmm.exe`.
+pub const VMM_IMAGE_NAME: &str = "openvmm.exe";
+
 /// Closes the handle on drop.
 struct OwnedHandle(HANDLE);
 
@@ -216,42 +226,74 @@ pub fn pid_alive(id: &PidIdentity) -> bool {
 /// recycled PID that merely happens to claim a dead parent's PID as its
 /// PPID is never swept up.
 fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
-    let table = process_table();
+    descendants_in(&process_table(), root, root_starttime)
+}
+
+/// [`descendants_of`] over an already-taken snapshot, so a caller that also
+/// needs each descendant's image name reads it from the SAME snapshot the
+/// walk used.
+fn descendants_in(table: &[ProcEntry], root: u32, root_starttime: u64) -> Vec<u32> {
     let mut frontier = vec![root];
     let mut found = Vec::new();
     let mut i = 0;
     while i < frontier.len() {
         let parent = frontier[i];
         i += 1;
-        for &(pid, ppid) in &table {
-            if ppid != parent || pid == parent || frontier.contains(&pid) {
+        for e in table {
+            if e.ppid != parent || e.pid == parent || frontier.contains(&e.pid) {
                 continue;
             }
-            if is_live_descendant(pid, root_starttime) {
-                frontier.push(pid);
-                found.push(pid);
+            if is_live_descendant(e.pid, root_starttime) {
+                frontier.push(e.pid);
+                found.push(e.pid);
             }
         }
     }
     found
 }
 
-/// Snapshot the live process set as `(pid, ppid)` pairs. Empty on failure.
-fn process_table() -> Vec<(u32, u32)> {
+/// One row of a Toolhelp process snapshot.
+struct ProcEntry {
+    pid: u32,
+    ppid: u32,
+    /// `szExeFile`, lowercased: the image's bare file name (no directory).
+    image: String,
+}
+
+/// Decode a NUL-terminated `szExeFile` (C `char` array) and lowercase it.
+/// Non-ASCII bytes of the ANSI code page are replaced lossily — only ever
+/// compared against ASCII image names.
+fn exe_file_name(sz: &[i8]) -> String {
+    let bytes: Vec<u8> = sz
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_lowercase()
+}
+
+/// Snapshot the live process set. Empty on failure.
+fn process_table() -> Vec<ProcEntry> {
     // SAFETY: plain FFI; the snapshot handle is closed by OwnedHandle.
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {
         return Vec::new();
     }
     let snap = OwnedHandle(snap);
+    // SAFETY: PROCESSENTRY32 is plain-old-data; all-zero is a valid value.
     let mut entry: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-    let mut table: Vec<(u32, u32)> = Vec::new();
-    // SAFETY: valid snapshot handle and a properly-sized entry.
+    let mut table: Vec<ProcEntry> = Vec::new();
+    // SAFETY: valid snapshot handle and a properly-sized entry; `szExeFile`
+    // is read only after Process32First/Next filled the entry.
     unsafe {
         if Process32First(snap.0, &mut entry) != 0 {
             loop {
-                table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                table.push(ProcEntry {
+                    pid: entry.th32ProcessID,
+                    ppid: entry.th32ParentProcessID,
+                    image: exe_file_name(&entry.szExeFile),
+                });
                 if Process32Next(snap.0, &mut entry) == 0 {
                     break;
                 }
@@ -399,25 +441,40 @@ fn boot_time() -> Option<u64> {
 ///
 /// Once the root is dead the PPID walk keys on its pid NUMBER, which Windows
 /// may hand to an unrelated process; the descendants are therefore passed
-/// through [`super::survivors::filter_tree_survivors`] with two guards: a
-/// root created before the current boot ([`boot_time`]) has no surviving
-/// tree, and when a DIFFERENT process now holds the root pid, everything
-/// created at or after that holder is the holder's, not ours.
+/// through [`super::survivors::filter_tree_survivors`] with three guards:
+/// only a descendant whose image is [`VMM_IMAGE_NAME`] can be a worker (a
+/// stranger that reused the pid, spawned a child and exited leaves no holder
+/// to compare against — the image is then the only tell), a root created
+/// before the current boot ([`boot_time`]) has no surviving tree, and when a
+/// DIFFERENT process now holds the root pid, everything created at or after
+/// that holder is the holder's, not ours. The recorded root itself is matched
+/// by its exact creation time and is not image-filtered.
+///
+/// Residual: two STALE izba sandboxes whose launcher pids were reused by each
+/// other's launchers can still cross-report (both trees are `openvmm.exe`);
+/// the full fix records the worker identities in `state.json` at start
+/// (follow-up issue).
 ///
 /// Cost: one Toolhelp snapshot plus one `OpenProcess` + zero-timeout wait per
 /// process of the tree, plus two `OpenProcess` calls for the guards; no sleeps.
 pub fn tree_survivors(id: &PidIdentity) -> Vec<u32> {
-    tree_survivor_identities(id)
+    tree_survivors_of_image(id, VMM_IMAGE_NAME)
+}
+
+/// [`tree_survivors`] with the worker image as a parameter — the seam the
+/// tests drive with a `sleep.exe` worker; production fixes [`VMM_IMAGE_NAME`].
+fn tree_survivors_of_image(id: &PidIdentity, vmm_image: &str) -> Vec<u32> {
+    tree_survivor_identities(id, vmm_image)
         .into_iter()
         .map(|s| s.pid)
         .collect()
 }
 
-/// [`tree_survivors`] with each survivor's creation time kept alongside its
-/// pid — the identity [`sweep_tree_survivors`] re-verifies on the very handle
-/// it terminates through, so a pid Windows recycled between this enumeration
-/// and the kill is never terminated.
-fn tree_survivor_identities(id: &PidIdentity) -> Vec<PidIdentity> {
+/// [`tree_survivors_of_image`] with each survivor's creation time kept
+/// alongside its pid — the identity [`sweep_tree_survivors`] re-verifies on
+/// the very handle it terminates through, so a pid Windows recycled between
+/// this enumeration and the kill is never terminated.
+fn tree_survivor_identities(id: &PidIdentity, vmm_image: &str) -> Vec<PidIdentity> {
     let mut out = Vec::new();
     if let Some(h) = open_sync_query(id.pid) {
         if creation_time(h.0) == Some(id.starttime) && !is_signaled(h.0) {
@@ -430,19 +487,34 @@ fn tree_survivor_identities(id: &PidIdentity) -> Vec<PidIdentity> {
     let pid_holder_created = open_query(id.pid)
         .and_then(|h| creation_time(h.0))
         .filter(|&t| t != id.starttime);
-    let candidates: Vec<Candidate> = descendants_of(id.pid, id.starttime)
+    // One snapshot for both the PPID walk and the image names, so a
+    // candidate's image is the one recorded for that very pid in that walk.
+    let table = process_table();
+    let candidates: Vec<Candidate> = descendants_in(&table, id.pid, id.starttime)
         .into_iter()
         .filter_map(|pid| {
+            // Every walked pid came from `table`, and a snapshot lists a pid once.
+            let image = table.iter().find(|e| e.pid == pid)?.image.clone();
             let h = open_sync_query(pid)?;
             if is_signaled(h.0) {
                 return None;
             }
-            // `descendants_of` already required a readable creation time.
+            // `descendants_in` already required a readable creation time.
             let created = creation_time(h.0)?;
-            Some(Candidate { pid, created })
+            Some(Candidate {
+                pid,
+                created,
+                image,
+            })
         })
         .collect();
-    let kept = filter_tree_survivors(id.starttime, boot_time(), pid_holder_created, &candidates);
+    let kept = filter_tree_survivors(
+        id.starttime,
+        boot_time(),
+        pid_holder_created,
+        vmm_image,
+        &candidates,
+    );
     // `descendants_of` never yields a pid twice, so mapping the kept pids back
     // onto their candidates recovers each survivor's creation time exactly.
     out.extend(
@@ -493,13 +565,19 @@ fn terminate_identity(target: &PidIdentity) {
 /// PPIDs by the launcher's pid NUMBER with only the creation-time floor, so
 /// if Windows has handed that pid to another process it would terminate that
 /// process's children. This sweep kills exactly what `tree_survivors`
-/// reports, after its boot-time and pid-holder guards — and carries each
+/// reports, after its image, boot-time and pid-holder guards — and carries each
 /// survivor's IDENTITY, not its bare pid, to [`terminate_identity`]: the
 /// bounded wait on one survivor can take seconds, long enough for a later
 /// survivor to exit and its pid to be reused. Best-effort and infallible,
 /// like `kill_pid`'s own descendant sweep; the caller re-probes.
 pub fn sweep_tree_survivors(id: &PidIdentity) -> anyhow::Result<()> {
-    for target in tree_survivor_identities(id) {
+    sweep_tree_survivors_of_image(id, VMM_IMAGE_NAME)
+}
+
+/// [`sweep_tree_survivors`] with the worker image as a parameter — the test
+/// seam, like [`tree_survivors_of_image`].
+fn sweep_tree_survivors_of_image(id: &PidIdentity, vmm_image: &str) -> anyhow::Result<()> {
+    for target in tree_survivor_identities(id, vmm_image) {
         terminate_identity(&target);
     }
     Ok(())
@@ -526,6 +604,19 @@ mod tests {
         );
     }
 
+    /// Image of the test trees' worker (Git for Windows' `sleep.exe`), passed
+    /// to the `_of_image` seams in place of [`VMM_IMAGE_NAME`].
+    const SLEEP: &str = "sleep.exe";
+
+    #[test]
+    fn exe_file_name_stops_at_the_nul_and_lowercases() {
+        let mut sz = [0i8; 16];
+        for (d, s) in sz.iter_mut().zip(b"OpenVMM.EXE\0junk") {
+            *d = *s as i8;
+        }
+        assert_eq!(exe_file_name(&sz), "openvmm.exe");
+    }
+
     fn log_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("izba-{tag}-{}.log", std::process::id()))
     }
@@ -544,49 +635,13 @@ mod tests {
         }
     }
 
-    /// Image names (`szExeFile`, lowercased) of every live process, keyed by
-    /// pid. Test-only: lets a test tell the `sleep.exe` worker apart from a
-    /// console-host (`conhost.exe`) descendant that `CREATE_NO_WINDOW`
-    /// launchers commonly pick up.
-    fn image_names() -> Vec<(u32, String)> {
-        // SAFETY: plain FFI; the snapshot handle is closed by OwnedHandle.
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snap == INVALID_HANDLE_VALUE {
-            return Vec::new();
-        }
-        let snap = OwnedHandle(snap);
-        // SAFETY: PROCESSENTRY32 is plain-old-data; all-zero is a valid value.
-        let mut entry: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-        let mut out = Vec::new();
-        // SAFETY: valid snapshot handle and a properly-sized entry.
-        unsafe {
-            if Process32First(snap.0, &mut entry) != 0 {
-                loop {
-                    // `szExeFile` is a NUL-terminated array of C `char` (i8).
-                    let bytes: Vec<u8> = entry
-                        .szExeFile
-                        .iter()
-                        .take_while(|&&c| c != 0)
-                        .map(|&c| c as u8)
-                        .collect();
-                    let name = String::from_utf8_lossy(&bytes).to_lowercase();
-                    out.push((entry.th32ProcessID, name));
-                    if Process32Next(snap.0, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-        out
-    }
-
     /// Pid of a live descendant of `root` whose image is `sleep.exe`, if any.
+    /// (A console host — `conhost.exe` — may be a descendant too.)
     fn sleep_worker_of(root: &PidIdentity) -> Option<u32> {
-        let names = image_names();
-        descendants_of(root.pid, root.starttime)
+        let table = process_table();
+        descendants_in(&table, root.pid, root.starttime)
             .into_iter()
-            .find(|pid| names.iter().any(|(p, n)| p == pid && n == "sleep.exe"))
+            .find(|pid| table.iter().any(|e| e.pid == *pid && e.image == SLEEP))
     }
 
     /// `TerminateProcess` on ONE pid with no descendant sweep (unlike
@@ -700,7 +755,7 @@ mod tests {
             "the launcher must be gone"
         );
 
-        let survivors = tree_survivors(&root);
+        let survivors = tree_survivors_of_image(&root, SLEEP);
         assert!(
             !survivors.contains(&root.pid),
             "the torn-down launcher is not a survivor: {survivors:?}"
@@ -712,7 +767,10 @@ mod tests {
 
         kill_pid(&root).expect("sweep orphans");
         assert!(
-            wait_until(Duration::from_secs(5), || tree_survivors(&root).is_empty()),
+            wait_until(Duration::from_secs(5), || tree_survivors_of_image(
+                &root, SLEEP
+            )
+            .is_empty()),
             "the sweep must reap the orphaned worker"
         );
     }
@@ -784,7 +842,7 @@ mod tests {
             pid: holder.pid,
             starttime: holder.starttime - 1,
         };
-        let survivors = tree_survivors(&recorded);
+        let survivors = tree_survivors_of_image(&recorded, SLEEP);
         assert!(
             !survivors.contains(&worker),
             "the new pid holder's child {worker} is not ours: {survivors:?}"
@@ -794,7 +852,7 @@ mod tests {
             "nothing of the new holder's tree is ours: {survivors:?}"
         );
         assert!(
-            tree_survivors(&holder).contains(&worker),
+            tree_survivors_of_image(&holder, SLEEP).contains(&worker),
             "control: under its real identity the worker IS a survivor"
         );
         kill_pid(&holder).expect("cleanup");
@@ -822,7 +880,7 @@ mod tests {
             pid: root.pid,
             starttime: 1,
         };
-        let survivors = tree_survivors(&pre_boot);
+        let survivors = tree_survivors_of_image(&pre_boot, SLEEP);
         match boot_time() {
             // The guard drops the record only because `1 < boot`; pin that the
             // boot is a real time so the test cannot pass on a placeholder.
@@ -840,10 +898,10 @@ mod tests {
             ),
         }
         assert!(
-            tree_survivors(&root).contains(&worker),
+            tree_survivors_of_image(&root, SLEEP).contains(&worker),
             "control: the orphan IS a survivor of the real, post-boot record"
         );
-        sweep_tree_survivors(&root).expect("sweep orphans");
+        sweep_tree_survivors_of_image(&root, SLEEP).expect("sweep orphans");
     }
 
     /// #319 Fix 2: `stop`'s re-sweep for a launcher that is already gone
@@ -856,11 +914,17 @@ mod tests {
             wait_until(Duration::from_secs(5), || !pid_alive(&root)),
             "the launcher must be gone"
         );
-        assert!(tree_survivors(&root).contains(&worker), "precondition");
-
-        sweep_tree_survivors(&root).expect("sweep");
         assert!(
-            wait_until(Duration::from_secs(5), || tree_survivors(&root).is_empty()),
+            tree_survivors_of_image(&root, SLEEP).contains(&worker),
+            "precondition"
+        );
+
+        sweep_tree_survivors_of_image(&root, SLEEP).expect("sweep");
+        assert!(
+            wait_until(Duration::from_secs(5), || tree_survivors_of_image(
+                &root, SLEEP
+            )
+            .is_empty()),
             "the re-sweep must reap the orphaned worker"
         );
     }
@@ -876,12 +940,49 @@ mod tests {
             pid: holder.pid,
             starttime: holder.starttime - 1,
         };
-        sweep_tree_survivors(&recorded).expect("sweep");
+        sweep_tree_survivors_of_image(&recorded, SLEEP).expect("sweep");
         assert!(pid_alive(&holder), "the new pid holder itself is untouched");
         assert!(
-            tree_survivors(&holder).contains(&worker),
+            tree_survivors_of_image(&holder, SLEEP).contains(&worker),
             "the new holder's child {worker} must still be running"
         );
         kill_pid(&holder).expect("cleanup");
+    }
+
+    /// PR #328 review (P1): the launcher dies, an unrelated program reuses
+    /// its pid, spawns a child and EXITS — the pid is vacant again, so the
+    /// pid-holder guard has nothing to compare against and the child is
+    /// created after the recorded launcher. Modelled by an orphaned
+    /// `sleep.exe` under the recorded `cmd.exe` launcher, whose pid nothing
+    /// holds once cmd is gone: the PRODUCTION `tree_survivors` must report
+    /// none of it (only an `openvmm.exe` can be our worker), and the
+    /// production re-sweep must leave it running. The `_of_image` control
+    /// proves the same tree DOES yield the worker when its image is the
+    /// expected one, so the empty answer is the image filter's doing.
+    #[test]
+    fn production_tree_survivors_ignore_a_descendant_that_is_not_openvmm() {
+        let (root, worker) = launcher_with_worker("tree-foreign-image");
+        terminate_root_only(root.pid);
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_alive(&root)),
+            "the launcher must be gone"
+        );
+        assert!(
+            tree_survivors_of_image(&root, SLEEP).contains(&worker),
+            "control: with its own image named, the orphan IS reported"
+        );
+
+        let survivors = tree_survivors(&root);
+        assert!(
+            survivors.is_empty(),
+            "no descendant that is not {VMM_IMAGE_NAME} may be reported: {survivors:?}"
+        );
+        sweep_tree_survivors(&root).expect("sweep");
+        assert!(
+            tree_survivors_of_image(&root, SLEEP).contains(&worker),
+            "the production re-sweep must not terminate a non-VMM process ({worker})"
+        );
+
+        sweep_tree_survivors_of_image(&root, SLEEP).expect("cleanup");
     }
 }

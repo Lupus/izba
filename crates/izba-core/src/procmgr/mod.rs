@@ -50,7 +50,7 @@ pub use windows::proc_starttime;
 #[cfg(windows)]
 pub use windows::{
     kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits, sweep_tree_survivors,
-    tree_survivors,
+    tree_survivors, VMM_IMAGE_NAME,
 };
 
 /// Unix fallback so call sites can use `spawn_confined` uniformly: the Linux

@@ -138,7 +138,9 @@ wait then expired and the kill path in finding 2 took over.
   yet signaled, keeps `state.json`, and shows `degraded (vmm process <pid>
   outlived its launcher and still holds the disks)`; when the launcher is gone
   but a worker is still running, `stop` re-sweeps the guarded tree before it
-  decides.
+  decides. Besides the boot and pid-holder guards, only a descendant whose
+  image is `openvmm.exe` counts as a worker, so a stranger's child left under
+  a since-vacated launcher pid is neither reported nor swept.
 - The guest power-off failure is a separate, guest-side defect around a vhci
   device at shutdown after traffic — follow-up filed.
 - Nothing here changes a normal stop: the new check is one Toolhelp snapshot
